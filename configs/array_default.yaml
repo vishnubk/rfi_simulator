@@ -1,0 +1,31 @@
+# Default 10-element array configuration for rfi_simulator.
+#
+# Schema:
+#   name           : str            -- human-readable array name
+#   latitude_deg   : float          -- geodetic latitude of array origin (deg)
+#   longitude_deg  : float          -- geodetic longitude of array origin (deg, east-positive)
+#   height_m       : float          -- height of array origin above WGS84 ellipsoid (m)
+#   antennas       : list of [e, n, u]
+#                    -- one triple per antenna, local ENU offset from the array
+#                       origin in meters: east, north, up.
+#
+# This is an irregular 2-D (up = 0) layout with baselines up to ~100 m,
+# loosely centered on the OVRO site (Owens Valley Radio Observatory),
+# used as the default site for the laptop-scale simulator.
+
+name: array_default
+latitude_deg: 37.234
+longitude_deg: -118.282
+height_m: 1222.0
+
+antennas:
+  - [0.0, 0.0, 0.0]
+  - [12.4, -8.7, 0.0]
+  - [-19.3, 5.2, 0.0]
+  - [27.8, 21.6, 0.0]
+  - [-33.1, -14.9, 0.0]
+  - [8.6, 44.3, 0.0]
+  - [-45.7, 27.0, 0.0]
+  - [51.2, -12.5, 0.0]
+  - [-6.9, -52.8, 0.0]
+  - [38.4, 9.1, 0.0]

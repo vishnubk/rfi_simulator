@@ -34,7 +34,7 @@ jobs:
                off-by-one errors in indexing.
             2. Tests — does new physics code come with a sanity test? Do the
                tests actually assert meaningful values rather than just running?
-            3. Clarity — this codebase is read by students; flag anything that
+            3. Clarity — this codebase prioritizes readability; flag anything that
                needs a comment or a simpler structure.
             Be direct and specific; cite file and line. Approve-with-nits when
             issues are minor.
