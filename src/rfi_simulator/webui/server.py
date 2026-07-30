@@ -5,13 +5,19 @@ what the tests use; `main` is the ``rfi-simulator-ui`` console entry
 point.
 
 The server binds to the loopback interface by default and deliberately
-never reaches the network itself: element sets are pasted in or taken
-from the bundled sample, so a run needs nothing but this process.
+never reaches the network itself -- neither on the server side nor in the
+page it serves: element sets are pasted in or taken from the bundled
+sample, every asset is served from this process, and the interactive API
+documentation, which would pull its viewer from a content delivery
+network, is switched off. The machine-readable schema stays at
+``/api/openapi.json``.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +25,8 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from rfi_simulator import __version__
 from rfi_simulator.webui.simulate import SimulateRequest, defaults_payload, run_simulation
@@ -30,9 +38,89 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
+HOST_ENV_VAR = "RFI_SIMULATOR_UI_HOST"
+"""str: Environment variable naming the bound interface.
 
-def create_app() -> FastAPI:
+`main` sets it before handing the application to the server by import
+string, which is the only way the value survives into the process the
+reloader starts."""
+
+LOCAL_HOSTS = ["127.0.0.1", "localhost", "testserver"]
+"""list of str: Host headers served without argument. Anything else has to
+be the interface the server was actually asked to bind."""
+
+WILDCARD_HOSTS = {"0.0.0.0", "::", ""}  # noqa: S104 - recognised, not a default
+"""set of str: Bind addresses that mean "every interface", for which no
+host check is possible."""
+
+MAX_REQUEST_BYTES = 2_000_000
+"""int: Largest request body accepted. A full array of the largest size
+this front end runs is a few kilobytes, so this is generous by three
+orders of magnitude and still refuses a body big enough to matter."""
+
+MAX_CONCURRENT_SIMULATIONS = 2
+"""int: Runs allowed in flight at once.
+
+One run is bounded by the request model's size cap; unbounded concurrency
+would multiply that bound by however many requests happen to arrive, so
+the rest queue instead."""
+
+_simulation_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SIMULATIONS)
+
+
+class ContentLengthLimitMiddleware:
+    """Refuse an over-long request before its body is read.
+
+    Checked in the ASGI scope, so an oversized body is answered from the
+    declared length alone and never allocated. A body sent without a
+    declared length is left to the server's own limits.
+    """
+
+    def __init__(self, app: ASGIApp, max_bytes: int = MAX_REQUEST_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            for name, value in scope.get("headers", ()):
+                if name.lower() != b"content-length":
+                    continue
+                try:
+                    declared = int(value)
+                except ValueError:
+                    break
+                if declared > self.max_bytes:
+                    response = JSONResponse(
+                        status_code=413,
+                        content={
+                            "detail": [
+                                {
+                                    "loc": ["body"],
+                                    "msg": (
+                                        f"this request is {declared} bytes, more than the "
+                                        f"{self.max_bytes} this server accepts"
+                                    ),
+                                    "type": "value_error",
+                                }
+                            ]
+                        },
+                    )
+                    await response(scope, receive, send)
+                    return
+                break
+        await self.app(scope, receive, send)
+
+
+def create_app(host: str | None = None) -> FastAPI:
     """Build the application.
+
+    Parameters
+    ----------
+    host : str, optional
+        The interface the server is bound to, added to the accepted
+        ``Host`` headers. Loopback names are always accepted. Defaults to
+        `HOST_ENV_VAR` in the environment, which is how `main` passes the
+        bound interface through the reloader's fresh process.
 
     Returns
     -------
@@ -43,9 +131,24 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Interference simulator",
         version=__version__,
-        docs_url="/api/docs",
+        docs_url=None,
+        redoc_url=None,
         openapi_url="/api/openapi.json",
     )
+
+    if host is None:
+        host = os.environ.get(HOST_ENV_VAR) or None
+
+    allowed_hosts = list(LOCAL_HOSTS)
+    if host in WILDCARD_HOSTS:
+        # Binding every interface is a deliberate choice to be reachable
+        # under whatever name the operator uses; there is nothing left to
+        # check the header against.
+        allowed_hosts = ["*"]
+    elif host and host not in allowed_hosts:
+        allowed_hosts.append(host)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+    app.add_middleware(ContentLengthLimitMiddleware)
 
     @app.exception_handler(RequestValidationError)
     def handle_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -79,14 +182,19 @@ def create_app() -> FastAPI:
         band is the common one -- comes back as a 422 with the library's
         own message, because it is a fault in the setup the user typed,
         not in the server.
+
+        Runs queue behind `MAX_CONCURRENT_SIMULATIONS`: the request model
+        bounds the memory of one run, and this is what keeps several
+        arriving at once from multiplying that bound.
         """
-        try:
-            return run_simulation(request)
-        except ValueError as exc:
-            return JSONResponse(
-                status_code=422,
-                content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]},
-            )
+        with _simulation_slots:
+            try:
+                return run_simulation(request)
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]},
+                )
 
     @app.get("/")
     def get_index() -> FileResponse:
@@ -138,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
 
     import uvicorn
 
+    os.environ[HOST_ENV_VAR] = args.host
     uvicorn.run(
         "rfi_simulator.webui.server:create_app",
         factory=True,

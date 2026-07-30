@@ -32,6 +32,7 @@ from __future__ import annotations
 import math
 import time
 import warnings
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -62,10 +63,12 @@ __all__ = [
     "DEFAULT_N_BLOCKS",
     "DEFAULT_N_CHAN",
     "MAX_ANTENNAS",
+    "MAX_COORDINATE_M",
     "MAX_N_BLOCKS",
     "MAX_N_CHAN",
     "MAX_RFI_SOURCES",
     "MAX_SKY_SOURCES",
+    "MAX_TOTAL_SAMPLES",
     "START_TIME_UTC",
     "SimulateRequest",
     "build_simulator",
@@ -103,6 +106,24 @@ MAX_N_BLOCKS = 32
 MAX_SKY_SOURCES = 8
 MAX_RFI_SOURCES = 6
 
+MAX_COORDINATE_M = 1.0e6
+"""float: Largest antenna coordinate accepted, metres.
+
+The same bound the aircraft trajectory uses. Beyond it the geometry is no
+longer a local array, and coordinates near the floating-point ceiling
+overflow into infinities that leave the response full of nulls."""
+
+MAX_TOTAL_SAMPLES = 48_000_000
+"""int: Most voltage samples one run may generate.
+
+The count is ``n_antennas * n_chan * n_blocks * N_TIME_PER_BLOCK``. Each
+of the individual caps is modest on its own, but their product is not:
+taking every one of them at once would allocate several gigabytes and run
+for about a minute. This budget keeps a run to a few hundred megabytes and
+a few seconds while leaving room for the largest setups the page offers in
+any one direction -- a 32-antenna array at the default width, or a
+512-channel band on a handful of antennas."""
+
 MAX_BINS = 256
 """int: Most cells the browser is ever sent along one axis of a waterfall."""
 
@@ -130,9 +151,24 @@ evenly subsampled, which costs sensitivity but does not move sources."""
 # Packaged inputs
 # ----------------------------------------------------------------------
 def _config_path(filename: str) -> Path | None:
-    """Locate a file in the repository's ``configs`` directory, if present."""
+    """Locate a file in the repository's ``configs`` directory, if present.
+
+    The search only ever looks inside a checkout: it climbs from this
+    module to the first directory holding a ``pyproject.toml`` and stops
+    there. An installed copy has no such ancestor and finds nothing, which
+    is the intended answer -- better a known-good built-in default than
+    whatever ``configs`` directory happens to sit above the install root
+    on a machine shared with other people.
+    """
     here = Path(__file__).resolve()
-    for parent in here.parents:
+    parents = list(here.parents)
+    root_index = next(
+        (index for index, parent in enumerate(parents) if (parent / "pyproject.toml").is_file()),
+        None,
+    )
+    if root_index is None:
+        return None
+    for parent in parents[: root_index + 1]:
         candidate = parent / "configs" / filename
         if candidate.is_file():
             return candidate
@@ -772,7 +808,7 @@ class SimulateRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    antennas: list[list[float]] = Field(default_factory=list)
+    antennas: list[list[float]] = Field(default_factory=list, max_length=MAX_ANTENNAS)
     sky_sources: list[SkySource] = Field(default_factory=list, max_length=MAX_SKY_SOURCES)
     rfi_sources: list[RFIParams] = Field(default_factory=list, max_length=MAX_RFI_SOURCES)
     sim: SimParams = Field(default_factory=SimParams)
@@ -793,7 +829,32 @@ class SimulateRequest(BaseModel):
                 )
             if not all(math.isfinite(coordinate) for coordinate in position):
                 raise ValueError(f"antenna {index} has a position that is not a finite number")
+            if any(abs(coordinate) > MAX_COORDINATE_M for coordinate in position):
+                raise ValueError(
+                    f"antenna {index} lies further than {MAX_COORDINATE_M:g} m from the array "
+                    "origin: give east, north and up in metres, not in another unit"
+                )
         return value
+
+    @model_validator(mode="after")
+    def _check_total_size(self) -> "SimulateRequest":
+        """Refuse a run whose *product* of sizes is too large.
+
+        Antennas, channels and integrations are each capped on their own,
+        but the cost of a run is their product; this is the check that
+        keeps a request that is legal in every field from allocating
+        gigabytes.
+        """
+        total = len(self.antennas) * self.sim.n_chan * self.sim.n_blocks * N_TIME_PER_BLOCK
+        if total > MAX_TOTAL_SAMPLES:
+            raise ValueError(
+                f"this run needs {total:,} voltage samples "
+                f"({len(self.antennas)} antennas x {self.sim.n_chan} channels x "
+                f"{self.sim.n_blocks} integrations x {N_TIME_PER_BLOCK} samples), more than the "
+                f"{MAX_TOTAL_SAMPLES:,} this front end allows: reduce the number of antennas, "
+                "n_chan, or n_blocks"
+            )
+        return self
 
 
 def default_request() -> SimulateRequest:
@@ -846,6 +907,7 @@ def defaults_payload() -> dict[str, Any]:
             "max_n_blocks": MAX_N_BLOCKS,
             "max_sky_sources": MAX_SKY_SOURCES,
             "max_rfi_sources": MAX_RFI_SOURCES,
+            "max_total_samples": MAX_TOTAL_SAMPLES,
             "dynamic_range_db": DYNAMIC_RANGE_DB,
         },
         "sky_source": {
@@ -970,55 +1032,72 @@ def build_simulator(request: SimulateRequest) -> VoltageSimulator:
     )
 
 
-def _collect_blocks(simulator: VoltageSimulator) -> tuple[list, dict[str, Any]]:
-    """Run the simulator, keeping the blocks and the reduced waterfall.
+class _WaterfallReducer:
+    """Reduce blocks onto the display grid as they stream past.
 
-    Returns the blocks (for the correlator) alongside the per-antenna
-    power and per-source masks already pooled onto the display grid.
+    A block at the largest sizes this front end allows is over a hundred
+    megabytes, so nothing keeps them: `stream` hands each block to the
+    correlator and folds its power and its interference masks into the
+    display grid on the way through, leaving one block's worth of voltages
+    alive at a time rather than the whole observation's.
     """
-    n_antennas = simulator.n_antennas
-    chan_bins, per_block_time_bins = _waterfall_shape(
-        n_antennas, simulator.n_chan, simulator.n_blocks
-    )
 
-    blocks = []
-    power_columns: list[np.ndarray] = []
-    mask_columns: list[np.ndarray] = []
-    occupied_cells = np.zeros(len(simulator.rfi_sources), dtype=np.int64)
+    def __init__(self, simulator: VoltageSimulator) -> None:
+        self._simulator = simulator
+        self.chan_bins, self.time_bins_per_block = _waterfall_shape(
+            simulator.n_antennas, simulator.n_chan, simulator.n_blocks
+        )
+        self._power_columns: list[np.ndarray] = []
+        self._mask_columns: list[np.ndarray] = []
+        self._occupied_cells = np.zeros(len(simulator.rfi_sources), dtype=np.int64)
 
-    for block in simulator.blocks():
-        blocks.append(block)
+    @property
+    def time_samples_per_cell(self) -> int:
+        """int: Voltage time samples pooled into one displayed column."""
+        return -(-N_TIME_PER_BLOCK // self.time_bins_per_block)
+
+    def stream(self) -> Iterator[Any]:
+        """Yield every block of the observation, reducing it in passing."""
+        for block in self._simulator.blocks():
+            self._absorb(block)
+            yield block
+
+    def _absorb(self, block: Any) -> None:
         power = (block.data.real.astype(np.float64) ** 2) + (
             block.data.imag.astype(np.float64) ** 2
         )
-        power = bin_mean(power, axis=2, n_bins=per_block_time_bins)
-        power = bin_mean(power, axis=1, n_bins=chan_bins)
-        power_columns.append(power)
+        power = bin_mean(power, axis=2, n_bins=self.time_bins_per_block)
+        power = bin_mean(power, axis=1, n_bins=self.chan_bins)
+        self._power_columns.append(power)
 
-        occupied_cells += block.rfi_mask.sum(axis=(1, 2))
-        mask = bin_any(block.rfi_mask, axis=2, n_bins=per_block_time_bins)
-        mask = bin_any(mask, axis=1, n_bins=chan_bins)
-        mask_columns.append(mask)
+        self._occupied_cells += block.rfi_mask.sum(axis=(1, 2))
+        mask = bin_any(block.rfi_mask, axis=2, n_bins=self.time_bins_per_block)
+        mask = bin_any(mask, axis=1, n_bins=self.chan_bins)
+        self._mask_columns.append(mask)
 
-    # (n_ant, chan_bins, n_blocks * per_block_time_bins)
-    waterfall = np.concatenate(power_columns, axis=2)
-    masks = np.concatenate(mask_columns, axis=2)
+    def reduced(self) -> dict[str, Any]:
+        """The pooled power, masks, occupancies and axes of the whole run."""
+        simulator = self._simulator
+        # (n_ant, chan_bins, n_blocks * time_bins_per_block)
+        waterfall = np.concatenate(self._power_columns, axis=2)
+        masks = np.concatenate(self._mask_columns, axis=2)
 
-    total_cells = simulator.n_blocks * simulator.n_chan * simulator.n_time_per_block
-    occupancy = occupied_cells / float(total_cells)
+        total_cells = simulator.n_blocks * simulator.n_chan * simulator.n_time_per_block
+        occupancy = self._occupied_cells / float(total_cells)
 
-    freq_hz = bin_mean(simulator.freq_hz, axis=0, n_bins=chan_bins)
-    n_columns = waterfall.shape[2]
-    column_duration_s = simulator.duration_s / n_columns
-    time_s = (np.arange(n_columns) + 0.5) * column_duration_s
+        freq_hz = bin_mean(simulator.freq_hz, axis=0, n_bins=self.chan_bins)
+        n_columns = waterfall.shape[2]
+        column_duration_s = simulator.duration_s / n_columns
+        time_s = (np.arange(n_columns) + 0.5) * column_duration_s
 
-    return blocks, {
-        "waterfall": waterfall,
-        "masks": masks,
-        "occupancy": occupancy,
-        "freq_hz": freq_hz,
-        "time_s": time_s,
-    }
+        return {
+            "waterfall": waterfall,
+            "masks": masks,
+            "occupancy": occupancy,
+            "freq_hz": freq_hz,
+            "time_s": time_s,
+            "time_samples_per_cell": self.time_samples_per_cell,
+        }
 
 
 def _to_decibels(power: np.ndarray) -> tuple[np.ndarray, float, float, float]:
@@ -1073,7 +1152,10 @@ def run_simulation(request: SimulateRequest) -> dict[str, Any]:
         shared grid), ``sources`` (one pooled ground-truth mask and one
         exact occupancy fraction each), ``image`` (dirty image and its
         peak), ``uv`` (baseline coordinates in wavelengths), any
-        ``warnings`` the library raised, and the wall time.
+        ``warnings`` the library raised, and the wall time. The waterfall
+        also reports ``time_samples_per_cell``, the number of voltage
+        samples pooled into one displayed column, so the page can say how
+        coarse the picture it is drawing really is.
 
     Raises
     ------
@@ -1085,8 +1167,9 @@ def run_simulation(request: SimulateRequest) -> dict[str, Any]:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         simulator = build_simulator(request)
-        blocks, reduced = _collect_blocks(simulator)
-        visibilities = correlate(blocks)
+        reducer = _WaterfallReducer(simulator)
+        visibilities = correlate(reducer.stream())
+        reduced = reducer.reduced()
 
         channel_step = max(1, simulator.n_chan // IMAGE_MAX_CHANNELS)
         image, l_grid, m_grid = dirty_image(
@@ -1123,6 +1206,7 @@ def run_simulation(request: SimulateRequest) -> dict[str, Any]:
             "vmax_db": round(vmax_db, 3),
             "peak_db": round(peak_db, 3),
             "dynamic_range_db": DYNAMIC_RANGE_DB,
+            "time_samples_per_cell": int(reduced["time_samples_per_cell"]),
             "unit": "dB (Jy per cell)",
         },
         "sources": [

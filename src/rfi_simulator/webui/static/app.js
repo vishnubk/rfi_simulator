@@ -1071,6 +1071,20 @@
       });
       host.appendChild(button);
     });
+
+    /* The display grid is coarser than the mask: a cell is drawn flagged
+       if any voltage sample inside it was, so the red extent is an upper
+       bound on the occupancy printed on the chip. Say so rather than let
+       a 1% source that paints half the picture look like a contradiction. */
+    var pooled = state.result.waterfall.time_samples_per_cell;
+    if (pooled > 1) {
+      host.appendChild(el(
+        "span",
+        "checkline",
+        "mask pooled over " + pooled
+          + " samples/pixel — displayed extent exceeds occupancy"
+      ));
+    }
   }
 
   function renderAntennaSelect() {
