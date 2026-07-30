@@ -29,6 +29,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          # Comment-triggered runs otherwise check out the default branch,
+          # where files added by the pull request do not exist.
+          ref: ${{ github.event.pull_request.head.sha || (github.event.issue.pull_request && format('refs/pull/{0}/head', github.event.issue.number)) || '' }}
 
       - name: Run Claude Code
         uses: anthropics/claude-code-action@v1
