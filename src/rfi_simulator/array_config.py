@@ -93,9 +93,7 @@ class ArrayConfig:
                 f"got shape {positions.shape}"
             )
         if positions.shape[0] < 2:
-            raise ValueError(
-                f"ArrayConfig requires at least 2 antennas, got {positions.shape[0]}"
-            )
+            raise ValueError(f"ArrayConfig requires at least 2 antennas, got {positions.shape[0]}")
         if not np.all(np.isfinite(positions)):
             raise ValueError("antenna_positions_enu_m contains non-finite values")
 
@@ -191,8 +189,7 @@ def _warn_on_duplicate_positions(positions: np.ndarray, tol_m: float = 1e-6) -> 
         for j in range(i + 1, n):
             if np.allclose(positions[i], positions[j], atol=tol_m, rtol=0.0):
                 warnings.warn(
-                    f"antennas {i} and {j} have duplicate (or near-duplicate) "
-                    "ENU positions",
+                    f"antennas {i} and {j} have duplicate (or near-duplicate) ENU positions",
                     UserWarning,
                     stacklevel=3,
                 )

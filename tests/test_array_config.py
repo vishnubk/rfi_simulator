@@ -129,7 +129,5 @@ def test_quantity_and_float_inputs_are_equivalent():
         longitude_deg=-118.282,
         height_m=1.222 * u.km,
     )
-    np.testing.assert_allclose(
-        config_quantity_km.antenna_positions_enu_m, positions_m, atol=1e-9
-    )
+    np.testing.assert_allclose(config_quantity_km.antenna_positions_enu_m, positions_m, atol=1e-9)
     assert config_quantity_km.height_m == pytest.approx(1222.0)
