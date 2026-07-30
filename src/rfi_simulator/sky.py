@@ -1,6 +1,6 @@
 """Sky model: point sources and direction-cosine (l, m) geometry.
 
-Conventions (see ``docs/design_stage2.md``): the phase center is an ICRS
+Conventions: the phase center is an ICRS
 (RA, Dec) coordinate, and source positions are expressed either as ICRS
 coordinates or as direction cosines ``(l, m)`` relative to that phase
 center.

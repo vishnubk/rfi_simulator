@@ -1,6 +1,6 @@
 """Antenna array configuration: geometry, loading, and validation.
 
-Conventions (see ``docs/design_stage2.md``): antenna positions are stored
+Conventions : antenna positions are stored
 internally as plain ``float64`` numpy arrays in local ENU (East-North-Up)
 meters relative to the array origin. Astropy `~astropy.units.Quantity`
 inputs are accepted at the public API boundary (the ``ArrayConfig``
@@ -70,7 +70,7 @@ class ArrayConfig:
     -----
     Duplicate antenna positions (within floating-point tolerance) are
     permitted -- they are useful for zero-baseline sanity tests (see
-    acceptance criterion 5 in ``docs/design_stage2.md``) -- but trigger a
+    zero-baseline sanity checks) -- but trigger a
     `UserWarning` since they are usually unintentional in a real array.
     """
 
@@ -121,12 +121,19 @@ class ArrayConfig:
         Raises
         ------
         ValueError
-            If the YAML is missing required keys or the geometry fails
+            If the file is empty or does not contain a top-level mapping,
+            if required keys are missing, or if the geometry fails
             validation (see `ArrayConfig.__post_init__`).
         """
         path = Path(path)
         with path.open("r") as f:
             data = yaml.safe_load(f)
+
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"array YAML {path} must contain a top-level mapping of keys, "
+                f"got {type(data).__name__}"
+            )
 
         required_keys = {"latitude_deg", "longitude_deg", "height_m", "antennas"}
         missing = required_keys - data.keys()
@@ -157,7 +164,7 @@ class ArrayConfig:
             Shape ``(n_baselines, 3)`` float64 array of baseline vectors
             ``r_i - r_j`` in ENU meters, for each pair with ``i < j``, in
             the same convention as the visibility definition in
-            ``docs/design_stage2.md`` (conjugate on the second antenna).
+            the package convention (conjugate on the second antenna).
         index_pairs : numpy.ndarray
             Shape ``(n_baselines, 2)`` int array of the ``(i, j)`` antenna
             index pairs corresponding to each row of

@@ -1,4 +1,4 @@
-# Default 10-element array configuration for rfi_simulator (Stage 2 MVP).
+# Default 10-element array configuration for rfi_simulator.
 #
 # Schema:
 #   name           : str            -- human-readable array name
@@ -11,7 +11,7 @@
 #
 # This is an irregular 2-D (up = 0) layout with baselines up to ~100 m,
 # loosely centered on the OVRO site (Owens Valley Radio Observatory),
-# used as the default site for the Stage 2 laptop-scale simulator.
+# used as the default site for the laptop-scale simulator.
 
 name: array_default
 latitude_deg: 37.234

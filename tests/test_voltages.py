@@ -73,7 +73,7 @@ def test_frequency_axis_is_ascending_and_centered(default_array, start_time):
 
 
 def test_default_band_matches_the_design(default_array, start_time):
-    """The shipped defaults are the DSA-110-shaped band from the design doc."""
+    """The shipped defaults match the documented L-band defaults."""
     sim = VoltageSimulator(
         default_array,
         zenith_phase_center(default_array, start_time, 2.0),
@@ -270,3 +270,63 @@ def test_simulator_accepts_a_custom_array_layout(start_time):
     )
     sim = make_simulator(array, start_time, noise_std=1.0)
     assert sim.block(0).data.shape[0] == 2
+
+
+def test_block_is_deterministic_in_seed_and_index(default_array, start_time):
+    """`block(i)` is a pure function of (seed, i), not of call order.
+
+    With one shared random stream, merely peeking at a block in a debugger
+    would shift every later block and silently change the dataset. Each
+    block gets its own spawned generator instead.
+    """
+    array = default_array
+    phase_center = zenith_phase_center(array, start_time, duration_s=0.1)
+    source = PointSource.from_lm(phase_center, (SOURCE_L, SOURCE_M), flux_jy=1.0)
+
+    def new_sim():
+        return make_simulator(
+            array,
+            start_time,
+            [source],
+            noise_std=1.0,
+            n_blocks=5,
+            rng=np.random.default_rng(2718),
+        )
+
+    # Repeating a block gives the same data.
+    sim = new_sim()
+    np.testing.assert_array_equal(sim.block(0).data, sim.block(0).data)
+    np.testing.assert_array_equal(sim.block(3).data, sim.block(3).data)
+
+    # A "debug peek" at a later block does not disturb a subsequent pass.
+    reference = np.stack([block.data for block in new_sim().blocks()])
+
+    peeked = new_sim()
+    _ = peeked.block(3)
+    after_peek = np.stack([block.data for block in peeked.blocks()])
+    np.testing.assert_array_equal(after_peek, reference)
+
+    # Out-of-order generation gives the same blocks too.
+    shuffled = new_sim()
+    for index in (4, 1, 0, 3, 2):
+        np.testing.assert_array_equal(shuffled.block(index).data, reference[index])
+
+
+def test_blocks_differ_from_one_another(default_array, start_time):
+    """Independent per-block seeding must not accidentally repeat a block."""
+    sim = make_simulator(
+        default_array, start_time, [], noise_std=1.0, n_blocks=3, rng=np.random.default_rng(5)
+    )
+    data = [block.data for block in sim.blocks()]
+    assert not np.array_equal(data[0], data[1])
+    assert not np.array_equal(data[1], data[2])
+
+
+def test_block_rng_is_range_checked_and_repeatable(default_array, start_time):
+    sim = make_simulator(default_array, start_time)
+    first = sim.block_rng(1).standard_normal(8)
+    second = sim.block_rng(1).standard_normal(8)
+    np.testing.assert_array_equal(first, second)
+    assert not np.array_equal(first, sim.block_rng(2).standard_normal(8))
+    with pytest.raises(ValueError, match="out of range"):
+        sim.block_rng(sim.n_blocks)

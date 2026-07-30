@@ -1,9 +1,9 @@
 """rfi_simulator: voltage-level radio-frequency-interference simulator.
 
-Public API is re-exported from submodules here; see ``docs/design_stage2.md``
-for the package layout and physics conventions.
+Public API is re-exported from submodules here; each submodule's docstring
+states the physics conventions it owns.
 
-The Stage 2 pipeline is four steps long::
+The pipeline is four steps long::
 
     array = ArrayConfig.from_yaml("configs/array_default.yaml")
     sim   = VoltageSimulator(array, phase_center, start_time, sources, rng=rng)

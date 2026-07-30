@@ -131,3 +131,19 @@ def test_quantity_and_float_inputs_are_equivalent():
     )
     np.testing.assert_allclose(config_quantity_km.antenna_positions_enu_m, positions_m, atol=1e-9)
     assert config_quantity_km.height_m == pytest.approx(1222.0)
+
+
+@pytest.mark.parametrize("contents", ["", "# just a comment\n", "- 1\n- 2\n", "hello\n"])
+def test_from_yaml_rejects_non_mapping_documents(tmp_path, contents):
+    """An empty or non-mapping YAML gives a ValueError, not an AttributeError."""
+    path = tmp_path / "bad.yaml"
+    path.write_text(contents)
+    with pytest.raises(ValueError, match="top-level mapping"):
+        ArrayConfig.from_yaml(path)
+
+
+def test_from_yaml_reports_missing_keys(tmp_path):
+    path = tmp_path / "partial.yaml"
+    path.write_text("latitude_deg: 37.234\n")
+    with pytest.raises(ValueError, match="missing required keys"):
+        ArrayConfig.from_yaml(path)

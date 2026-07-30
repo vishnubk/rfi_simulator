@@ -2,11 +2,15 @@
 
 Covers acceptance criteria 1 (localization, on two different antenna
 layouts), 2 (sign convention: +l images at +l) and 3 (flux and radiometer
-noise) from ``docs/design_stage2.md``.
+noise).
 """
+
+import warnings
 
 import numpy as np
 import pytest
+from astropy import units as u
+from astropy.coordinates import SkyCoord
 from conftest import SOURCE_L, SOURCE_M, random_flat_array, zenith_phase_center
 
 from rfi_simulator import (
@@ -17,6 +21,7 @@ from rfi_simulator import (
     lm_axis,
     uvw_wavelengths,
 )
+from rfi_simulator.imaging import w_term_phase_rad
 
 # Grid fine enough to resolve the ~lambda/B = 2e-3 rad synthesized beam
 # roughly ten times over, so "within half a pixel" is a real constraint.
@@ -171,7 +176,7 @@ def test_image_rms_follows_the_radiometer_equation(default_array, start_time):
 
         n_base = int(vis.cross_mask.sum())
         expected = noise_std**2 / np.sqrt(2 * n_base * n_chan * n_blocks * n_time)
-        # Equivalent, in the form the design doc states it:
+        # Equivalent, stated as a Fourier pair:
         total_time_s = n_blocks * n_time * sim.sample_period_s
         expected_alt = noise_std**2 / np.sqrt(
             2 * n_base * n_chan * sim.chan_width_hz * total_time_s
@@ -300,9 +305,9 @@ def test_lm_axis_shape_and_span():
 
 @pytest.mark.slow
 def test_full_default_observation_end_to_end(default_array, start_time):
-    """The real Stage 2 defaults: 10 antennas, 384 channels, 61 blocks, ~2 s.
+    """The shipped defaults: 10 antennas, 384 channels, 61 blocks, ~2 s.
 
-    This is the run the students will actually do, and it has to stay
+    This is the run users will actually do, and it has to stay
     laptop-fast; it takes ~15 s here including the DFT imaging.
     """
     array = default_array
@@ -332,3 +337,54 @@ def test_full_default_observation_end_to_end(default_array, start_time):
 
     at_source, _, _ = dirty_image(vis, np.array([SOURCE_L]), np.array([SOURCE_M]))
     assert at_source[0, 0] == pytest.approx(flux_jy, rel=0.10)
+
+
+def test_lm_axis_single_pixel_is_the_field_center():
+    """A one-pixel axis is the map center, not the map edge."""
+    axis = lm_axis(0.04, 1)
+    assert axis.shape == (1,)
+    assert axis[0] == 0.0
+
+
+def test_w_term_is_zero_for_a_flat_array_at_the_zenith(default_array, start_time):
+    """The zenith-pointing configuration used elsewhere has no w term."""
+    vis, _, _, _, _, _ = image_a_source(
+        default_array, start_time, (SOURCE_L, SOURCE_M), n_chan=8, n_blocks=2
+    )
+    _, _, w = uvw_wavelengths(vis)
+    assert w_term_phase_rad(w, GRID, GRID) < 0.01
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        dirty_image(vis, GRID, GRID)
+
+
+def test_imaging_far_from_the_zenith_warns_about_the_w_term(default_array, start_time):
+    """Pointing 40 degrees off the zenith makes the neglected w term matter."""
+    array = default_array
+    zenith = zenith_phase_center(array, start_time, duration_s=0.5)
+    phase_center = SkyCoord(ra=zenith.ra, dec=zenith.dec - 40.0 * u.deg, frame="icrs")
+    source = PointSource.from_lm(phase_center, (0.0, 0.0), flux_jy=1.0)
+    sim = VoltageSimulator(
+        array,
+        phase_center,
+        start_time,
+        [source],
+        n_chan=8,
+        n_blocks=2,
+        n_time_per_block=64,
+        noise_std=0.0,
+        rng=np.random.default_rng(17),
+    )
+    vis = correlate(sim.blocks())
+
+    _, _, w = uvw_wavelengths(vis)
+    assert w_term_phase_rad(w, GRID, GRID) > 0.1
+
+    with pytest.warns(UserWarning, match="neglected w term"):
+        dirty_image(vis, GRID, GRID)
+
+    # ...and the warning can be silenced deliberately.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        dirty_image(vis, GRID, GRID, warn_on_w_term=False)

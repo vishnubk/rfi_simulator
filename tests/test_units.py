@@ -106,7 +106,7 @@ def test_scalar_attributes_are_plain_floats(start_time):
 
 
 def test_flux_quantity_matches_plain_float():
-    """PointSource flux conversion is exact for the units students will use."""
+    """PointSource flux conversion is exact for commonly used units."""
     from astropy.coordinates import SkyCoord
 
     coord = SkyCoord(ra=10.0 * u.deg, dec=20.0 * u.deg, frame="icrs")

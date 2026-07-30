@@ -40,19 +40,30 @@ source of flux ``F`` peaks at exactly ``F``.
 The neglected :math:`w(n_0 - 1)` term is why the tests phase up on the
 zenith: for a flat array (all ``up = 0``) a zenith phase center makes
 :math:`\mathbf{b} \cdot \hat{s}_0 = 0`, hence ``w = 0``, and the
-tangent-plane transform above is exact.
+tangent-plane transform above is exact. Point somewhere else and the term
+comes back; `dirty_image` measures it and raises a `UserWarning` rather
+than quietly returning a smeared map.
 """
 
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 
 from rfi_simulator.correlator import Visibilities
 from rfi_simulator.delays import SPEED_OF_LIGHT_M_S
 
-__all__ = ["dirty_image", "lm_axis", "uvw_wavelengths"]
+__all__ = ["dirty_image", "lm_axis", "uvw_wavelengths", "w_term_phase_rad"]
 
 _MAX_PHASE_ELEMENTS = 1_000_000
+
+W_TERM_WARN_PHASE_RAD = 0.1
+"""float: Neglected w-term phase above which `dirty_image` warns, radians.
+
+0.1 rad is roughly a 0.5% amplitude loss at the map edge -- small enough
+to ignore, large enough that anything above it deserves a look.
+"""
 
 
 def lm_axis(field_of_view_rad: float, n_pix: int) -> np.ndarray:
@@ -70,10 +81,13 @@ def lm_axis(field_of_view_rad: float, n_pix: int) -> np.ndarray:
     -------
     numpy.ndarray
         Shape ``(n_pix,)`` float64 axis running from
-        ``-field_of_view_rad / 2`` to ``+field_of_view_rad / 2``.
+        ``-field_of_view_rad / 2`` to ``+field_of_view_rad / 2``. A
+        single-pixel axis is the field *center*, ``[0.0]``, not an edge.
     """
     if n_pix < 1:
         raise ValueError(f"n_pix must be >= 1, got {n_pix}")
+    if n_pix == 1:
+        return np.zeros(1, dtype=np.float64)
     return np.linspace(-0.5 * field_of_view_rad, 0.5 * field_of_view_rad, n_pix)
 
 
@@ -83,24 +97,54 @@ def uvw_wavelengths(vis: Visibilities) -> tuple[np.ndarray, np.ndarray, np.ndarr
     Parameters
     ----------
     vis : Visibilities
-        Visibilities carrying baseline vectors, per-integration ``(l, m)``
-        basis vectors and channel frequencies.
+        Visibilities carrying baseline vectors, per-integration basis
+        vectors and channel frequencies.
 
     Returns
     -------
-    u, v : numpy.ndarray
-        Shape ``(n_int, n_baselines, n_chan)`` float64 arrays of ``u`` and
-        ``v`` in wavelengths.
-    scale : numpy.ndarray
-        Shape ``(n_chan,)`` array ``freq_hz / c``, in inverse meters --
-        returned because callers often want it for ``w`` as well.
+    u, v, w : numpy.ndarray
+        Shape ``(n_int, n_baselines, n_chan)`` float64 arrays of the
+        baseline projections onto ``e_l``, ``e_m`` and the phase-center
+        direction, in wavelengths. Only ``u`` and ``v`` enter the image;
+        ``w`` is returned so callers can check how much they are ignoring.
     """
     scale = vis.freq_hz / SPEED_OF_LIGHT_M_S  # (n_chan,) 1/m
     b_l = np.einsum("bj,tj->tb", vis.baseline_vectors_enu_m, vis.e_l_enu)
     b_m = np.einsum("bj,tj->tb", vis.baseline_vectors_enu_m, vis.e_m_enu)
+    b_s = np.einsum("bj,tj->tb", vis.baseline_vectors_enu_m, vis.s0_enu)
     u = b_l[:, :, np.newaxis] * scale[np.newaxis, np.newaxis, :]
     v = b_m[:, :, np.newaxis] * scale[np.newaxis, np.newaxis, :]
-    return u, v, scale
+    w = b_s[:, :, np.newaxis] * scale[np.newaxis, np.newaxis, :]
+    return u, v, w
+
+
+def w_term_phase_rad(w: np.ndarray, l_grid: np.ndarray, m_grid: np.ndarray) -> float:
+    """Largest phase error this imager throws away, in radians.
+
+    The exact visibility of a point source carries a term
+    ``exp(2 pi i w (n - 1))`` with ``n = sqrt(1 - l**2 - m**2)``, which the
+    two-dimensional transform in `dirty_image` ignores. This returns its
+    worst-case size over the given baselines and map extent.
+
+    Parameters
+    ----------
+    w : numpy.ndarray
+        Baseline projections onto the phase-center direction, wavelengths.
+    l_grid, m_grid : numpy.ndarray
+        The direction-cosine axes of the map.
+
+    Returns
+    -------
+    float
+        ``2 pi max|w| max|n - 1|`` in radians. Zero for a flat array
+        pointed at the zenith, where every baseline has ``w = 0``.
+    """
+    if w.size == 0:
+        return 0.0
+    l_max = float(np.abs(l_grid).max())
+    m_max = float(np.abs(m_grid).max())
+    n_edge = np.sqrt(max(0.0, 1.0 - l_max**2 - m_max**2))
+    return float(2.0 * np.pi * np.abs(w).max() * abs(n_edge - 1.0))
 
 
 def dirty_image(
@@ -112,6 +156,7 @@ def dirty_image(
     n_pix: int = 64,
     channels: slice | np.ndarray | None = None,
     include_autos: bool = False,
+    warn_on_w_term: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Naturally-weighted dirty image by direct DFT.
 
@@ -136,6 +181,10 @@ def dirty_image(
     include_autos : bool, optional
         If True, include autocorrelations. Default False -- autos carry no
         fringe and only add a flat offset equal to the total system power.
+    warn_on_w_term : bool, optional
+        If True (default) emit a `UserWarning` when the neglected ``w``
+        term exceeds `W_TERM_WARN_PHASE_RAD` at the map edge, which is the
+        usual symptom of imaging far from the zenith with a flat array.
 
     Returns
     -------
@@ -165,14 +214,27 @@ def dirty_image(
 
     chan_sel = slice(None) if channels is None else channels
 
-    u, v, _ = uvw_wavelengths(vis)
+    u, v, w = uvw_wavelengths(vis)
     u = u[:, baseline_sel, :][:, :, chan_sel].ravel()
     v = v[:, baseline_sel, :][:, :, chan_sel].ravel()
+    w = w[:, baseline_sel, :][:, :, chan_sel].ravel()
     data = vis.data[:, baseline_sel, :][:, :, chan_sel].ravel()
 
     n_terms = data.size
     if n_terms == 0:
         raise ValueError("no visibility samples selected for imaging")
+
+    if warn_on_w_term:
+        phase_rad = w_term_phase_rad(w, l_grid, m_grid)
+        if phase_rad > W_TERM_WARN_PHASE_RAD:
+            warnings.warn(
+                f"neglected w term reaches {phase_rad:.2f} rad at the edge of this "
+                f"map (threshold {W_TERM_WARN_PHASE_RAD} rad): this two-dimensional "
+                "transform will smear and shift sources. Phase up closer to the "
+                "zenith, shrink the field of view, or use a w-aware imager.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     n_l = l_grid.size
     n_m = m_grid.size

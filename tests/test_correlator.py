@@ -1,7 +1,7 @@
 """Tests for rfi_simulator.correlator.
 
 Covers acceptance criteria 4 (autocorrelations real and positive) and 5
-(zero-baseline) from ``docs/design_stage2.md``, plus the conjugation and
+(zero-baseline), plus conjugation and
 fringe-stopping conventions.
 """
 

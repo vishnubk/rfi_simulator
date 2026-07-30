@@ -13,7 +13,7 @@ visibilities come out directly in janskys: a single source of flux
 ``sum(F) + noise_std**2``.
 
 Fringe stopping (tracking the phase center) is applied here, per the
-Stage 2 design: the voltages carry the absolute geometric delays and the
+By construction, the voltages carry the absolute geometric delays and the
 correlator multiplies by
 
 .. math::
@@ -93,6 +93,9 @@ class Visibilities:
     e_m_enu : numpy.ndarray
         Shape ``(n_int, 3)`` ENU unit vector along increasing ``m`` at
         each integration center.
+    s0_enu : numpy.ndarray
+        Shape ``(n_int, 3)`` ENU unit vector towards the phase center at
+        each integration center.
     """
 
     data: np.ndarray
@@ -105,6 +108,7 @@ class Visibilities:
     baseline_vectors_enu_m: np.ndarray
     e_l_enu: np.ndarray
     e_m_enu: np.ndarray
+    s0_enu: np.ndarray
 
     @property
     def n_int(self) -> int:
@@ -198,6 +202,7 @@ def correlate(
     times_mjd: list[float] = []
     e_l: list[np.ndarray] = []
     e_m: list[np.ndarray] = []
+    s0: list[np.ndarray] = []
 
     pairs = None
     first: VoltageBlock | None = None
@@ -227,6 +232,7 @@ def correlate(
         times_mjd.append(float(Time(block.center_time).utc.mjd))
         e_l.append(np.asarray(block.e_l_enu, dtype=np.float64))
         e_m.append(np.asarray(block.e_m_enu, dtype=np.float64))
+        s0.append(np.asarray(block.s0_enu, dtype=np.float64))
 
     if first is None:
         raise ValueError("correlate() received no voltage blocks")
@@ -245,4 +251,5 @@ def correlate(
         baseline_vectors_enu_m=baseline_vectors,
         e_l_enu=np.stack(e_l, axis=0),
         e_m_enu=np.stack(e_m, axis=0),
+        s0_enu=np.stack(s0, axis=0),
     )

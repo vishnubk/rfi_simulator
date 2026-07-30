@@ -1,6 +1,6 @@
 r"""Geometric delays -- the module that owns the delay sign convention.
 
-Binding convention (``docs/design_stage2.md``): for a plane wave arriving
+Binding convention: for a plane wave arriving
 from sky direction :math:`\hat{s}` (a unit vector pointing *from the array
 towards the source*), the antenna at local ENU position :math:`\mathbf{r}`
 (meters, relative to the array origin) sees the signal with geometric delay

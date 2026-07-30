@@ -3,7 +3,7 @@
 Most tests deliberately run a *small* version of the default observation
 (fewer channels, fewer samples, fewer blocks) so that the whole suite stays
 laptop-fast; one end-to-end test in ``test_imaging.py`` uses the real
-Stage 2 defaults (384 channels, 61 blocks of 1000 samples, ~2 s).
+Package defaults (384 channels, 61 blocks of 1000 samples, ~2 s).
 """
 
 from pathlib import Path
@@ -22,7 +22,7 @@ DEFAULT_ARRAY_YAML = REPO_ROOT / "configs" / "array_default.yaml"
 # A fixed, arbitrary UTC epoch: the tests must not depend on wall-clock time.
 START_TIME = Time("2026-10-01T04:00:00", scale="utc")
 
-# Test source offset from the design doc's acceptance criterion 1.
+# Standard test source offset used across the suite.
 SOURCE_L = float(np.sin(np.deg2rad(0.5)))
 SOURCE_M = float(np.sin(np.deg2rad(-0.3)))
 

@@ -4,7 +4,7 @@ The simulator produces *channelized* complex baseband voltages: for every
 antenna, every frequency channel and every post-channelization time sample
 it emits one complex number. A perfect channelizer is assumed (no PFB
 leakage -- see the deliberate MVP simplifications in
-``docs/design_stage2.md``).
+the module docstrings of ``delays`` and ``correlator``).
 
 Synthesis is done in the frequency domain, which is exact for noise-like
 celestial sources and needs no fractional-delay filtering:
@@ -99,6 +99,9 @@ class VoltageBlock:
     e_m_enu : numpy.ndarray
         Shape ``(3,)`` ENU unit vector along increasing ``m`` at
         `center_time`.
+    s0_enu : numpy.ndarray
+        Shape ``(3,)`` ENU unit vector towards the phase center at
+        `center_time`. Imaging uses it to size the neglected ``w`` term.
     """
 
     data: np.ndarray
@@ -110,6 +113,7 @@ class VoltageBlock:
     antenna_positions_enu_m: np.ndarray
     e_l_enu: np.ndarray
     e_m_enu: np.ndarray
+    s0_enu: np.ndarray
 
     @property
     def n_antennas(self) -> int:
@@ -148,12 +152,12 @@ class VoltageSimulator:
         Sky model. An empty sequence gives a noise-only observation, which
         is what the radiometer test uses. Defaults to ``()``.
     center_freq_hz : float or astropy.units.Quantity, optional
-        Band center frequency in Hz. Default 1.405 GHz (DSA-110-like).
+        Band center frequency in Hz. Default 1.405 GHz (L band).
     n_chan : int, optional
         Number of frequency channels. Default 384.
     chan_width_hz : float or astropy.units.Quantity, optional
         Channel width in Hz. Default 30517.578125 Hz, so that
-        ``n_chan * chan_width`` is one DSA-110 channel-group bandwidth
+        ``n_chan * chan_width`` matches a typical L-band digital backend subband
         (11.71875 MHz).
     n_time_per_block : int, optional
         Post-channelization time samples per block. Default 1000, i.e.
@@ -167,7 +171,9 @@ class VoltageSimulator:
         SEFD. Default 1.0. Set to 0.0 for noiseless runs.
     rng : numpy.random.Generator
         Seeded random generator. Required -- the package never seeds a
-        global generator, so that every test and dataset is reproducible.
+        global generator, so that every run is reproducible. It is drawn
+        from exactly once, at construction, to seed an independent
+        generator per block (see Notes).
 
     Attributes
     ----------
@@ -175,6 +181,19 @@ class VoltageSimulator:
         Shape ``(n_chan,)`` RF channel center frequencies, Hz, ascending.
     sample_period_s : float
         ``1 / chan_width_hz``, seconds.
+    seed_sequence : numpy.random.SeedSequence
+        Root seed sequence derived from `rng` at construction; the per-block
+        generators are spawned from it.
+
+    Notes
+    -----
+    Blocks are independently seeded, so ``block(i)`` is a pure function of
+    the construction-time `rng` state and ``i``. That matters more than it
+    looks: with a single shared stream, merely peeking at one block (say,
+    in a debugger or a plotting notebook) would shift every later block and
+    silently produce a *different* dataset from the same seed. Here blocks
+    can be generated in any order, skipped, or regenerated, and the data is
+    always the same.
 
     Raises
     ------
@@ -223,7 +242,6 @@ class VoltageSimulator:
         self.phase_center = phase_center
         self.start_time = start_time
         self.sources = list(sources)
-        self.rng = rng
 
         self.center_freq_hz = float(_to_value(center_freq_hz, u.Hz))
         self.chan_width_hz = float(_to_value(chan_width_hz, u.Hz))
@@ -246,6 +264,12 @@ class VoltageSimulator:
         # RF channel centers, ascending, symmetric about the band center.
         offsets = np.arange(self.n_chan, dtype=np.float64) - 0.5 * (self.n_chan - 1)
         self.freq_hz = self.center_freq_hz + offsets * self.chan_width_hz
+
+        # Draw from the caller's generator exactly once, then give every
+        # block its own independent generator spawned from the result.
+        entropy = rng.integers(0, 2**63 - 1, size=4, dtype=np.int64)
+        self.seed_sequence = np.random.SeedSequence(entropy.tolist())
+        self._block_seed_sequences = self.seed_sequence.spawn(self.n_blocks)
 
         self.location = earth_location(array)
         self._precompute_geometry()
@@ -335,11 +359,35 @@ class VoltageSimulator:
     # ------------------------------------------------------------------
     # Synthesis
     # ------------------------------------------------------------------
-    def _circular_normal(self, shape: tuple[int, ...], scale: float) -> np.ndarray:
+    def block_rng(self, index: int) -> np.random.Generator:
+        """The generator used for block `index`.
+
+        Parameters
+        ----------
+        index : int
+            Block index in ``[0, n_blocks)``.
+
+        Returns
+        -------
+        numpy.random.Generator
+            A fresh generator, seeded only by the construction-time seed
+            and `index`. Calling this twice gives two generators that
+            produce the same stream.
+        """
+        if not 0 <= index < self.n_blocks:
+            raise ValueError(f"block index {index} out of range [0, {self.n_blocks})")
+        return np.random.default_rng(self._block_seed_sequences[index])
+
+    @staticmethod
+    def _circular_normal(
+        rng: np.random.Generator, shape: tuple[int, ...], scale: float
+    ) -> np.ndarray:
         """Draw circular complex Gaussian samples with ``E|z|**2 == scale**2``.
 
         Parameters
         ----------
+        rng : numpy.random.Generator
+            Generator to draw from.
         shape : tuple of int
             Output shape.
         scale : float
@@ -350,7 +398,7 @@ class VoltageSimulator:
         numpy.ndarray
             Complex64 array of shape `shape`.
         """
-        parts = self.rng.standard_normal(size=(*shape, 2), dtype=np.float32)
+        parts = rng.standard_normal(size=(*shape, 2), dtype=np.float32)
         parts *= np.float32(scale / np.sqrt(2.0))
         return parts.view(np.complex64)[..., 0]
 
@@ -369,11 +417,10 @@ class VoltageSimulator:
 
         Notes
         -----
-        Blocks must be generated in order if the random stream is to be
-        reproducible: each call consumes samples from `rng`.
+        Deterministic in ``(seed, index)``: blocks may be generated in any
+        order, repeated, or skipped without changing any of them.
         """
-        if not 0 <= index < self.n_blocks:
-            raise ValueError(f"block index {index} out of range [0, {self.n_blocks})")
+        rng = self.block_rng(index)
 
         n_ant = self.array.n_antennas
         n_chan = self.n_chan
@@ -385,7 +432,7 @@ class VoltageSimulator:
             if source.flux_jy == 0.0:
                 continue
             # One sky signal, shared by every antenna.
-            spectrum = self._circular_normal((n_chan, n_time), np.sqrt(source.flux_jy))
+            spectrum = self._circular_normal(rng, (n_chan, n_time), np.sqrt(source.flux_jy))
             tau_s = self._source_delays_s[i_src, index]  # (n_ant,)
             # RF frequency of each channel -- NOT a baseband offset.
             phase = np.exp(-2j * np.pi * self.freq_hz[np.newaxis, :] * tau_s[:, np.newaxis]).astype(
@@ -395,7 +442,7 @@ class VoltageSimulator:
 
         if self.noise_std > 0.0:
             # Independent receiver noise per antenna.
-            data += self._circular_normal((n_ant, n_chan, n_time), self.noise_std)
+            data += self._circular_normal(rng, (n_ant, n_chan, n_time), self.noise_std)
 
         start_time = self.start_time + index * self.block_duration_s * u.s
         return VoltageBlock(
@@ -408,6 +455,7 @@ class VoltageSimulator:
             antenna_positions_enu_m=self.array.antenna_positions_enu_m,
             e_l_enu=self._e_l_enu[index],
             e_m_enu=self._e_m_enu[index],
+            s0_enu=self._phase_center_s_hat[index],
         )
 
     def blocks(self) -> Iterator[VoltageBlock]:
@@ -417,7 +465,9 @@ class VoltageSimulator:
         ------
         VoltageBlock
             Successive blocks; the whole observation is never
-            materialized in memory at once.
+            materialized in memory at once. This is exactly
+            ``block(0), block(1), ...``, so iterating is equivalent to
+            asking for the blocks one at a time.
         """
         for index in range(self.n_blocks):
             yield self.block(index)
