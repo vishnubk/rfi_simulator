@@ -6,4 +6,4 @@ Simulates a small, configurable antenna array observing celestial sources, with 
 
 Under active development; documentation and datasets will be published as the project matures.
 
-Licensed under the MIT License — see [LICENSE](LICENSE).
+Licensed under the GNU General Public License v3.0 — see [LICENSE](LICENSE).
