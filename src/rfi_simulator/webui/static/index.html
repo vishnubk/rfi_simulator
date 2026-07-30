@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interference simulator</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23171A1E'/%3E%3Cpath d='M16 5v22M5 16h22' stroke='%23D98E32' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='16' r='6' fill='none' stroke='%23E4574B' stroke-width='1.6'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="masthead-mark" aria-hidden="true">
+    <svg viewBox="0 0 32 32" width="26" height="26">
+      <path d="M16 4v24M4 16h24" stroke="currentColor" stroke-width="1.2"/>
+      <circle cx="16" cy="16" r="7" fill="none" stroke="currentColor" stroke-width="1.2"/>
+    </svg>
+  </div>
+  <div class="masthead-text">
+    <h1>Interference simulator</h1>
+    <p>Place antennas, place interference, see what the telescope sees.</p>
+  </div>
+  <dl class="masthead-meta mono" id="site-meta"></dl>
+</header>
+
+<main class="console">
+
+  <!-- ------------------------------------------------ site plan -->
+  <section class="zone zone-site" aria-labelledby="site-plan-heading">
+    <div class="zone-head">
+      <h2 class="panel-title" id="site-plan-heading">Site plan</h2>
+      <span class="panel-note mono" id="array-summary"></span>
+    </div>
+
+    <div class="sheet" id="sheet">
+      <svg id="site-plan" role="application" tabindex="0"
+           aria-label="Array site plan. Click to add an antenna, drag to move it, double-click to remove it. With the plan focused, press A to add an antenna at the centre."></svg>
+      <p class="sheet-empty" id="sheet-empty" hidden>Click the site plan to place your first antenna</p>
+      <output class="sheet-readout mono" id="cursor-readout" aria-live="off"></output>
+    </div>
+
+    <p class="hint">
+      Click bare ground to add an antenna. Drag a marker to move it.
+      Double-click a marker to remove it.
+    </p>
+
+    <div class="button-row">
+      <button type="button" class="button" id="reset-array">Reset to the default array</button>
+      <button type="button" class="button button-quiet" id="clear-array">Remove all</button>
+    </div>
+
+    <div class="antenna-table-wrap">
+      <table class="antenna-table mono">
+        <caption class="panel-title">Antennas</caption>
+        <thead>
+          <tr><th scope="col">#</th><th scope="col">East&nbsp;m</th><th scope="col">North&nbsp;m</th><th scope="col"></th></tr>
+        </thead>
+        <tbody id="antenna-rows"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------- sky and interference -->
+  <section class="zone zone-sources" aria-labelledby="sources-heading">
+    <div class="zone-head">
+      <h2 class="panel-title" id="sources-heading">Sky &amp; interference</h2>
+    </div>
+
+    <div class="scroll-region">
+      <div class="group">
+        <div class="group-head">
+          <h3 class="group-title">Sky sources</h3>
+          <button type="button" class="button button-small" id="add-sky">Add sky source</button>
+        </div>
+        <div id="sky-cards" class="card-stack"></div>
+        <p class="empty-note" id="sky-empty" hidden>No sky sources — the map will show noise only.</p>
+      </div>
+
+      <div class="group">
+        <div class="group-head">
+          <h3 class="group-title">Interference sources</h3>
+        </div>
+        <div class="add-row">
+          <label class="field-label" for="rfi-type">Kind</label>
+          <select id="rfi-type" class="input"></select>
+          <button type="button" class="button button-small" id="add-rfi">Add</button>
+        </div>
+        <p class="type-summary" id="rfi-type-summary"></p>
+        <div id="rfi-cards" class="card-stack"></div>
+        <p class="empty-note" id="rfi-empty" hidden>No interference — a clean observation.</p>
+      </div>
+
+      <div class="group">
+        <div class="group-head">
+          <h3 class="group-title">Observation</h3>
+        </div>
+        <div class="field-grid" id="sim-fields"></div>
+        <p class="hint mono" id="sim-summary"></p>
+      </div>
+    </div>
+
+    <div class="run-bar">
+      <button type="button" class="button button-run" id="run">Run observation</button>
+      <span class="run-status mono" id="run-status"></span>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------------- console -->
+  <section class="zone zone-console" aria-labelledby="console-heading">
+    <div class="zone-head">
+      <h2 class="panel-title" id="console-heading">Console</h2>
+      <span class="panel-note mono" id="wall-time"></span>
+    </div>
+
+    <div class="notice-area" id="notices" aria-live="polite"></div>
+
+    <div class="console-grid">
+
+      <figure class="display display-wide" id="waterfall-display">
+        <figcaption>
+          <span class="display-title">Autocorrelation waterfall</span>
+          <span class="display-sub mono" id="waterfall-sub"></span>
+        </figcaption>
+        <div class="display-controls">
+          <label class="field-label" for="waterfall-antenna">Antenna</label>
+          <select id="waterfall-antenna" class="input input-dark input-small"></select>
+          <span class="control-sep" aria-hidden="true"></span>
+          <span class="field-label">Ground truth</span>
+          <div class="mask-toggles" id="mask-toggles"></div>
+          <label class="checkline">
+            <input type="checkbox" id="hatch-toggle"> hatch
+          </label>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="waterfall-canvas"></canvas>
+          <div class="sweep" id="waterfall-sweep" hidden></div>
+          <p class="display-empty" id="waterfall-empty">Run an observation to fill the console.</p>
+        </div>
+      </figure>
+
+      <figure class="display" id="image-display">
+        <figcaption>
+          <span class="display-title">Dirty image</span>
+          <span class="display-sub mono" id="image-sub"></span>
+        </figcaption>
+        <div class="canvas-wrap">
+          <canvas id="image-canvas"></canvas>
+        </div>
+      </figure>
+
+      <figure class="display" id="uv-display">
+        <figcaption>
+          <span class="display-title">Baseline coverage</span>
+          <span class="display-sub mono" id="uv-sub"></span>
+        </figcaption>
+        <div class="canvas-wrap">
+          <svg id="uv-plot" role="img" aria-label="Baseline coverage in wavelengths"></svg>
+        </div>
+      </figure>
+
+    </div>
+  </section>
+
+</main>
+
+<div class="tooltip mono" id="tooltip" hidden></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
