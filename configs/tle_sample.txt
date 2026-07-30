@@ -1,0 +1,20 @@
+# Frozen two-line element set for one GPS satellite, bundled so that the
+# examples and the test suite have a real orbit to propagate without ever
+# touching the network.
+#
+# Object      : GPS BIIR-5 (PRN 22), NORAD catalogue number 26407
+# Element set : epoch 26211.29429826 = 2026-07-30T07:03:47.370 UTC
+# Source      : CelesTrak general-perturbations catalogue, group "gps-ops",
+#               retrieved 2026-07-30. Frozen deliberately -- do not refresh
+#               it, or the reference angles in the tests move.
+#
+# Accuracy note: an element set is only good for a few days either side of
+# its epoch. Propagating this one to a date far from 2026-07-30 will give a
+# plausible-looking orbit that is wrong by many kilometres. Fetch current
+# elements with `fetch_tles` for anything that has to match reality.
+#
+# Blank lines and lines beginning with "#" are ignored by the reader; the
+# remaining lines are name / line 1 / line 2 triples.
+GPS BIIR-5  (PRN 22)
+1 26407U 00040A   26211.29429826  .00000064  00000+0  00000+0 0  9995
+2 26407  54.8470 213.4502 0120062 302.9461 145.6045  2.00558031190810

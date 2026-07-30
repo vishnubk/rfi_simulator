@@ -3,9 +3,11 @@ r"""Interference sources injected at the voltage level.
 An interference source is anything that adds power to the antennas which
 did not come from the tracked sky: a transmitter on a nearby hilltop, an
 arcing power line, a satellite. This module defines the plug-in interface
-(`RFISource`) and the two simplest concrete sources; the simulator adds
-their contributions to the sky-plus-noise voltages *before* correlation,
-so interference goes through exactly the same correlator and
+(`RFISource`), the geometry and band helpers every source shares, and the
+two stationary ground-based sources; moving platforms live in
+`rfi_simulator.satellites` and `rfi_simulator.aircraft`. The simulator
+adds every source's contribution to the sky-plus-noise voltages *before*
+correlation, so interference goes through exactly the same correlator and
 fringe-stopping path as celestial signal.
 
 Geometry: near field, no plane-wave approximation
@@ -106,8 +108,16 @@ __all__ = [
     "ImpulsiveBroadband",
     "NarrowbandTransmitter",
     "RFISource",
+    "band_overlaps",
+    "channels_within",
+    "circular_normal",
+    "enu_from_ecef_offset",
     "enu_from_geodetic",
     "enu_from_horizontal",
+    "enu_rotation_matrix",
+    "near_field_phasors",
+    "occupancy_mask",
+    "out_of_band_message",
     "path_delays_s",
     "path_lengths_m",
     "spreading_amplitudes",
@@ -268,12 +278,30 @@ def enu_from_geodetic(latitude_deg, longitude_deg, height_m, array: ArrayConfig)
         ],
         dtype=np.float64,
     )
+    return enu_from_ecef_offset(delta_m, origin)
 
+
+def enu_rotation_matrix(origin: EarthLocation) -> np.ndarray:
+    """Rotation from Earth-centred Earth-fixed axes to a local ENU triad.
+
+    Parameters
+    ----------
+    origin : astropy.coordinates.EarthLocation
+        Point whose local East-North-Up triad is wanted -- for this
+        package, the array origin.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(3, 3)`` float64 orthogonal matrix ``R`` such that
+        ``R @ delta_ecef`` is the ENU representation of a geocentric
+        offset vector ``delta_ecef``.
+    """
     lat_rad = np.deg2rad(float(origin.lat.to_value(u.deg)))
     lon_rad = np.deg2rad(float(origin.lon.to_value(u.deg)))
     sin_lat, cos_lat = np.sin(lat_rad), np.cos(lat_rad)
     sin_lon, cos_lon = np.sin(lon_rad), np.cos(lon_rad)
-    rotation = np.array(
+    return np.array(
         [
             [-sin_lon, cos_lon, 0.0],
             [-sin_lat * cos_lon, -sin_lat * sin_lon, cos_lat],
@@ -281,7 +309,124 @@ def enu_from_geodetic(latitude_deg, longitude_deg, height_m, array: ArrayConfig)
         ],
         dtype=np.float64,
     )
-    return rotation @ delta_m
+
+
+def enu_from_ecef_offset(delta_ecef_m: np.ndarray, origin: EarthLocation) -> np.ndarray:
+    """Rotate a geocentric offset vector into a local ENU triad.
+
+    Parameters
+    ----------
+    delta_ecef_m : numpy.ndarray
+        Shape ``(..., 3)`` offsets in Earth-centred Earth-fixed meters,
+        i.e. target position minus `origin` position.
+    origin : astropy.coordinates.EarthLocation
+        Point defining the local triad (the array origin).
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(..., 3)`` float64 ENU coordinates in meters.
+    """
+    delta = np.asarray(delta_ecef_m, dtype=np.float64)
+    return delta @ enu_rotation_matrix(origin).T
+
+
+def band_overlaps(
+    center_freq_hz: float, bandwidth_hz: float, freq_hz: np.ndarray, chan_width_hz: float
+) -> bool:
+    """Whether an emission's spectrum reaches into the simulated band at all.
+
+    Parameters
+    ----------
+    center_freq_hz : float
+        Center frequency of the emission, Hz.
+    bandwidth_hz : float
+        Full occupied bandwidth of the emission, Hz. May be zero for a
+        pure carrier.
+    freq_hz : numpy.ndarray
+        Shape ``(n_chan,)`` ascending RF channel centers, Hz.
+    chan_width_hz : float
+        Channel width, Hz.
+
+    Returns
+    -------
+    bool
+        True if any part of ``center +/- bandwidth / 2`` lies within the
+        band edges, taken as the outer channel centers extended by half a
+        channel.
+
+    Notes
+    -----
+    Sources call this to decide whether to raise. A transmitter
+    configured outside the simulated band is nearly always a mistake in
+    the observing setup rather than a deliberate silence, and a source
+    that quietly contributes nothing is much harder to debug than one
+    that says so.
+    """
+    low_hz = float(freq_hz[0]) - 0.5 * chan_width_hz
+    high_hz = float(freq_hz[-1]) + 0.5 * chan_width_hz
+    half_width_hz = 0.5 * bandwidth_hz
+    return (center_freq_hz + half_width_hz >= low_hz) and (
+        center_freq_hz - half_width_hz <= high_hz
+    )
+
+
+def out_of_band_message(
+    name: str, center_freq_hz: float, bandwidth_hz: float, freq_hz: np.ndarray
+) -> str:
+    """The standard error text for an emission outside the simulated band.
+
+    Parameters
+    ----------
+    name : str
+        Source name.
+    center_freq_hz, bandwidth_hz : float
+        Emission center frequency and full bandwidth, Hz.
+    freq_hz : numpy.ndarray
+        Shape ``(n_chan,)`` ascending RF channel centers, Hz.
+
+    Returns
+    -------
+    str
+        A message naming both the emission and the simulated band, so the
+        fix (re-center the band, or re-tune the source) is obvious.
+    """
+    return (
+        f"source {name!r} emits at {center_freq_hz / 1e6:.3f} MHz "
+        f"+/- {bandwidth_hz / 2e6:.3f} MHz, outside the simulated band "
+        f"{freq_hz[0] / 1e6:.3f}-{freq_hz[-1] / 1e6:.3f} MHz. Re-center the "
+        f"simulated band on the emission, or re-tune the source."
+    )
+
+
+def channels_within(freq_hz: np.ndarray, center_freq_hz: float, bandwidth_hz: float) -> np.ndarray:
+    """Boolean mask of the channels an emission occupies.
+
+    Parameters
+    ----------
+    freq_hz : numpy.ndarray
+        Shape ``(n_chan,)`` RF channel center frequencies, Hz.
+    center_freq_hz : float
+        Center frequency of the emission, Hz.
+    bandwidth_hz : float
+        Full occupied bandwidth, Hz. Zero means a pure carrier, which
+        lands in the single nearest channel.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean array of shape ``(n_chan,)``. May be all False if the
+        emission falls between the band edges and the nearest channel is
+        far away -- callers decide whether that is an error.
+    """
+    freq_hz = np.asarray(freq_hz, dtype=np.float64)
+    half_width_hz = 0.5 * bandwidth_hz
+    if half_width_hz > 0.0:
+        return np.abs(freq_hz - center_freq_hz) <= half_width_hz
+    nearest = int(np.argmin(np.abs(freq_hz - center_freq_hz)))
+    mask = np.zeros(freq_hz.shape, dtype=bool)
+    mask[nearest] = True
+    return mask
 
 
 # ----------------------------------------------------------------------
@@ -515,7 +660,7 @@ def occupancy_mask(envelope_jy: np.ndarray, threshold: float = OCCUPANCY_THRESHO
     return envelope_jy > threshold * peak
 
 
-def _circular_normal(rng: np.random.Generator, shape: tuple[int, ...]) -> np.ndarray:
+def circular_normal(rng: np.random.Generator, shape: tuple[int, ...]) -> np.ndarray:
     """Unit-power circular complex Gaussian samples, complex64.
 
     Parameters
@@ -653,14 +798,7 @@ class NarrowbandTransmitter(RFISource):
         single channel nearest its center frequency, provided that channel
         actually contains it.
         """
-        freq_hz = np.asarray(freq_hz, dtype=np.float64)
-        half_width_hz = 0.5 * self.bandwidth_hz
-        if half_width_hz > 0.0:
-            return np.abs(freq_hz - self.center_freq_hz) <= half_width_hz
-        nearest = int(np.argmin(np.abs(freq_hz - self.center_freq_hz)))
-        mask = np.zeros(freq_hz.shape, dtype=bool)
-        mask[nearest] = True
-        return mask
+        return channels_within(freq_hz, self.center_freq_hz, self.bandwidth_hz)
 
     def on_frames(self, ctx: BlockContext) -> np.ndarray:
         """Per-sample on/off state of the transmitter within a block.
@@ -710,12 +848,12 @@ class NarrowbandTransmitter(RFISource):
         """
         occupied = self.occupied_channels(ctx.freq_hz)
         n_occupied = int(occupied.sum())
-        if n_occupied == 0 or not _band_overlaps(self, ctx.freq_hz, ctx.chan_width_hz):
+        in_band = band_overlaps(
+            self.center_freq_hz, self.bandwidth_hz, ctx.freq_hz, ctx.chan_width_hz
+        )
+        if n_occupied == 0 or not in_band:
             raise ValueError(
-                f"source {self.name!r} emits at "
-                f"{self.center_freq_hz / 1e6:.3f} MHz +/- {self.bandwidth_hz / 2e6:.3f} MHz, "
-                f"outside the simulated band "
-                f"{ctx.freq_hz[0] / 1e6:.3f}-{ctx.freq_hz[-1] / 1e6:.3f} MHz"
+                out_of_band_message(self.name, self.center_freq_hz, self.bandwidth_hz, ctx.freq_hz)
             )
 
         on = self.on_frames(ctx)
@@ -726,7 +864,7 @@ class NarrowbandTransmitter(RFISource):
 
         # One emitted waveform, shared by every antenna; only the occupied
         # channels are drawn, so the cost scales with the occupied band.
-        waveform = _circular_normal(ctx.rng, (n_occupied, ctx.n_time))
+        waveform = circular_normal(ctx.rng, (n_occupied, ctx.n_time))
         waveform *= np.sqrt(envelope[occupied], dtype=np.float64).astype(np.float32)
 
         phasors = near_field_phasors(
@@ -918,37 +1056,9 @@ class ImpulsiveBroadband(RFISource):
         if active.size == 0:
             return voltages, mask
 
-        waveform = _circular_normal(ctx.rng, (ctx.n_chan, active.size))
+        waveform = circular_normal(ctx.rng, (ctx.n_chan, active.size))
         waveform *= np.sqrt(per_sample_jy[active]).astype(np.float32)[np.newaxis, :]
 
         phasors = near_field_phasors(self.position_enu_m, ctx.antenna_positions_enu_m, ctx.freq_hz)
         voltages[:, :, active] = phasors[:, :, np.newaxis] * waveform[np.newaxis, :, :]
         return voltages, mask
-
-
-def _band_overlaps(
-    source: NarrowbandTransmitter, freq_hz: np.ndarray, chan_width_hz: float
-) -> bool:
-    """Whether a narrowband source's emission falls inside the simulated band.
-
-    Parameters
-    ----------
-    source : NarrowbandTransmitter
-        Source to test.
-    freq_hz : numpy.ndarray
-        Shape ``(n_chan,)`` ascending RF channel centers, Hz.
-    chan_width_hz : float
-        Channel width, Hz.
-
-    Returns
-    -------
-    bool
-        True if any part of ``center +/- bandwidth/2`` lies within the
-        band edges (channel centers extended by half a channel).
-    """
-    low_hz = float(freq_hz[0]) - 0.5 * chan_width_hz
-    high_hz = float(freq_hz[-1]) + 0.5 * chan_width_hz
-    half_width_hz = 0.5 * source.bandwidth_hz
-    return (source.center_freq_hz + half_width_hz >= low_hz) and (
-        source.center_freq_hz - half_width_hz <= high_hz
-    )

@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=1.24",
     "astropy>=5.3",
     "pyyaml",
+    "sgp4>=2.20",
 ]
 
 [project.optional-dependencies]
