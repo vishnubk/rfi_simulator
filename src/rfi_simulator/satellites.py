@@ -487,6 +487,11 @@ def fetch_tles(
             "underscores and hyphens only (for example 'gps-ops', 'starlink')"
         )
 
+    if max_age_hours < 0.0:
+        raise ValueError(f"max_age_hours must be >= 0, got {max_age_hours}")
+    if timeout_s <= 0.0:
+        raise ValueError(f"timeout_s must be > 0, got {timeout_s}")
+
     cache_dir = Path(cache_dir).expanduser()
     cache_path = cache_dir / f"{group}.tle"
 
@@ -787,17 +792,23 @@ class SatelliteTransmitter(RFISource):
             envelope[carrier_channel, :] += carrier_power_jy
 
         sideband_channels = np.zeros(ctx.n_chan, dtype=bool)
-        if sideband_power_jy > 0.0 and total_width_hz > 0.0:
+        if total_width_hz > 0.0:
             sideband_channels = channels_within(ctx.freq_hz, received_hz, total_width_hz)
             n_sideband = int(sideband_channels.sum())
-            if n_sideband > 0:
+            if sideband_power_jy > 0.0 and n_sideband > 0:
                 envelope[sideband_channels, :] += sideband_power_jy / n_sideband
 
-        occupied = envelope[:, 0] > 0.0
+        # Occupancy is the frequency footprint (carrier plus sidebands), never
+        # the power values: a zero-power transmitter is in band and silent, not
+        # out of band.
+        occupied = carrier_channel | sideband_channels
         n_occupied = int(occupied.sum())
         if n_occupied == 0:
-            raise ValueError(
-                out_of_band_message(self.name, received_hz, total_width_hz, ctx.freq_hz)
+            # Footprint misses every channel (e.g. Doppler pushed the carrier
+            # into a gap at the band edge): silent, like the horizon cut.
+            return (
+                np.zeros((ctx.n_antennas, ctx.n_chan, ctx.n_time), dtype=np.complex64),
+                np.zeros((ctx.n_chan, ctx.n_time), dtype=bool),
             )
 
         # One emitted waveform shared by every antenna, as for the sky.

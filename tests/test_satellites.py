@@ -376,3 +376,49 @@ def test_satellite_labels_reach_the_visibilities(default_array, tle):
         )
     # A continuously transmitting satellite occupies its channel all the time.
     assert vis.rfi_fraction.max() == pytest.approx(1.0)
+
+
+def test_zero_power_satellite_is_silent_not_out_of_band(default_array, tle):
+    """A zero-power transmitter is in band and silent, not "out of band".
+
+    ``received_power_jy=0.0`` passes constructor validation, so it must
+    produce an all-zero contribution rather than a misleading ValueError
+    blaming the band configuration (regression: occupancy used to be
+    derived from the power envelope instead of the frequency footprint).
+    """
+    source = SatelliteTransmitter(tle, carrier_freq_hz=IN_BAND_CARRIER_HZ, received_power_jy=0.0)
+    sim = make_simulator(default_array, APPROACH_TIME, [source])
+    block = sim.block(0)
+    assert not np.any(block.rfi_mask)
+
+
+def test_satellite_and_ground_sources_coexist(default_array, tle):
+    """A satellite and a ground transmitter stack masks independently."""
+    from rfi_simulator import NarrowbandTransmitter
+
+    satellite = SatelliteTransmitter(
+        tle, carrier_freq_hz=IN_BAND_CARRIER_HZ, received_power_jy=50.0
+    )
+    tower = NarrowbandTransmitter(
+        (2000.0, 0.0, 30.0),
+        center_freq_hz=IN_BAND_CARRIER_HZ + 2.0e5,
+        bandwidth_hz=6.0e4,
+        received_power_jy=50.0,
+    )
+    sim = make_simulator(default_array, APPROACH_TIME, [satellite, tower])
+    block = sim.block(0)
+    assert block.rfi_mask.shape[0] == 2
+    assert block.rfi_mask[0].any() and block.rfi_mask[1].any()
+    vis = correlate(sim.blocks())
+    assert vis.rfi_fraction.shape[1] == 2
+    assert (vis.rfi_fraction > 0).any(axis=(0, 2)).all()
+
+
+def test_fetch_tles_rejects_negative_config(tmp_path):
+    """Negative cache age or timeout is a caller error, refused up front."""
+    from rfi_simulator.satellites import fetch_tles
+
+    with pytest.raises(ValueError, match="max_age_hours"):
+        fetch_tles("gps-ops", tmp_path, max_age_hours=-1.0)
+    with pytest.raises(ValueError, match="timeout_s"):
+        fetch_tles("gps-ops", tmp_path, timeout_s=0.0)
