@@ -25,6 +25,12 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: end-to-end runs at the full Stage 2 defaults (a few seconds each)",
+]
+
 [tool.ruff]
 line-length = 100
 
