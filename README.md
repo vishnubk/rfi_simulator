@@ -2,7 +2,7 @@
 
 Tools for simulating radio-frequency interference (RFI) in radio-interferometric data.
 
-Simulates a small, configurable antenna array observing celestial sources, with RFI injected at the voltage level and propagated through channelization, correlation, and imaging. Currently implemented: point-source sky model, geometric delay tracking, FX correlation, and dirty imaging; RFI signal models are the next step.
+Simulates a small, configurable antenna array observing celestial sources, with RFI injected at the voltage level and propagated through channelization, correlation, and imaging. Currently implemented: point-source sky model, geometric delay tracking, FX correlation, dirty imaging, and a library of RFI sources — narrowband stationary transmitters, broadband impulsive events, TLE-driven satellites (with Doppler and near-field geometry), and ADS-B aircraft — each carrying ground-truth time–frequency contamination labels through every stage.
 
 ## Quickstart
 
@@ -26,6 +26,15 @@ image, l_grid, m_grid = dirty_image(vis)
 peak = np.unravel_index(np.argmax(image), image.shape)
 print(f"peak {image[peak]:.2f} Jy at l={l_grid[peak[1]]:+.4f}, m={m_grid[peak[0]]:+.4f}")
 # -> peak 4.82 Jy at l=+0.0086, m=-0.0054
+```
+
+## Web interface
+
+An interactive browser UI for exploring the simulator — edit the antenna layout on a site plan, add sky and RFI sources, and view per-antenna waterfalls (with ground-truth RFI mask overlays), the dirty image, and uv coverage. It is a thin layer over the library and runs fully offline.
+
+```bash
+pip install -e '.[webui]'
+rfi-simulator-ui --port 8765   # then open http://127.0.0.1:8765
 ```
 
 Under active development; documentation and datasets will be published as the project matures.
