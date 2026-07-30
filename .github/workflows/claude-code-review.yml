@@ -1,0 +1,39 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+
+jobs:
+  claude-review:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Automatic PR review
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Review this pull request thoroughly. Priorities, in order:
+            1. Correctness — especially numerical and signal-processing code:
+               units (Hz vs MHz, deg vs rad), array shapes and channel ordering,
+               complex conjugation and sign conventions, dtype truncation,
+               off-by-one errors in indexing.
+            2. Tests — does new physics code come with a sanity test? Do the
+               tests actually assert meaningful values rather than just running?
+            3. Clarity — this codebase is read by students; flag anything that
+               needs a comment or a simpler structure.
+            Be direct and specific; cite file and line. Approve-with-nits when
+            issues are minor.
+          claude_args: '--allowed-tools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"'
