@@ -1,3 +1,19 @@
+# Local working files
+docs/
+CLAUDE.md
+CHANGELOG.md
+.claude/
+
+# Data & outputs
+*.h5
+*.hdf5
+*.npz
+*.npy
+*.out
+*.ms/
+data/
+outputs/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
