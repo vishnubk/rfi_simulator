@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=1.24",
     "astropy>=5.3",
     "pyyaml",
+    "sgp4>=2.20",
 ]
 
 [project.optional-dependencies]
@@ -27,7 +28,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "slow: end-to-end runs at the full Stage 2 defaults (a few seconds each)",
+    "slow: end-to-end runs at the full package defaults (a few seconds each)",
 ]
 
 [tool.ruff]

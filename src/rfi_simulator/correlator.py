@@ -31,7 +31,7 @@ included.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from astropy.time import Time
@@ -96,6 +96,23 @@ class Visibilities:
     s0_enu : numpy.ndarray
         Shape ``(n_int, 3)`` ENU unit vector towards the phase center at
         each integration center.
+    rfi_fraction : numpy.ndarray
+        Float64 ground-truth labels of shape
+        ``(n_int, n_interference_sources, n_chan)``: the fraction of the
+        integration's voltage samples in which each source occupied each
+        channel, in ``[0, 1]``. This is the voltage-resolution occupancy
+        mask averaged down to the integration grid, which is the only form
+        of it that survives correlation.
+
+        A run with no interference sources gives a **zero-sized** array of
+        shape ``(n_int, 0, n_chan)`` rather than a zero-filled one: there
+        is no source to report a fraction for, and the source axis then
+        stacks and concatenates consistently with contaminated runs. Both
+        ``rfi_fraction.max(initial=0.0)`` and ``(rfi_fraction == 0).all()``
+        behave as expected on it.
+    rfi_source_names : tuple of str
+        Names of the interference sources, in the order of
+        `rfi_fraction`'s middle axis.
     """
 
     data: np.ndarray
@@ -109,6 +126,18 @@ class Visibilities:
     e_l_enu: np.ndarray
     e_m_enu: np.ndarray
     s0_enu: np.ndarray
+    rfi_fraction: np.ndarray | None = None
+    rfi_source_names: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        if self.rfi_fraction is None:
+            self.rfi_fraction = np.zeros((self.n_int, 0, self.n_chan), dtype=np.float64)
+        self.rfi_source_names = tuple(self.rfi_source_names)
+
+    @property
+    def n_rfi_sources(self) -> int:
+        """int: Number of interference sources labelled in this dataset."""
+        return self.rfi_fraction.shape[1]
 
     @property
     def n_int(self) -> int:
@@ -189,7 +218,8 @@ def correlate(
     Raises
     ------
     ValueError
-        If `blocks` is empty.
+        If `blocks` is empty, or if the blocks do not all carry the same
+        interference-source labels.
 
     Notes
     -----
@@ -203,6 +233,7 @@ def correlate(
     e_l: list[np.ndarray] = []
     e_m: list[np.ndarray] = []
     s0: list[np.ndarray] = []
+    rfi_fraction: list[np.ndarray] = []
 
     pairs = None
     first: VoltageBlock | None = None
@@ -211,6 +242,11 @@ def correlate(
         if first is None:
             first = block
             pairs = baseline_index_pairs(block.n_antennas, include_autos=include_autos)
+        elif block.rfi_source_names != first.rfi_source_names:
+            raise ValueError(
+                "all blocks must carry the same interference-source labels, got "
+                f"{first.rfi_source_names} then {block.rfi_source_names}"
+            )
 
         voltages = np.ascontiguousarray(np.transpose(block.data, (1, 0, 2)))
         # (n_chan, n_ant, n_ant): V[c, i, j] = sum_t v_i v_j^*
@@ -233,6 +269,9 @@ def correlate(
         e_l.append(np.asarray(block.e_l_enu, dtype=np.float64))
         e_m.append(np.asarray(block.e_m_enu, dtype=np.float64))
         s0.append(np.asarray(block.s0_enu, dtype=np.float64))
+        # Labels ride along untouched by the correlation itself: the
+        # voltage-resolution mask simply averages down the time axis.
+        rfi_fraction.append(block.rfi_mask.mean(axis=2, dtype=np.float64))
 
     if first is None:
         raise ValueError("correlate() received no voltage blocks")
@@ -252,4 +291,6 @@ def correlate(
         e_l_enu=np.stack(e_l, axis=0),
         e_m_enu=np.stack(e_m, axis=0),
         s0_enu=np.stack(s0, axis=0),
+        rfi_fraction=np.stack(rfi_fraction, axis=0),
+        rfi_source_names=first.rfi_source_names,
     )
