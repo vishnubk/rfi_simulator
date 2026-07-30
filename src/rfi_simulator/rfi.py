@@ -91,6 +91,7 @@ generate them.
 
 from __future__ import annotations
 
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -103,6 +104,7 @@ from rfi_simulator.array_config import ArrayConfig, _to_value
 from rfi_simulator.delays import SPEED_OF_LIGHT_M_S, earth_location, enu_unit_vector
 
 __all__ = [
+    "MIN_SEPARATION_WAVELENGTHS",
     "OCCUPANCY_THRESHOLD",
     "BlockContext",
     "ImpulsiveBroadband",
@@ -115,6 +117,7 @@ __all__ = [
     "enu_from_geodetic",
     "enu_from_horizontal",
     "enu_rotation_matrix",
+    "elevation_deg",
     "near_field_phasors",
     "occupancy_mask",
     "out_of_band_message",
@@ -126,6 +129,41 @@ __all__ = [
 OCCUPANCY_THRESHOLD = 0.01
 """float: Mean-power fraction of a block's peak cell above which a cell is
 labelled as occupied by a source. See the module docstring."""
+
+MIN_SEPARATION_WAVELENGTHS = 10.0
+"""float: Transmitter-to-antenna separation, in wavelengths at the band
+center, below which `near_field_phasors` warns that the ``1/r`` amplitude
+model has stopped being meaningful."""
+
+
+def elevation_deg(position_enu_m) -> float:
+    """Elevation angle of a local ENU position above the horizontal plane.
+
+    Parameters
+    ----------
+    position_enu_m : array_like
+        Position, shape ``(3,)``, local ENU meters relative to the array
+        origin.
+
+    Returns
+    -------
+    float
+        Elevation in degrees: 90 straight up, 0 on the horizontal plane
+        through the array origin, negative below it.
+
+    Notes
+    -----
+    This is a *geometric* elevation in the array's local tangent plane. It
+    ignores Earth curvature, so for a distant object it is not quite the
+    elevation an observer would measure; the difference matters only for
+    sources within a degree or so of the horizon, which is also where
+    refraction and terrain dominate anyway.
+    """
+    position = np.asarray(position_enu_m, dtype=np.float64).reshape(3)
+    norm = float(np.linalg.norm(position))
+    if norm == 0.0:
+        raise ValueError("cannot take the elevation of the array origin itself")
+    return float(np.rad2deg(np.arcsin(position[2] / norm)))
 
 
 # ----------------------------------------------------------------------
@@ -632,8 +670,60 @@ def near_field_phasors(
     tau_s = path_delays_s(position_enu_m, antenna_positions_enu_m)
     amplitudes = spreading_amplitudes(position_enu_m, antenna_positions_enu_m)
     freq_hz = np.asarray(freq_hz, dtype=np.float64)
+    _warn_if_too_close(position_enu_m, antenna_positions_enu_m, freq_hz)
     phase = np.exp(-2j * np.pi * freq_hz[np.newaxis, :] * tau_s[:, np.newaxis])
     return (amplitudes[:, np.newaxis] * phase).astype(np.complex64)
+
+
+def _warn_if_too_close(
+    position_enu_m, antenna_positions_enu_m: np.ndarray, freq_hz: np.ndarray
+) -> None:
+    """Warn when a transmitter is inside the array's reactive-near-field zone.
+
+    Parameters
+    ----------
+    position_enu_m : array_like
+        Transmitter position, shape ``(3,)``, local ENU meters.
+    antenna_positions_enu_m : numpy.ndarray
+        Antenna positions, shape ``(n_antennas, 3)``, local ENU meters.
+    freq_hz : numpy.ndarray
+        Channel frequencies, Hz; their mean sets the wavelength.
+
+    Warns
+    -----
+    UserWarning
+        If any antenna is within `MIN_SEPARATION_WAVELENGTHS` wavelengths
+        of the transmitter.
+
+    Notes
+    -----
+    The ``1/r`` amplitude model is normalized at the *array origin*, so
+    ``received_power_jy`` means "power at the origin". That contract stops
+    being useful once a transmitter is close enough that ``|x - r_i|``
+    varies wildly across the array: at 1 mm separation an antenna receives
+    a factor of order :math:`10^9` more power than the origin does, which
+    is arithmetically correct for a point emitter and physically
+    meaningless -- a real receiver that close is in the reactive near
+    field, where a scalar ``1/r`` model does not apply at all. The warning
+    fires well before that, at ten wavelengths, because the usual cause is
+    a units slip (kilometres entered as meters) rather than a deliberate
+    choice.
+    """
+    distances_m = path_lengths_m(position_enu_m, antenna_positions_enu_m)
+    wavelength_m = SPEED_OF_LIGHT_M_S / float(np.mean(freq_hz))
+    threshold_m = MIN_SEPARATION_WAVELENGTHS * wavelength_m
+    closest_m = float(distances_m.min())
+    if closest_m < threshold_m:
+        warnings.warn(
+            f"a transmitter is {closest_m:.4g} m from the nearest antenna, closer "
+            f"than {MIN_SEPARATION_WAVELENGTHS:g} wavelengths ({threshold_m:.4g} m) "
+            "at the band center. The 1/r amplitude model is normalized at the array "
+            "origin, so the per-antenna received power is now wildly non-uniform and "
+            "the source's received_power_jy no longer describes what any antenna "
+            "sees. Check the position units.",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 def occupancy_mask(envelope_jy: np.ndarray, threshold: float = OCCUPANCY_THRESHOLD) -> np.ndarray:
@@ -734,6 +824,13 @@ class NarrowbandTransmitter(RFISource):
     and an excision algorithm tuned on this simulator will be optimistic
     about how sharply interference is confined until a filter-bank model
     is added.
+
+    The transmitter is always visible: it is specified by an ENU position
+    with an implied line of sight, and **no terrain shadowing, horizon cut
+    or diffraction is modelled**. A position placed below the horizontal
+    plane through the array origin still transmits at full strength. Place
+    ground-based transmitters where the array can actually see them, or
+    lower `received_power_jy` to stand in for an obstructed path.
 
     Examples
     --------
@@ -930,6 +1027,11 @@ class ImpulsiveBroadband(RFISource):
 
     Notes
     -----
+    Like `NarrowbandTransmitter`, the source is specified by an ENU
+    position with an implied line of sight: **no terrain shadowing,
+    horizon cut or diffraction is modelled**, so a position below the
+    array's horizontal plane still emits at full strength.
+
     Events are placed uniformly over the block's samples and are allowed
     to run off the end of the block, where they are simply truncated. That
     is a small (order ``pulse_width_samples / n_time``) edge effect and it

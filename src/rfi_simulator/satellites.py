@@ -58,6 +58,7 @@ so examples and tests have a real orbit to propagate offline.
 
 from __future__ import annotations
 
+import re
 import time as _time
 import urllib.error
 import urllib.parse
@@ -78,6 +79,7 @@ from rfi_simulator.rfi import (
     band_overlaps,
     channels_within,
     circular_normal,
+    elevation_deg,
     enu_from_ecef_offset,
     near_field_phasors,
     occupancy_mask,
@@ -86,6 +88,7 @@ from rfi_simulator.rfi import (
 
 __all__ = [
     "CATALOGUE_URL",
+    "MAX_TLE_AGE_DAYS",
     "SatelliteTransmitter",
     "TwoLineElement",
     "fetch_tles",
@@ -94,6 +97,17 @@ __all__ = [
 
 CATALOGUE_URL = "https://celestrak.org/NORAD/elements/gp.php"
 """str: Public general-perturbations catalogue endpoint used by `fetch_tles`."""
+
+_GROUP_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
+"""re.Pattern: Accepted catalogue group names. Deliberately strict -- the
+group name is interpolated into a cache file path as well as a URL."""
+
+MAX_TLE_AGE_DAYS = 14.0
+"""float: Age of an element set, in days either side of its epoch, beyond
+which `SatelliteTransmitter` warns that the propagated position is no
+longer trustworthy. Two weeks is generous for a low orbiter and about
+right for a medium-orbit navigation satellite; there is no sharp cliff,
+which is exactly why a single documented constant is used."""
 
 _RANGE_RATE_STEP_S = 0.5
 """float: Half-interval used to difference the topocentric range, seconds."""
@@ -435,6 +449,11 @@ def fetch_tles(
 
     Raises
     ------
+    ValueError
+        If `group` is not a plain catalogue group name (letters, digits,
+        underscores and hyphens). The name is interpolated into both a
+        filesystem path and a URL, so anything else -- a path separator,
+        ``..``, a query fragment -- is rejected before either is built.
     RuntimeError
         If the download fails and no cached copy exists. The message
         names the cache path, so the offline fix -- drop a catalogue file
@@ -459,6 +478,15 @@ def fetch_tles(
     >>> len(tles)  # doctest: +SKIP
     31
     """
+    # Validate before building either a path or a URL: `group` reaches the
+    # filesystem, and a name like "../../etc/x" would read and write
+    # outside `cache_dir` entirely.
+    if not _GROUP_PATTERN.fullmatch(group):
+        raise ValueError(
+            f"invalid catalogue group name {group!r}: expected letters, digits, "
+            "underscores and hyphens only (for example 'gps-ops', 'starlink')"
+        )
+
     cache_dir = Path(cache_dir).expanduser()
     cache_path = cache_dir / f"{group}.tle"
 
@@ -533,14 +561,29 @@ class SatelliteTransmitter(RFISource):
         If True (default) shift the received frequency by
         ``-carrier_freq_hz * range_rate / c``. Set False to isolate the
         geometry when debugging.
+    min_elevation_deg : float or astropy.units.Quantity, optional
+        Elevation below which the satellite is treated as set: blocks
+        whose mid-point elevation is under this contribute exactly zero
+        voltages and an all-False mask. Default 0.0, the geometric
+        horizon. Raise it to model a horizon mask, or set it to ``-90``
+        to disable the cut entirely and let the satellite transmit
+        through the Earth.
     name : str, optional
         Label for the source. Default ``"satellite"``.
 
     Raises
     ------
     ValueError
-        If any power or bandwidth is negative, or
-        `sideband_power_fraction` is outside ``[0, 1]``.
+        If any power or bandwidth is negative,
+        `sideband_power_fraction` is outside ``[0, 1]``, or
+        `min_elevation_deg` is outside ``[-90, 90]``.
+
+    Warns
+    -----
+    UserWarning
+        If the observation time is more than `MAX_TLE_AGE_DAYS` from the
+        element set's epoch, where SGP4 still returns a plausible-looking
+        position that is wrong by many kilometres.
 
     Notes
     -----
@@ -551,6 +594,15 @@ class SatelliteTransmitter(RFISource):
     consistent with how celestial sources are handled here. Very long
     blocks would smear the Doppler within a block; shorten the block
     rather than the observation if that matters.
+
+    The horizon test is a **sharp geometric cut** in the array's local
+    tangent plane: a satellite is either fully visible or fully absent,
+    switching state between one block and the next. No atmospheric
+    refraction (which lifts a setting object by roughly half a degree),
+    no knife-edge diffraction over the limb, no terrain and no antenna
+    response are modelled. Real horizon crossings are gradual, so
+    algorithms trained to key on an abrupt appearance are keying on an
+    artefact of this model.
 
     Examples
     --------
@@ -571,6 +623,7 @@ class SatelliteTransmitter(RFISource):
         sideband_bandwidth_hz=0.0,
         sideband_power_fraction: float = 0.0,
         apply_doppler: bool = True,
+        min_elevation_deg=0.0,
         name: str = "satellite",
     ) -> None:
         super().__init__(name)
@@ -580,7 +633,12 @@ class SatelliteTransmitter(RFISource):
         self.sideband_bandwidth_hz = float(_to_value(sideband_bandwidth_hz, u.Hz))
         self.sideband_power_fraction = float(sideband_power_fraction)
         self.apply_doppler = bool(apply_doppler)
+        self.min_elevation_deg = float(_to_value(min_elevation_deg, u.deg))
 
+        if not -90.0 <= self.min_elevation_deg <= 90.0:
+            raise ValueError(
+                f"min_elevation_deg must be in [-90, 90], got {self.min_elevation_deg}"
+            )
         if self.received_power_jy < 0.0:
             raise ValueError(f"received_power_jy must be >= 0, got {self.received_power_jy}")
         if self.sideband_bandwidth_hz < 0.0:
@@ -590,6 +648,39 @@ class SatelliteTransmitter(RFISource):
         if not 0.0 <= self.sideband_power_fraction <= 1.0:
             raise ValueError(
                 f"sideband_power_fraction must be in [0, 1], got {self.sideband_power_fraction}"
+            )
+
+    def _warn_if_elements_are_stale(self, time: Time) -> None:
+        """Warn when propagating far from the element set's epoch.
+
+        Parameters
+        ----------
+        time : astropy.time.Time
+            Scalar epoch the caller wants a position for.
+
+        Warns
+        -----
+        UserWarning
+            If ``|time - tle.epoch|`` exceeds `MAX_TLE_AGE_DAYS`.
+
+        Notes
+        -----
+        SGP4 does not fail on a stale element set; it returns a smooth,
+        plausible orbit that has silently drifted -- tens of kilometres
+        after a few weeks, which is degrees of pointing error. Because the
+        failure is invisible in the output, it has to be announced at the
+        input.
+        """
+        age_days = abs(float((time - self.tle.epoch).to_value(u.day)))
+        if age_days > MAX_TLE_AGE_DAYS:
+            warnings.warn(
+                f"propagating {self.tle.name or 'satellite'} {age_days:.1f} days from "
+                f"its element-set epoch ({self.tle.epoch.isot}); beyond "
+                f"{MAX_TLE_AGE_DAYS:g} days SGP4 still returns a plausible-looking "
+                "position, but it may be wrong by many kilometres. Fetch current "
+                "elements, or move the observation time closer to the epoch.",
+                UserWarning,
+                stacklevel=3,
             )
 
     def doppler_shift_hz(self, time: Time, location: EarthLocation) -> float:
@@ -648,7 +739,8 @@ class SatelliteTransmitter(RFISource):
             Boolean ``(n_chan, n_time)`` occupancy labels. Constant in
             time within a block, since the emission is continuous; it is
             the *frequency* that moves, block to block, as the Doppler
-            shift changes.
+            shift changes. All False for a block in which the satellite
+            is below `min_elevation_deg`.
 
         Raises
         ------
@@ -656,9 +748,27 @@ class SatelliteTransmitter(RFISource):
             If the received spectrum lies wholly outside the simulated
             band -- the usual case for a real navigation downlink at the
             package defaults. Re-center the band or set an in-band
-            `carrier_freq_hz`.
+            `carrier_freq_hz`. Note the horizon test comes first: a set
+            satellite is silent rather than an error, since a pass moving
+            out of view is normal operation.
+
+        Warns
+        -----
+        UserWarning
+            If the block is more than `MAX_TLE_AGE_DAYS` from the element
+            set's epoch.
         """
+        self._warn_if_elements_are_stale(ctx.center_time)
+
         position_enu_m = self.tle.enu_position_m(ctx.center_time, ctx.location)
+        if elevation_deg(position_enu_m) < self.min_elevation_deg:
+            # Below the horizon: the Earth is in the way. Silent, and
+            # labelled silent -- not an error, and not a faint signal.
+            return (
+                np.zeros((ctx.n_antennas, ctx.n_chan, ctx.n_time), dtype=np.complex64),
+                np.zeros((ctx.n_chan, ctx.n_time), dtype=bool),
+            )
+
         received_hz = self.received_freq_hz(ctx.center_time, ctx.location)
         total_width_hz = max(self.sideband_bandwidth_hz, 0.0)
 

@@ -46,6 +46,7 @@ from rfi_simulator.rfi import (
     band_overlaps,
     channels_within,
     circular_normal,
+    elevation_deg,
     near_field_phasors,
     occupancy_mask,
     out_of_band_message,
@@ -94,17 +95,33 @@ class ADSBTransponder(RFISource):
         Burst length in post-channelization samples. Default 1: at the
         package defaults a real burst is ~30 times shorter than one
         sample, so one sample is already an over-estimate.
+    min_elevation_deg : float or astropy.units.Quantity, optional
+        Elevation below which the aircraft is treated as over the
+        horizon: blocks whose mid-point elevation is under this
+        contribute exactly zero voltages and an all-False mask. Default
+        0.0, the geometric horizon -- which matters here, because a
+        long track at cruise altitude flies out of view during a single
+        simulated pass. Set to ``-90`` to disable the cut.
     name : str, optional
         Label for the source. Default ``"transponder"``.
 
     Raises
     ------
     ValueError
-        If any rate, power, bandwidth or width is invalid, or if the
-        position/velocity vectors are not 3-vectors.
+        If any rate, power, bandwidth or width is invalid, if the
+        position/velocity vectors are not 3-vectors, or if
+        `min_elevation_deg` is outside ``[-90, 90]``.
 
     Notes
     -----
+    The horizon test is a **sharp geometric cut** in the array's local
+    tangent plane: the aircraft is either fully visible or fully absent,
+    switching between one block and the next. No atmospheric refraction,
+    knife-edge diffraction, terrain or antenna response is modelled, and
+    Earth curvature is not applied to the tangent plane -- so for an
+    aircraft hundreds of kilometres away the cut is approximate. Real
+    horizon crossings fade; this one does not.
+
     Time is measured from the start of the observation, taken as
     ``block index * block duration`` -- blocks tile the observation
     contiguously, so the aircraft's position depends only on the block
@@ -140,6 +157,7 @@ class ADSBTransponder(RFISource):
         received_power_jy=5.0e4,
         message_rate_hz=6.2,
         pulse_width_samples: int = 1,
+        min_elevation_deg=0.0,
         name: str = "transponder",
     ) -> None:
         super().__init__(name)
@@ -154,7 +172,12 @@ class ADSBTransponder(RFISource):
         self.received_power_jy = float(_to_value(received_power_jy, u.Jy))
         self.message_rate_hz = float(_to_value(message_rate_hz, u.Hz))
         self.pulse_width_samples = int(pulse_width_samples)
+        self.min_elevation_deg = float(_to_value(min_elevation_deg, u.deg))
 
+        if not -90.0 <= self.min_elevation_deg <= 90.0:
+            raise ValueError(
+                f"min_elevation_deg must be in [-90, 90], got {self.min_elevation_deg}"
+            )
         if self.bandwidth_hz < 0.0:
             raise ValueError(f"bandwidth_hz must be >= 0, got {self.bandwidth_hz}")
         if self.received_power_jy < 0.0:
@@ -229,7 +252,8 @@ class ADSBTransponder(RFISource):
             root-Jy.
         mask : numpy.ndarray
             Boolean ``(n_chan, n_time)`` occupancy labels: the occupied
-            channels, on the samples a burst landed in.
+            channels, on the samples a burst landed in. All False for a
+            block in which the aircraft is below `min_elevation_deg`.
 
         Raises
         ------
@@ -237,7 +261,9 @@ class ADSBTransponder(RFISource):
             If the burst spectrum lies wholly outside the simulated band.
             At the package defaults that is the *expected* outcome for a
             1090 MHz transponder, and it is an error rather than silence
-            so the band mismatch is impossible to overlook.
+            so the band mismatch is impossible to overlook. The band check
+            runs before the horizon test, so a misconfigured band is
+            reported even on blocks where the aircraft is out of view.
         """
         in_band = band_overlaps(
             self.carrier_freq_hz, self.bandwidth_hz, ctx.freq_hz, ctx.chan_width_hz
@@ -247,6 +273,16 @@ class ADSBTransponder(RFISource):
         if not in_band or n_occupied == 0:
             raise ValueError(
                 out_of_band_message(self.name, self.carrier_freq_hz, self.bandwidth_hz, ctx.freq_hz)
+            )
+
+        position_enu_m = self.block_position_enu_m(ctx)
+        if elevation_deg(position_enu_m) < self.min_elevation_deg:
+            # Over the horizon: silent, and labelled silent. Note this
+            # returns before drawing any bursts, so an out-of-view block
+            # costs nothing and consumes no randomness it does not need.
+            return (
+                np.zeros((ctx.n_antennas, ctx.n_chan, ctx.n_time), dtype=np.complex64),
+                np.zeros((ctx.n_chan, ctx.n_time), dtype=bool),
             )
 
         starts = self.draw_burst_samples(ctx)
@@ -268,7 +304,7 @@ class ADSBTransponder(RFISource):
         waveform *= np.float32(np.sqrt(self.received_power_jy / n_occupied))
 
         phasors = near_field_phasors(
-            self.block_position_enu_m(ctx), ctx.antenna_positions_enu_m, ctx.freq_hz[occupied]
+            position_enu_m, ctx.antenna_positions_enu_m, ctx.freq_hz[occupied]
         )
         voltages[np.ix_(np.arange(ctx.n_antennas), occupied, active_samples)] = (
             phasors[:, :, np.newaxis] * waveform[np.newaxis, :, :]
