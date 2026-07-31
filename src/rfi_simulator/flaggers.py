@@ -557,6 +557,14 @@ def sumthreshold_mask(
     is aimed at *added* power. Pass ``numpy.abs(residual)`` for a
     two-sided test.
 
+    **Flags freeze within a pass.** Every window position in one pass
+    reads the mask as it stood when the pass began; cells flagged by a
+    pass take effect only from the next pass on. Reference
+    implementations that update the mask *within* a sweep can flag a
+    slightly different set of cells on the same input, so a cell-for-cell
+    comparison against them will show small differences that are not
+    bugs.
+
     **False-alarm rate.** Only the first pass has an analytic rate: with
     ``iterations=1`` and a standard-normal residual, exactly the cells
     above `chi_1` are flagged, a fraction ``Q(chi_1)``. Every further
