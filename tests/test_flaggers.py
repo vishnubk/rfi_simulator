@@ -23,6 +23,7 @@ means the behaviour changed rather than that the dice came up badly.
 """
 
 import math
+import warnings
 from statistics import NormalDist
 
 import numpy as np
@@ -35,7 +36,7 @@ from rfi_simulator import (
     bin_mean,
     flag_scores,
     mad_clip_mask,
-    pool_truth,
+    pool_truth_accumulations,
     spectral_kurtosis_mask,
     sumthreshold_mask,
 )
@@ -161,15 +162,29 @@ def test_spectral_kurtosis_accepts_a_per_antenna_cube():
 
 
 def test_spectral_kurtosis_flags_undefined_accumulations():
-    """NaN samples and zero-power accumulations are flagged, statistic NaN."""
+    """Non-finite samples and zero-power accumulations are flagged, statistic NaN."""
     rng = np.random.default_rng(105)
-    voltages = gaussian_voltages(rng, (3, 128)).astype(np.complex64)
+    voltages = gaussian_voltages(rng, (4, 128)).astype(np.complex64)
     voltages[0, 5] = np.nan
     voltages[1, :] = 0.0
+    voltages[3, 70] = np.inf
     mask, sk = spectral_kurtosis_mask(voltages, m=64, return_statistic=True)
     assert mask[0, 0] and math.isnan(sk[0, 0])
     assert mask[1].all() and np.isnan(sk[1]).all()
+    assert mask[3, 1] and math.isnan(sk[3, 1])
     assert not mask[0, 1]  # the second accumulation of row 0 is untouched
+    assert not mask[3, 0]
+
+
+def test_spectral_kurtosis_does_not_leak_runtime_warnings():
+    """Undefined accumulations are a defined outcome, so nothing warns."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        spectral_kurtosis_mask(np.full((2, 8), np.nan, dtype=np.complex128), m=4)
+        spectral_kurtosis_mask(np.zeros((2, 8), dtype=np.complex64), m=4)
+        spectral_kurtosis_mask(
+            np.full((2, 8), np.inf, dtype=np.complex128), m=4, return_statistic=True
+        )
 
 
 def test_spectral_kurtosis_is_blind_to_steady_gaussian_interference():
@@ -203,15 +218,31 @@ def test_spectral_kurtosis_is_deterministic():
     [
         ({"m": 1}, "m must be >= 2"),
         ({"m": 4096}, "m must be <="),
+        ({"m": 2.9}, "m must be a whole number"),
+        ({"m": 64.5}, "m must be a whole number"),
         ({"m": 64, "pfa": 0.0}, r"pfa must be in \(0, 1\)"),
         ({"m": 64, "pfa": 1.0}, r"pfa must be in \(0, 1\)"),
     ],
 )
 def test_spectral_kurtosis_validates_its_parameters(kwargs, message):
-    """Bad accumulation lengths and probabilities raise, they do not clamp."""
+    """Bad accumulation lengths and probabilities raise, they do not clamp.
+
+    A fractional `m` is rejected rather than truncated: ``m=2.9`` would
+    silently become 2, changing the grid the mask is defined on and the
+    grid the truth has to be pooled onto with it.
+    """
     voltages = np.zeros((2, 256), dtype=np.complex64)
     with pytest.raises(ValueError, match=message):
         spectral_kurtosis_mask(voltages, **kwargs)
+
+
+def test_spectral_kurtosis_accepts_integral_floats_and_numpy_integers():
+    """Whole-number floats and numpy integers are fine; only fractions are not."""
+    rng = np.random.default_rng(108)
+    voltages = gaussian_voltages(rng, (2, 256))
+    reference = spectral_kurtosis_mask(voltages, m=64)
+    for value in (64.0, np.int64(64), np.int32(64)):
+        np.testing.assert_array_equal(spectral_kurtosis_mask(voltages, m=value), reference)
 
 
 def test_spectral_kurtosis_rejects_real_input():
@@ -279,11 +310,13 @@ def test_spectral_kurtosis_thresholds_are_optimistic_at_small_m():
     """
     pfa = 0.0027
     ratios = {}
-    for m, n_accumulations in ((64, 8192), (1024, 1024)):
+    for m, n_accumulations in ((64, 8192), (1024, 4096)):
         rate, _ = sk_false_positive_rate(m=m, pfa=pfa, n_accumulations=n_accumulations, seed=202)
         ratios[m] = rate / pfa
-    assert 3.0 < ratios[64] < 9.0
-    assert 1.2 < ratios[1024] < 3.0
+    # Measured at these seeds and sample counts: about 3.7 and about 1.4,
+    # each with a binomial spread of a few per cent.
+    assert 3.0 < ratios[64] < 4.5
+    assert 1.1 < ratios[1024] < 2.0
     assert ratios[1024] < ratios[64]
 
     # The excess is one-sided: the lower tail under-fires, the upper tail
@@ -414,6 +447,47 @@ def test_mad_clip_flags_nan_cells():
     assert mask[0, 4]
     assert math.isnan(deviation[0, 4])
     assert int(mask.sum()) == 1
+
+
+def test_mad_clip_infinities_do_not_hide_a_co_channel_outlier():
+    """Infinities are missing data, not extreme data.
+
+    Five ``+inf`` cells out of eight give the channel an infinite median
+    if they are carried into the statistics; every deviation is then NaN
+    and *nothing* is flagged -- not the infinities, and not the 1e9
+    outlier sharing the channel. Excluding them from the median and MAD
+    and flagging them outright is the only reading in which the outlier
+    survives.
+    """
+    values = np.array([[np.inf] * 5 + [1.0, 1e9, 1.0]])
+    mask, deviation = mad_clip_mask(values, 5.0, return_statistic=True)
+    np.testing.assert_array_equal(mask[0], [True] * 5 + [False, True, False])
+    assert np.isnan(deviation[0, :5]).all()
+
+
+def test_mad_clip_flags_a_wholly_missing_channel():
+    """A channel with no finite cell is flagged wholesale, quietly."""
+    values = np.zeros((2, 8))
+    values[0] = np.nan
+    values[1, 3] = -np.inf
+    mask = mad_clip_mask(values, 5.0)
+    assert mask[0].all()
+    assert int(mask[1].sum()) == 1
+
+
+def test_mad_clip_does_not_leak_runtime_warnings():
+    """Degenerate channels are a defined outcome, so nothing warns.
+
+    `numpy.nanmedian` warns on an all-NaN slice, which would crash any
+    pipeline running with warnings as errors. The suppression is narrow:
+    only the two messages this function can legitimately provoke.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        mad_clip_mask(np.full((2, 8), np.nan))
+        mad_clip_mask(np.array([[np.inf] * 8, [1.0] * 8]))
+        mad_clip_mask(np.ones((2, 8)))  # zero MAD everywhere
+        mad_clip_mask(np.zeros((2, 8)), 5.0, return_statistic=True)
 
 
 def test_mad_clip_deviations_are_signed():
@@ -556,6 +630,59 @@ def test_sumthreshold_flags_nan_cells_without_spreading_them():
     assert int(mask.sum()) == 1
 
 
+def test_sumthreshold_survives_an_infinite_cell_beside_real_interference():
+    """A single -inf must not blind the method to its neighbours.
+
+    Left in the values, one ``-inf`` drives the running sum of every
+    window containing it to ``-inf``; the one-sided test then flags
+    nothing in any of those windows, so the faint 8-cell run right next
+    to it goes undetected -- and the ``-inf`` cell itself is never
+    flagged either, since it is a *negative* excursion. This is not a
+    contrived input: `mad_clip_mask` emits ``-inf`` for below-median
+    cells of a channel with no scale, and its deviation array is the
+    documented input to this function.
+    """
+    residual = np.zeros((4, 16))
+    residual[1, 4:12] = 2.5
+    residual[1, 3] = -np.inf
+    mask = sumthreshold_mask(residual, chi_1=6.0, iterations=5)
+    assert mask[1, 4:12].all()
+    assert mask[1, 3]
+    assert not mask[0].any()
+
+    # +inf is missing data too, and does not spread into its neighbours.
+    positive = np.zeros((4, 16))
+    positive[2, 7] = np.inf
+    spread = sumthreshold_mask(positive, chi_1=6.0, iterations=5)
+    assert spread[2, 7]
+    assert int(spread.sum()) == 1
+
+
+def test_sumthreshold_chain_from_mad_clip_deviations_is_safe():
+    """The documented chain end to end, on a channel with no scale.
+
+    The zero-MAD channel makes `mad_clip_mask` emit ``+/-inf``, which is
+    exactly the input that used to poison the sums.
+    """
+    power = np.ones((3, 32))
+    power[0, 10] = 100.0  # zero-MAD channel with one outlier
+    power[1] = np.arange(32) * 0.01
+    power[1, 20:28] += 0.5  # a faint run in a channel that does have a scale
+    _, deviation = mad_clip_mask(power, return_statistic=True)
+    mask = sumthreshold_mask(deviation, chi_1=6.0, iterations=5)
+    assert mask[0, 10]
+    assert mask[1, 20:28].any()
+
+
+def test_sumthreshold_does_not_leak_runtime_warnings():
+    """Non-finite input is neutralized before any arithmetic touches it."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        sumthreshold_mask(np.full((2, 8), np.nan))
+        sumthreshold_mask(np.full((2, 8), -np.inf))
+        sumthreshold_mask(np.full((2, 8), np.inf), return_statistic=True)
+
+
 def test_sumthreshold_is_deterministic():
     """Two identical calls give bit-identical masks."""
     rng = np.random.default_rng(403)
@@ -575,6 +702,9 @@ def test_sumthreshold_validates_its_input():
         sumthreshold_mask(np.ones((4, 8)), iterations=0)
     with pytest.raises(ValueError, match="rho must be > 1"):
         sumthreshold_mask(np.ones((4, 8)), rho=1.0)
+    for chi_1 in (0.0, -1.0):
+        with pytest.raises(ValueError, match="chi_1 must be > 0"):
+            sumthreshold_mask(np.ones((4, 8)), chi_1)
 
 
 def test_sumthreshold_windows_wider_than_the_axis_are_skipped():
@@ -644,9 +774,10 @@ def collect_statistics(simulator, antenna=0):
 
     Spectral kurtosis reads the complex voltages of one antenna; MAD
     clipping reads the same antenna's power averaged over the *same*
-    accumulations. Pooling the truth with `pool_truth` puts the labels on
-    that grid too, so all three arrays are directly comparable and
-    neither detector is handed a finer view than the other.
+    accumulations. `pool_truth_accumulations` puts the labels on that
+    grid too -- the same fixed blocks the kurtosis decided on -- so all
+    three arrays are directly comparable and neither detector is handed a
+    finer view than the other.
     """
     n_accumulations = N_TIME // ACCUMULATION
     kurtosis, deviation, truth = [], [], []
@@ -658,7 +789,7 @@ def collect_statistics(simulator, antenna=0):
         kurtosis.append(sk)
         deviation.append(dev)
         if block.n_rfi_sources:
-            truth.append(pool_truth(block.rfi_mask[0], (N_CHAN, n_accumulations)))
+            truth.append(pool_truth_accumulations(block.rfi_mask[0], ACCUMULATION))
     return (
         np.concatenate(kurtosis, axis=1),
         np.concatenate(deviation, axis=1),

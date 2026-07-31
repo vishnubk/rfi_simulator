@@ -11,7 +11,7 @@ the remainder off the end.
 import numpy as np
 import pytest
 
-from rfi_simulator import bin_any, bin_mean
+from rfi_simulator import bin_any, bin_mean, block_any
 from rfi_simulator.binning import bin_edges
 from rfi_simulator.webui import simulate as webui_simulate
 
@@ -115,3 +115,95 @@ def test_binning_is_a_no_op_when_the_axis_is_already_short_enough():
     assert bin_mean(values, axis=0, n_bins=4) is values
     assert bin_mean(values, axis=0, n_bins=9) is values
     assert bin_any(mask, axis=0, n_bins=4) is mask
+
+
+@pytest.mark.parametrize("n_bins", [0, -1])
+def test_binning_rejects_a_non_positive_bin_count(n_bins):
+    """A zero or negative count is an error, not an empty partition.
+
+    Left unchecked it reaches `numpy.linspace` and comes back as an empty
+    or reversed set of edges, so the caller gets an array of the wrong
+    shape instead of a complaint.
+    """
+    for call in (
+        lambda: bin_mean(np.zeros((2, 8)), axis=1, n_bins=n_bins),
+        lambda: bin_any(np.zeros((2, 8), dtype=bool), axis=1, n_bins=n_bins),
+        lambda: bin_edges(8, n_bins),
+    ):
+        with pytest.raises(ValueError, match="n_bins must be >= 1"):
+            call()
+
+
+# ----------------------------------------------------------------------
+# block_any: the fixed-block partition
+# ----------------------------------------------------------------------
+def test_block_any_uses_fixed_blocks_and_drops_the_tail():
+    """Hand-computed: 10 cells in blocks of 4 is two blocks, two cells dropped.
+
+    Cell 5 is inside block 1 and must land there; cell 9 is inside the
+    two-cell tail that belongs to no block and must vanish entirely.
+    """
+    mask = np.zeros((1, 10), dtype=bool)
+    mask[0, 5] = True
+    mask[0, 9] = True
+    np.testing.assert_array_equal(block_any(mask, 4), [[False, True]])
+
+
+def test_block_any_differs_from_bin_any_on_a_ragged_axis():
+    """The two partitions are genuinely different, and silently so.
+
+    This is the whole reason `block_any` exists: with 10 cells and a
+    block size of 4, `bin_any` into 2 bins cuts at cell 5 while
+    `block_any` cuts at cell 4. A cell-4 flag therefore lands in bin 0
+    under one rule and block 1 under the other, and a cell-8 flag lands
+    in bin 1 under one rule and in the discarded tail under the other.
+    Neither raises.
+    """
+    inside = np.zeros((1, 10), dtype=bool)
+    inside[0, 4] = True
+    np.testing.assert_array_equal(bin_any(inside, axis=1, n_bins=2), [[True, False]])
+    np.testing.assert_array_equal(block_any(inside, 4), [[False, True]])
+
+    tail = np.zeros((1, 10), dtype=bool)
+    tail[0, 8] = True
+    np.testing.assert_array_equal(bin_any(tail, axis=1, n_bins=2), [[False, True]])
+    np.testing.assert_array_equal(block_any(tail, 4), [[False, False]])
+
+
+def test_block_any_agrees_with_bin_any_when_the_block_size_divides():
+    """The two rules coincide exactly on a divisible axis."""
+    rng = np.random.default_rng(41)
+    mask = rng.random((3, 64)) < 0.1
+    for block_size in (1, 2, 4, 8, 16, 32, 64):
+        np.testing.assert_array_equal(
+            block_any(mask, block_size), bin_any(mask, axis=1, n_bins=64 // block_size)
+        )
+
+
+def test_block_any_pools_the_chosen_axis_only():
+    """Leading axes pass through untouched, and `axis` is honoured."""
+    rng = np.random.default_rng(42)
+    mask = rng.random((2, 5, 12)) < 0.2
+    assert block_any(mask, 5).shape == (2, 5, 2)
+    assert block_any(mask, 2, axis=1).shape == (2, 2, 12)
+    for antenna in range(2):
+        np.testing.assert_array_equal(block_any(mask, 5)[antenna], block_any(mask[antenna], 5))
+
+
+def test_block_any_returns_a_new_array():
+    """A block size of 1 is the identity in value but not in identity."""
+    mask = np.array([[True, False]])
+    pooled = block_any(mask, 1)
+    np.testing.assert_array_equal(pooled, mask)
+    pooled[0, 1] = True
+    assert not mask[0, 1]
+
+
+def test_block_any_validates_its_input():
+    """A non-boolean mask, a zero block, or an oversized block all raise."""
+    with pytest.raises(ValueError, match="boolean mask"):
+        block_any(np.zeros((2, 8)), 4)
+    with pytest.raises(ValueError, match="block_size must be >= 1"):
+        block_any(np.zeros((2, 8), dtype=bool), 0)
+    with pytest.raises(ValueError, match="block_size must be <="):
+        block_any(np.zeros((2, 8), dtype=bool), 9)

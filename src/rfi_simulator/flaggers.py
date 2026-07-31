@@ -16,9 +16,13 @@ Conventions shared by every flagger here
   else's job (`rfi_simulator.metrics`).
 * **Deterministic.** No generator is drawn from, so a mask is a pure
   function of the input array and the parameters.
-* **NaN cells are always flagged.** A NaN is either missing data or a
-  broken upstream step; either way it is not clean, and leaving it
-  unflagged would let it poison the statistics of whatever runs next.
+* **Non-finite cells are always flagged.** NaN and ``+/-inf`` alike are
+  read as missing data or as a broken upstream step; either way they are
+  not clean, and leaving them unflagged would let them poison the
+  statistics of whatever runs next. They are also excluded from each
+  detector's own statistics rather than merely tolerated -- an infinity
+  carried into a median or a running sum silently blinds a detector to
+  the real interference sitting beside it.
 * **The last axis is time, the second-to-last is frequency.** Leading
   axes (antenna, polarization, ...) are looped over implicitly by
   broadcasting: each is flagged independently.
@@ -35,8 +39,12 @@ Grids
 their input. `spectral_kurtosis_mask` accumulates over blocks of ``M``
 time samples and therefore returns a mask of shape
 ``(..., n_chan, n_time // M)``: one decision per accumulation, not one
-per sample. Comparing that with per-sample ground truth needs
-`rfi_simulator.metrics.pool_truth`.
+per sample, with the final ``n_time % M`` samples taking part in no
+accumulation at all. Comparing that with per-sample ground truth needs
+`rfi_simulator.metrics.pool_truth_accumulations`, which reproduces both
+the fixed-block partition and the dropped tail --
+`rfi_simulator.metrics.pool_truth` does neither and misaligns the labels
+whenever ``M`` does not divide ``n_time``.
 
 What each detector is sensitive to
 ----------------------------------
@@ -67,6 +75,7 @@ model. Both are documented per function.
 
 from __future__ import annotations
 
+import warnings
 from statistics import NormalDist
 
 import numpy as np
@@ -190,22 +199,30 @@ def spectral_kurtosis_mask(
     Gaussian and the true lower tail lighter, so the realized false-alarm
     rate **exceeds** `pfa`, and almost all of the excess sits in the
     upper tail. At the default `pfa` the realized rate on Gaussian noise
-    is about five times nominal at ``M = 64`` and still about twice
+    is about 3.7 times nominal at ``M = 64`` and still about 1.4 times
     nominal at ``M = 1024``; the ratio is worse for tighter `pfa` and
     better for looser. At ``M = 1024`` and ``pfa = 0.1`` it is within a
     few per cent. So: treat the default as a *sensitivity* setting, and
     calibrate the threshold on noise-only data whenever the false-alarm
     rate itself matters.
 
-    **Truncation.** If ``m`` does not divide ``n_time``, the last
-    ``n_time % m`` samples take part in no accumulation and are dropped.
-    They are not flagged and not reported; a partial accumulation would
-    have a different variance and a different threshold, which is a worse
-    trade than losing under ``m`` samples.
+    **Truncation, and pooling truth to match.** If ``m`` does not divide
+    ``n_time``, the last ``n_time % m`` samples take part in no
+    accumulation and are dropped. They are not flagged and not reported;
+    a partial accumulation would have a different variance and a
+    different threshold, which is a worse trade than losing under ``m``
+    samples. Because of that, ground truth must be brought onto this grid
+    with `rfi_simulator.metrics.pool_truth_accumulations`, which applies
+    the identical fixed-block partition and drops the identical tail.
+    Pooling with `rfi_simulator.metrics.pool_truth` onto ``n_time // m``
+    bins is **wrong whenever ``m`` does not divide ``n_time``**: it
+    spreads the remainder across every bin, so labels land beside the
+    decisions they are scored against and a perfect mask can score a
+    recall near 0.5.
 
-    **Undefined cells.** An accumulation containing a NaN, or one whose
-    total power is exactly zero, has no defined statistic. Its
-    `statistic` entry is NaN and it is flagged.
+    **Undefined cells.** An accumulation containing a non-finite sample,
+    or one whose total power is exactly zero, has no defined statistic.
+    Its `statistic` entry is NaN and it is flagged.
 
     Examples
     --------
@@ -228,6 +245,11 @@ def spectral_kurtosis_mask(
         raise ValueError(
             "voltages must have shape (n_chan, n_time) or (n_ant, n_chan, n_time), "
             f"got shape {values.shape}"
+        )
+    if int(m) != m:
+        raise ValueError(
+            f"m must be a whole number of time samples, got {m!r}. Truncating it "
+            "silently would change the accumulation grid the mask is defined on."
         )
     m = int(m)
     if m < 2:
@@ -305,9 +327,11 @@ def mad_clip_mask(
     statistic : numpy.ndarray, optional
         Returned only if `return_statistic`: float64 array of the same
         shape holding the signed deviation in Gaussian-equivalent sigmas,
-        ``(x - median) / (1.4826 * MAD)``. NaN where the input was NaN.
+        ``(x - median) / (1.4826 * MAD)``. NaN where the input was not
+        finite, and ``+/-inf`` in a channel with no scale (see Notes).
         This array is a natural input to `sumthreshold_mask`, which wants
-        a background-subtracted, noise-normalized residual.
+        a background-subtracted, noise-normalized residual and which
+        treats both of those as missing data.
 
     Raises
     ------
@@ -333,6 +357,15 @@ def mad_clip_mask(
     ``+/-inf`` elsewhere, so an otherwise-constant channel with a single
     outlier still flags the outlier and nothing else.
 
+    **Missing data.** Every non-finite input cell -- NaN *and* ``+/-inf``
+    -- is treated as missing: excluded from the channel's median and MAD,
+    given a NaN deviation, and flagged. Infinities have to be excluded
+    rather than carried through, because a channel with half its cells at
+    ``+inf`` would otherwise take an infinite median, produce an all-NaN
+    deviation, and flag nothing at all -- hiding any genuine outlier
+    sharing the channel. A channel that is entirely missing is flagged
+    wholesale.
+
     Examples
     --------
     >>> import numpy as np
@@ -356,23 +389,35 @@ def mad_clip_mask(
         raise ValueError(f"n_sigma must be > 0, got {n_sigma}")
 
     values = values.astype(np.float64)
-    is_nan = np.isnan(values)
-    with np.errstate(invalid="ignore"):
-        median = np.nanmedian(values, axis=-1, keepdims=True)
-        mad = np.nanmedian(np.abs(values - median), axis=-1, keepdims=True)
-    scale = MAD_TO_SIGMA * mad
+    # Every non-finite cell is missing data, infinities included. Leaving
+    # an infinity in place would put it into the median: a channel with
+    # half its cells at +inf gets an infinite median, an all-NaN
+    # deviation, and nothing flagged at all -- not even a co-channel
+    # outlier of 1e9. Excluding them from the statistics and flagging
+    # them outright is the only reading that cannot hide a neighbour.
+    is_missing = ~np.isfinite(values)
+    finite = np.where(is_missing, np.nan, values)
 
-    residual = values - median
-    # A channel with zero MAD has no scale: a cell that sits on the
-    # median is zero deviations away, anything else is infinitely far.
-    degenerate = np.where(residual > 0.0, np.inf, np.where(residual < 0.0, -np.inf, 0.0))
-    with np.errstate(invalid="ignore", divide="ignore"):
-        statistic = np.where(scale > 0.0, residual / scale, degenerate)
-    statistic = np.where(is_nan, np.nan, statistic)
+    # An all-missing channel makes nanmedian warn about an empty slice.
+    # That is a defined, intended outcome here (the channel is flagged
+    # wholesale), so the warning is suppressed narrowly rather than left
+    # to crash a warnings-as-errors pipeline.
+    with warnings.catch_warnings(), np.errstate(invalid="ignore"):
+        warnings.filterwarnings("ignore", "All-NaN slice encountered", RuntimeWarning)
+        warnings.filterwarnings("ignore", "Mean of empty slice", RuntimeWarning)
+        median = np.nanmedian(finite, axis=-1, keepdims=True)
+        mad = np.nanmedian(np.abs(finite - median), axis=-1, keepdims=True)
+        scale = MAD_TO_SIGMA * mad
 
-    with np.errstate(invalid="ignore"):
+        residual = finite - median
+        # A channel with zero MAD has no scale: a cell that sits on the
+        # median is zero deviations away, anything else is infinitely far.
+        degenerate = np.where(residual > 0.0, np.inf, np.where(residual < 0.0, -np.inf, 0.0))
+        with np.errstate(divide="ignore"):
+            statistic = np.where(scale > 0.0, residual / scale, degenerate)
+        statistic = np.where(is_missing, np.nan, statistic)
         mask = np.abs(statistic) > n_sigma
-    mask |= is_nan
+    mask |= is_missing
 
     if return_statistic:
         return mask, statistic
@@ -487,7 +532,7 @@ def sumthreshold_mask(
         Base of the threshold decay. Default `SUMTHRESHOLD_RHO`.
     return_statistic : bool, optional
         If True, also return the residual actually thresholded (the input
-        as float64, with NaN preserved). Default False. Provided for
+        as float64, non-finite cells preserved). Default False. For
         API symmetry with the other flaggers: unlike them, this method
         emits no per-cell score of its own, only a decision.
 
@@ -502,9 +547,9 @@ def sumthreshold_mask(
     ------
     ValueError
         If `residual` is complex, has fewer than two dimensions, if
-        `iterations` is below 1, or if `rho` is not greater than 1
-        (``rho <= 1`` would make wide windows no more sensitive than
-        narrow ones, or infinitely sensitive).
+        `chi_1` is not positive, if `iterations` is below 1, or if `rho`
+        is not greater than 1 (``rho <= 1`` would make wide windows no
+        more sensitive than narrow ones, or infinitely sensitive).
 
     Notes
     -----
@@ -526,9 +571,16 @@ def sumthreshold_mask(
     knob: at ``chi_1 = 6`` and five windows the rate is back near
     ``3e-5``.
 
-    **NaN.** NaN cells are flagged before the first pass and then enter
-    every sum at the threshold value, so they neither hide nor
-    manufacture flags in their neighbours.
+    **Missing data.** Every non-finite cell -- NaN and ``+/-inf`` alike --
+    is flagged before the first pass and then enters every sum at the
+    threshold value, so it neither hides nor manufactures flags in its
+    neighbours. Infinities must be handled and not merely tolerated: one
+    ``-inf`` left in the values would drive the running sum of every
+    window containing it to ``-inf``, and since the test is one-sided
+    that window then flags nothing, blinding the method to real
+    interference next door. `mad_clip_mask` emits ``-inf`` for
+    below-median cells of a channel with no scale, so the recommended
+    input can contain them.
 
     Examples
     --------
@@ -553,9 +605,22 @@ def sumthreshold_mask(
     if not rho > 1.0:
         raise ValueError(f"rho must be > 1, got {rho}")
     chi_1 = float(chi_1)
+    if not chi_1 > 0.0:
+        raise ValueError(
+            f"chi_1 must be > 0, got {chi_1}. A non-positive threshold flags every "
+            "cell whose run sums to zero, i.e. essentially everything."
+        )
 
     values = values.astype(np.float64)
-    mask = np.isnan(values)
+    # Non-finite cells are flagged up front and neutralized in the working
+    # copy. Both halves matter. A single -inf left in the values poisons
+    # the running sums of every window that contains it -- they go to
+    # -inf or NaN, compare False, and suppress detection of genuine
+    # interference beside it -- and the one-sided test would never flag
+    # the -inf cell itself. Infinities are not hypothetical here: the
+    # recommended input, the deviation array of `mad_clip_mask`, emits
+    # them for a channel with no scale.
+    mask = ~np.isfinite(values)
     clean = np.where(mask, 0.0, values)
 
     for step in range(iterations):

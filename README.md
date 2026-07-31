@@ -35,23 +35,28 @@ Three classical, non-learned flaggers ship with the library, together with the s
 ```python
 import numpy as np
 from rfi_simulator import (
-    flag_scores, mad_clip_mask, pool_truth, spectral_kurtosis_mask, sumthreshold_mask,
+    flag_scores, mad_clip_mask, pool_truth_accumulations,
+    spectral_kurtosis_mask, sumthreshold_mask,
 )
 
 block = next(sim.blocks())
 voltages = block.data[0]                      # one antenna, (n_chan, n_time)
+truth = block.rfi_mask.any(axis=0)            # union over interference sources
 
-# Spectral kurtosis works pre-detection, on blocks of M time samples.
+# Spectral kurtosis works pre-detection, on accumulations of M time samples,
+# so its mask is coarser in time than the labels. `pool_truth_accumulations`
+# puts the truth on exactly that grid — including dropping the tail of fewer
+# than M samples, about which the flagger reached no decision.
 mask = spectral_kurtosis_mask(voltages, m=256)
+print(flag_scores(mask, pool_truth_accumulations(truth, m=256)))
 
 # Robust per-channel clipping of the detected power, and the run-finding
-# SumThreshold algorithm on its noise-normalized residual.
+# SumThreshold algorithm on its noise-normalized residual. Both decide at
+# full resolution, so they score against the labels directly.
 power = np.abs(voltages) ** 2
 clipped, deviation = mad_clip_mask(power, n_sigma=5.0, return_statistic=True)
 runs = sumthreshold_mask(deviation, chi_1=6.0)
-
-truth = pool_truth(block.rfi_mask.any(axis=0), mask.shape)
-print(flag_scores(mask, truth))   # precision, recall, f1, mcc, false-positive rate, ...
+print(flag_scores(runs, truth))   # precision, recall, f1, mcc, false-positive rate, ...
 ```
 
 ## Web interface

@@ -14,7 +14,13 @@ import math
 import numpy as np
 import pytest
 
-from rfi_simulator import confusion_counts, flag_scores, pool_truth
+from rfi_simulator import (
+    confusion_counts,
+    flag_scores,
+    pool_truth,
+    pool_truth_accumulations,
+    spectral_kurtosis_mask,
+)
 from rfi_simulator.binning import bin_any
 
 # A 2x3 toy whose counts are tp=1, fp=1, fn=1, tn=3. Small enough to
@@ -260,3 +266,110 @@ def test_pool_truth_rejects_a_non_boolean_mask():
     """Ground truth is a decision, so it is boolean."""
     with pytest.raises(ValueError, match="boolean mask"):
         pool_truth(np.zeros((2, 4)), (2, 2))
+
+
+# ----------------------------------------------------------------------
+# pool_truth_accumulations: the pairing for spectral kurtosis
+# ----------------------------------------------------------------------
+# 1000 samples in accumulations of 256: three accumulations covering
+# 0-255, 256-511 and 512-767, and a 232-sample tail the flagger never
+# decides about. Deliberately the shape of the package's own defaults.
+RAGGED_N_TIME = 1000
+RAGGED_M = 256
+
+
+def gaussian_voltages(rng, shape):
+    """Unit-power circular complex Gaussian voltages, complex64."""
+    parts = rng.standard_normal(size=(*shape, 2), dtype=np.float32)
+    parts *= np.float32(1.0 / np.sqrt(2.0))
+    return parts.view(np.complex64)[..., 0]
+
+
+def test_pool_truth_accumulations_matches_the_flaggers_partition():
+    """Hand-computed on a ragged axis: fixed blocks, tail dropped.
+
+    Sample 300 sits in accumulation 1 (256 to 511) and must be labelled
+    there; sample 800 sits in the dropped tail and must vanish. The
+    fit-to-count `pool_truth` gets both wrong, which is the regression
+    this pins.
+    """
+    truth = np.zeros((2, RAGGED_N_TIME), dtype=bool)
+    truth[0, 300] = True
+    pooled = pool_truth_accumulations(truth, RAGGED_M)
+    assert pooled.shape == (2, RAGGED_N_TIME // RAGGED_M)
+    np.testing.assert_array_equal(pooled[0], [False, True, False])
+    np.testing.assert_array_equal(pooled[1], [False, False, False])
+    # The rule that used to be applied here puts the flag in bin 0.
+    np.testing.assert_array_equal(
+        pool_truth(truth, (2, RAGGED_N_TIME // RAGGED_M))[0], [True, False, False]
+    )
+
+
+def test_pool_truth_accumulations_scores_a_perfect_mask_as_perfect():
+    """A flagger that got every accumulation right must score 1.0.
+
+    The regression: pooling this truth with `pool_truth` puts each burst
+    one bin away from the accumulation that contains it, so a mask
+    identical to the ground truth scored a recall near 0.5 -- a silent
+    halving of every reported score at any ``m`` that does not divide the
+    time axis.
+    """
+    rng = np.random.default_rng(77)
+    truth = np.zeros((4, RAGGED_N_TIME), dtype=bool)
+    for channel in range(4):
+        for sample in rng.choice(RAGGED_N_TIME, size=6, replace=False):
+            truth[channel, sample] = True
+
+    pooled = pool_truth_accumulations(truth, RAGGED_M)
+    scores = flag_scores(pooled.copy(), pooled)
+    assert scores["recall"] == 1.0
+    assert scores["precision"] == 1.0
+
+    misaligned = pool_truth(truth, (4, RAGGED_N_TIME // RAGGED_M))
+    assert flag_scores(pooled, misaligned)["recall"] < 1.0
+
+
+def test_pool_truth_accumulations_excludes_the_truncated_tail():
+    """Interference the flagger never saw is not scored against it.
+
+    A burst entirely inside the final partial accumulation takes part in
+    no decision, so it must not appear in the pooled truth at all --
+    otherwise the flagger is charged a false negative for samples it was
+    handed and then told to ignore.
+    """
+    truth = np.zeros((1, RAGGED_N_TIME), dtype=bool)
+    truth[0, 768:] = True  # the whole dropped tail is contaminated
+    pooled = pool_truth_accumulations(truth, RAGGED_M)
+    assert not pooled.any()
+
+    clean_mask = np.zeros_like(pooled)
+    scores = flag_scores(clean_mask, pooled)
+    assert scores["fn"] == 0.0
+    assert scores["truth_occupancy"] == 0.0
+
+
+def test_pool_truth_accumulations_lines_up_with_a_spectral_kurtosis_mask():
+    """End to end: the pooled truth has the flagger's exact shape.
+
+    Checked at a deliberately ragged length, and against a real mask
+    rather than a hand-built one, so a change to either side's partition
+    breaks this.
+    """
+    rng = np.random.default_rng(78)
+    voltages = gaussian_voltages(rng, (5, RAGGED_N_TIME))
+    mask = spectral_kurtosis_mask(voltages, m=RAGGED_M)
+    truth = np.zeros((5, RAGGED_N_TIME), dtype=bool)
+    truth[2, 260] = True
+    pooled = pool_truth_accumulations(truth, RAGGED_M)
+    assert pooled.shape == mask.shape
+    assert flag_scores(mask, pooled)["truth_occupancy"] == pytest.approx(1.0 / pooled.size)
+
+
+def test_pool_truth_accumulations_validates_its_input():
+    """Non-boolean masks and impossible accumulation lengths raise."""
+    with pytest.raises(ValueError, match="boolean mask"):
+        pool_truth_accumulations(np.zeros((2, 8)), 4)
+    with pytest.raises(ValueError, match="block_size must be >= 1"):
+        pool_truth_accumulations(np.zeros((2, 8), dtype=bool), 0)
+    with pytest.raises(ValueError, match="block_size must be <="):
+        pool_truth_accumulations(np.zeros((2, 8), dtype=bool), 9)

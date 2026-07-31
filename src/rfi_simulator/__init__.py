@@ -13,7 +13,7 @@ The pipeline is four steps long::
 
 from rfi_simulator.aircraft import ADSB_FREQ_HZ, ADSBTransponder
 from rfi_simulator.array_config import ArrayConfig
-from rfi_simulator.binning import bin_any, bin_mean
+from rfi_simulator.binning import bin_any, bin_mean, block_any
 from rfi_simulator.correlator import Visibilities, baseline_index_pairs, correlate
 from rfi_simulator.delays import (
     SPEED_OF_LIGHT_M_S,
@@ -29,7 +29,12 @@ from rfi_simulator.flaggers import (
     sumthreshold_mask,
 )
 from rfi_simulator.imaging import dirty_image, lm_axis, uvw_wavelengths
-from rfi_simulator.metrics import confusion_counts, flag_scores, pool_truth
+from rfi_simulator.metrics import (
+    confusion_counts,
+    flag_scores,
+    pool_truth,
+    pool_truth_accumulations,
+)
 from rfi_simulator.rfi import (
     OCCUPANCY_THRESHOLD,
     BlockContext,
@@ -71,6 +76,7 @@ __all__ = [
     "baseline_index_pairs",
     "bin_any",
     "bin_mean",
+    "block_any",
     "confusion_counts",
     "correlate",
     "dirty_image",
@@ -86,6 +92,7 @@ __all__ = [
     "mad_clip_mask",
     "path_delays_s",
     "pool_truth",
+    "pool_truth_accumulations",
     "radec_from_lm",
     "read_tle_file",
     "source_unit_vectors_enu",

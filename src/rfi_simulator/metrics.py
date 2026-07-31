@@ -26,9 +26,11 @@ Conventions
   refuses mismatched shapes rather than broadcasting, since a
   broadcastable mismatch (say ``(n_chan, 1)`` against
   ``(n_chan, n_time)``) is always a bug. When a flagger ran on a coarser
-  grid than the labels -- spectral kurtosis accumulates over ``M`` time
-  samples -- bring the truth to the flagger's grid with `pool_truth`
-  first.
+  grid than the labels, bring the truth to the flagger's grid first --
+  with `pool_truth_accumulations` for `spectral_kurtosis_mask`, and with
+  `pool_truth` for a display or any other fit-to-count grid. The two
+  partition an axis differently and are not interchangeable; picking the
+  wrong one costs real score rather than raising.
 
 Why the Matthews correlation coefficient
 ----------------------------------------
@@ -44,9 +46,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from rfi_simulator.binning import bin_any
+from rfi_simulator.binning import bin_any, block_any
 
-__all__ = ["confusion_counts", "flag_scores", "pool_truth"]
+__all__ = ["confusion_counts", "flag_scores", "pool_truth", "pool_truth_accumulations"]
 
 
 def _as_mask(array: np.ndarray, name: str) -> np.ndarray:
@@ -251,14 +253,23 @@ def flag_scores(predicted: np.ndarray, truth: np.ndarray) -> dict[str, float]:
 
 
 def pool_truth(mask: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
-    """Pool a fine-grained truth mask onto a flagger's coarser grid.
+    """Pool a fine-grained truth mask onto a coarser fit-to-count grid.
 
     Ground truth is labelled at the resolution the data was simulated at,
-    one cell per channel per time sample. A flagger need not run there:
-    spectral kurtosis emits one decision per accumulation of ``M``
-    samples, and a display or a downstream product may be coarser still.
-    This brings the labels to the flagger's grid so the two can be
-    compared cell for cell.
+    one cell per channel per time sample. A display, or any consumer that
+    has a fixed number of cells to fill, is coarser. This brings the
+    labels onto that grid so the two can be compared cell for cell.
+
+    .. warning::
+
+       This is **not** the right pooling for `spectral_kurtosis_mask`.
+       The target shape here is a bin *count*, and the remainder of a
+       ragged axis is spread across all the bins; a spectral-kurtosis mask
+       is decided on fixed blocks of ``M`` samples with the tail dropped.
+       The two partitions coincide only when ``M`` divides the time axis
+       exactly, and otherwise labels land in the wrong bin -- which shows
+       up as a mediocre score, not as an error. Use
+       `pool_truth_accumulations` for that pairing.
 
     Parameters
     ----------
@@ -319,3 +330,65 @@ def pool_truth(mask: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
     for axis, length in enumerate(shape):
         values = bin_any(values, axis=axis, n_bins=length)
     return np.array(values, dtype=bool)
+
+
+def pool_truth_accumulations(mask: np.ndarray, m: int) -> np.ndarray:
+    """Pool a truth mask onto an accumulating flagger's time grid.
+
+    The counterpart of `rfi_simulator.flaggers.spectral_kurtosis_mask`,
+    which reads time samples in fixed blocks ``[k*m, (k+1)*m)`` and
+    discards the final ``n_time % m`` samples. This applies exactly the
+    same partition to the labels, so the two arrays line up cell for cell
+    whatever ``m`` and ``n_time`` are.
+
+    Parameters
+    ----------
+    mask : numpy.ndarray
+        Boolean ground-truth mask of shape ``(..., n_chan, n_time)``, e.g.
+        ``block.rfi_mask.any(axis=0)``. Only the last axis is pooled;
+        every other axis is passed through, since spectral kurtosis
+        coarsens time and nothing else.
+    m : int
+        Accumulation length in time samples -- the same ``m`` the flagger
+        was given.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean array of shape ``(..., n_chan, n_time // m)``: an
+        accumulation is contaminated if *any* of its ``m`` samples was.
+
+    Raises
+    ------
+    ValueError
+        If `mask` is not boolean, or if `m` is below 1 or longer than the
+        time axis.
+
+    Notes
+    -----
+    Two failure modes this exists to prevent, both of which score as a
+    half-working flagger rather than raising:
+
+    * Pooling with `pool_truth` onto ``n_time // m`` bins spreads the
+      remainder across every bin, so on a ragged axis a burst inside
+      accumulation ``k`` can be labelled into bins ``k`` and ``k - 1``.
+      A flagger that got every accumulation right then scores a recall
+      of about 0.5.
+    * Keeping the truncated tail charges the flagger a false negative for
+      samples that took part in no accumulation, i.e. for a decision it
+      was never asked to make.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from rfi_simulator import spectral_kurtosis_mask
+    >>> truth = np.zeros((1, 10), dtype=bool)
+    >>> truth[0, 5] = True   # inside accumulation 1
+    >>> truth[0, 9] = True   # inside the dropped tail
+    >>> pool_truth_accumulations(truth, m=4)
+    array([[False,  True]])
+    """
+    values = _as_mask(mask, "mask")
+    if values.ndim < 1:
+        raise ValueError("mask must have at least one axis (time is the last)")
+    return np.array(block_any(values, int(m), axis=-1), dtype=bool)
