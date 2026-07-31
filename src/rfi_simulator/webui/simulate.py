@@ -55,6 +55,7 @@ from rfi_simulator import (
     enu_from_horizontal,
     uvw_wavelengths,
 )
+from rfi_simulator.binning import bin_any, bin_mean
 from rfi_simulator.delays import earth_location, zenith_coord
 from rfi_simulator.voltages import DEFAULT_CHAN_WIDTH_HZ
 
@@ -923,42 +924,6 @@ def defaults_payload() -> dict[str, Any]:
 # ----------------------------------------------------------------------
 # Array reduction helpers
 # ----------------------------------------------------------------------
-def _bin_edges(length: int, n_bins: int) -> np.ndarray:
-    """Start index of every bin when `length` cells are pooled into `n_bins`."""
-    return np.linspace(0, length, n_bins + 1).astype(np.intp)
-
-
-def bin_mean(values: np.ndarray, axis: int, n_bins: int) -> np.ndarray:
-    """Average `values` down to `n_bins` along `axis`.
-
-    Bins are as equal as integer division allows and cover every cell, so
-    no data is dropped off the end of the axis.
-    """
-    length = values.shape[axis]
-    if n_bins >= length:
-        return values
-    edges = _bin_edges(length, n_bins)
-    counts = np.diff(edges)
-    totals = np.add.reduceat(values, edges[:-1], axis=axis)
-    shape = [1] * values.ndim
-    shape[axis] = n_bins
-    return totals / counts.reshape(shape)
-
-
-def bin_any(mask: np.ndarray, axis: int, n_bins: int) -> np.ndarray:
-    """Pool a boolean mask down to `n_bins` along `axis` with an ANY rule.
-
-    A pooled cell is True if *any* cell inside it was, which is the only
-    honest way to shrink ground truth: it never claims a clean cell where
-    the library flagged interference.
-    """
-    length = mask.shape[axis]
-    if n_bins >= length:
-        return mask
-    edges = _bin_edges(length, n_bins)
-    return np.maximum.reduceat(mask.astype(np.uint8), edges[:-1], axis=axis) > 0
-
-
 def _waterfall_shape(n_antennas: int, n_chan: int, n_blocks: int) -> tuple[int, int]:
     """Channel and per-block time bin counts that fit the response budget."""
     chan_bins = min(n_chan, MAX_BINS)
