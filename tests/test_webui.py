@@ -340,6 +340,29 @@ def test_an_oversized_body_is_refused_before_it_is_read(client):
     assert "bytes" in response.text
 
 
+def test_an_oversized_chunked_body_is_refused_while_streaming(client):
+    """No declared length must not mean no limit.
+
+    A chunked body carries no ``Content-Length``, so the header check
+    cannot fire; the middleware has to count the bytes as they arrive
+    and refuse when the running total passes the cap.
+    """
+
+    def chunks():
+        sent = 0
+        while sent <= MAX_REQUEST_BYTES:
+            yield b"x" * 65536
+            sent += 65536
+
+    response = client.post(
+        "/api/simulate",
+        content=chunks(),
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 413
+    assert "bytes" in response.text
+
+
 def test_an_antenna_further_out_than_the_bound_is_refused(client):
     """Coordinates are metres from the origin, not arbitrary floats."""
     body = make_request()

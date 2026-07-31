@@ -818,10 +818,8 @@ class SimulateRequest(BaseModel):
     def _check_antennas(cls, value: list[list[float]]) -> list[list[float]]:
         if len(value) < 2:
             raise ValueError("place at least 2 antennas: one antenna forms no baseline")
-        if len(value) > MAX_ANTENNAS:
-            raise ValueError(
-                f"this front end runs at most {MAX_ANTENNAS} antennas, got {len(value)}"
-            )
+        # An over-long list never reaches this validator: the Field's
+        # max_length rejects it before the elements are even coerced.
         for index, position in enumerate(value):
             if len(position) != 3:
                 raise ValueError(

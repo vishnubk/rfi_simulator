@@ -21,7 +21,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -58,57 +58,94 @@ MAX_REQUEST_BYTES = 2_000_000
 this front end runs is a few kilobytes, so this is generous by three
 orders of magnitude and still refuses a body big enough to matter."""
 
-MAX_CONCURRENT_SIMULATIONS = 2
+MAX_CONCURRENT_SIMULATIONS = 1
 """int: Runs allowed in flight at once.
 
 One run is bounded by the request model's size cap; unbounded concurrency
 would multiply that bound by however many requests happen to arrive, so
-the rest queue instead."""
+the rest queue instead. Single flight also keeps warning capture correct:
+`warnings.catch_warnings` swaps interpreter-global state, so two runs
+recording at once could attribute one request's warnings to the other."""
 
 _simulation_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SIMULATIONS)
 
 
 class ContentLengthLimitMiddleware:
-    """Refuse an over-long request before its body is read.
+    """Refuse an over-long request body, however it is framed.
 
-    Checked in the ASGI scope, so an oversized body is answered from the
-    declared length alone and never allocated. A body sent without a
-    declared length is left to the server's own limits.
+    A declared ``Content-Length`` beyond the limit is answered from the
+    header alone, before any body is read. A body without a declared
+    length (chunked transfer encoding, or a header that lies) is counted
+    as it streams and cut off at the same limit -- the framing must not
+    matter, because the point is to bound what a request can make this
+    process buffer.
     """
 
     def __init__(self, app: ASGIApp, max_bytes: int = MAX_REQUEST_BYTES) -> None:
         self.app = app
         self.max_bytes = max_bytes
 
+    def _refusal(self, received: int) -> JSONResponse:
+        return JSONResponse(
+            status_code=413,
+            content={
+                "detail": [
+                    {
+                        "loc": ["body"],
+                        "msg": (
+                            f"this request is {received} bytes, more than the "
+                            f"{self.max_bytes} this server accepts"
+                        ),
+                        "type": "value_error",
+                    }
+                ]
+            },
+        )
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http":
-            for name, value in scope.get("headers", ()):
-                if name.lower() != b"content-length":
-                    continue
-                try:
-                    declared = int(value)
-                except ValueError:
-                    break
-                if declared > self.max_bytes:
-                    response = JSONResponse(
-                        status_code=413,
-                        content={
-                            "detail": [
-                                {
-                                    "loc": ["body"],
-                                    "msg": (
-                                        f"this request is {declared} bytes, more than the "
-                                        f"{self.max_bytes} this server accepts"
-                                    ),
-                                    "type": "value_error",
-                                }
-                            ]
-                        },
-                    )
-                    await response(scope, receive, send)
-                    return
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        for name, value in scope.get("headers", ()):
+            if name.lower() != b"content-length":
+                continue
+            try:
+                declared = int(value)
+            except ValueError:
                 break
-        await self.app(scope, receive, send)
+            if declared > self.max_bytes:
+                await self._refusal(declared)(scope, receive, send)
+                return
+            break
+
+        received = 0
+
+        async def counted_receive() -> Any:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    # HTTPException, because the body is read inside the
+                    # routing layer, which turns any other exception into
+                    # a generic 400 before it could reach this middleware.
+                    raise HTTPException(
+                        status_code=413,
+                        detail=[
+                            {
+                                "loc": ["body"],
+                                "msg": (
+                                    f"this request is over {received} bytes, more than "
+                                    f"the {self.max_bytes} this server accepts"
+                                ),
+                                "type": "value_error",
+                            }
+                        ],
+                    )
+            return message
+
+        await self.app(scope, counted_receive, send)
 
 
 def create_app(host: str | None = None) -> FastAPI:
