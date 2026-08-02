@@ -1,0 +1,490 @@
+r"""Packed 4-bit complex voltage block format.
+
+FX-correlator packet streams commonly move channelized antenna voltages as
+a headerless stream of fixed-size blocks, one byte per complex sample: a
+signed 4-bit two's-complement real part in one nibble and a signed 4-bit
+two's-complement imaginary part in the other, dequantized by multiplying
+by a fixed scale factor. This module implements that on-disk convention
+as a small, dependency-free (beyond numpy) reader/writer, independent of
+any particular correlator's block dimensions -- every axis length is a
+parameter of `PackedVoltageLayout`.
+
+Nibble convention
+------------------
+Given a raw byte interpreted as a signed 8-bit two's-complement value
+``b``::
+
+    real = sign_extend_4bit(b & 0x0F)         # low (least-significant) nibble
+    imag = sign_extend_4bit((b >> 4) & 0x0F)  # high (most-significant) nibble
+
+i.e. **the real part lives in the low nibble and the imaginary part in the
+high nibble**, each in the signed range ``[-8, 7]``. This is the
+arithmetic-shift trick ``real = (b << 4) >> 4`` / ``imag = b >> 4`` used by
+FX-correlator "fluff" kernels, transcribed here in pure numpy via a
+256-entry lookup table instead of per-byte shifts.
+
+Both nibbles are dequantized with a single scalar ``scale`` (typically of
+order 0.01-0.1, matching the small dynamic range of a 4-bit sample):
+
+.. math::
+
+    v = \mathrm{scale} \times (\mathrm{real} + i\,\mathrm{imag})
+
+Block layout
+------------
+One block is a dense tensor of shape ``(n_packets, n_antennas, n_channels,
+n_times_per_packet, n_pols)``, C-contiguous, one byte per element. The
+packet axis and the intra-packet time axis both index time; this module
+merges them into a single contiguous time axis of length
+``n_packets * n_times_per_packet`` on unpack (and splits it back out on
+pack), with the packet index as the *outer* (slower-varying) component and
+the intra-packet index as the *inner* (faster-varying) component:
+``t = packet_index * n_times_per_packet + intra_packet_index``.
+
+Files are headerless concatenations of blocks with no padding, so a valid
+file's size is an exact multiple of the block's byte count (one byte per
+sample).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+__all__ = [
+    "DEFAULT_QUANT_SCALE",
+    "PackedVoltageLayout",
+    "pack_block",
+    "pack_from_voltage_block",
+    "read_packed_file",
+    "suggest_quant_scale",
+    "unpack_block",
+]
+
+#: Signed 4-bit two's-complement range, inclusive.
+_NIBBLE_MIN = -8
+_NIBBLE_MAX = 7
+
+#: A reasonable default dequantization scale for demonstration / test use.
+#: There is nothing physically special about this value -- callers reading
+#: a real packet stream must supply the scale that stream was quantized
+#: with; callers writing one out should generally use
+#: `suggest_quant_scale` instead of this constant.
+DEFAULT_QUANT_SCALE = 0.05
+
+
+def _build_nibble_lut() -> np.ndarray:
+    """Build the 256-entry byte -> (real, imag) int8 lookup table.
+
+    Returns
+    -------
+    numpy.ndarray
+        int8 array of shape ``(256, 2)``; ``lut[byte, 0]`` is the signed
+        real nibble (low nibble), ``lut[byte, 1]`` is the signed imaginary
+        nibble (high nibble).
+    """
+    bytes_ = np.arange(256, dtype=np.uint8)
+    low = (bytes_ & 0x0F).astype(np.int16)
+    high = ((bytes_ >> 4) & 0x0F).astype(np.int16)
+    # Sign-extend a 4-bit nibble: values >= 8 represent negative numbers.
+    real = np.where(low >= 8, low - 16, low).astype(np.int8)
+    imag = np.where(high >= 8, high - 16, high).astype(np.int8)
+    return np.stack([real, imag], axis=-1)
+
+
+#: Module-level LUT, built once. `unpack_block` indexes into this with the
+#: raw byte array to vectorize the nibble split -- no Python-level bit
+#: twiddling per sample.
+_NIBBLE_LUT = _build_nibble_lut()
+
+
+@dataclass(frozen=True)
+class PackedVoltageLayout:
+    """Dimensions of one packed 4-bit complex voltage block.
+
+    Attributes
+    ----------
+    n_packets : int
+        Number of packets per block (outer time axis).
+    n_antennas : int
+        Number of antennas.
+    n_channels : int
+        Number of frequency channels.
+    n_times_per_packet : int
+        Number of time samples carried by a single packet (inner time
+        axis).
+    n_pols : int
+        Number of polarizations.
+
+    Notes
+    -----
+    The on-disk byte order for one block is
+    ``(n_packets, n_antennas, n_channels, n_times_per_packet, n_pols)``,
+    C-contiguous, one byte per complex sample.
+    """
+
+    n_packets: int
+    n_antennas: int
+    n_channels: int
+    n_times_per_packet: int
+    n_pols: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "n_packets",
+            "n_antennas",
+            "n_channels",
+            "n_times_per_packet",
+            "n_pols",
+        ):
+            value = getattr(self, name)
+            if int(value) != value or value < 1:
+                raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
+    @property
+    def n_time(self) -> int:
+        """int: Merged time-axis length, ``n_packets * n_times_per_packet``."""
+        return self.n_packets * self.n_times_per_packet
+
+    @property
+    def raw_shape(self) -> tuple[int, int, int, int, int]:
+        """tuple of int: On-disk block shape (packet axis and intra-packet
+        time axis kept separate), as bytes/samples."""
+        return (
+            self.n_packets,
+            self.n_antennas,
+            self.n_channels,
+            self.n_times_per_packet,
+            self.n_pols,
+        )
+
+    @property
+    def unpacked_shape(self) -> tuple[int, int, int, int]:
+        """tuple of int: Shape of an unpacked complex block,
+        ``(n_antennas, n_channels, n_time, n_pols)``."""
+        return (self.n_antennas, self.n_channels, self.n_time, self.n_pols)
+
+    @property
+    def samples_per_block(self) -> int:
+        """int: Total complex samples per block (== bytes per block, one
+        byte per sample)."""
+        return (
+            self.n_packets
+            * self.n_antennas
+            * self.n_channels
+            * self.n_times_per_packet
+            * self.n_pols
+        )
+
+    @property
+    def bytes_per_block(self) -> int:
+        """int: Bytes per block. One byte per complex sample, so this
+        equals `samples_per_block`."""
+        return self.samples_per_block
+
+
+def unpack_block(
+    raw_bytes: bytes | bytearray | memoryview | np.ndarray,
+    layout: PackedVoltageLayout,
+    scale: float = DEFAULT_QUANT_SCALE,
+) -> np.ndarray:
+    """Dequantize one packed block into complex voltages.
+
+    Parameters
+    ----------
+    raw_bytes : bytes-like or numpy.ndarray
+        Exactly `PackedVoltageLayout.bytes_per_block` bytes (uint8), in
+        `PackedVoltageLayout.raw_shape` C order.
+    layout : PackedVoltageLayout
+        Block dimensions.
+    scale : float, optional
+        Dequantization scale applied to both nibbles. Default
+        `DEFAULT_QUANT_SCALE`.
+
+    Returns
+    -------
+    numpy.ndarray
+        complex64 array of shape `PackedVoltageLayout.unpacked_shape` =
+        ``(n_antennas, n_channels, n_time, n_pols)``, with
+        ``n_time = n_packets * n_times_per_packet`` and the packet index
+        as the outer (slower) component of that merged axis.
+
+    Raises
+    ------
+    ValueError
+        If `raw_bytes` is not exactly `PackedVoltageLayout.bytes_per_block`
+        bytes.
+    """
+    arr = (
+        np.frombuffer(bytes(raw_bytes), dtype=np.uint8)
+        if isinstance(raw_bytes, (bytes, bytearray, memoryview))
+        else np.asarray(raw_bytes, dtype=np.uint8).reshape(-1)
+    )
+
+    expected = layout.bytes_per_block
+    if arr.size != expected:
+        raise ValueError(f"raw block size {arr.size} != expected {expected} bytes")
+
+    raw = arr.reshape(layout.raw_shape)  # (pkt, ant, chan, t_sub, pol)
+    nibbles = _NIBBLE_LUT[raw]  # (pkt, ant, chan, t_sub, pol, 2) int8
+    real = nibbles[..., 0]
+    imag = nibbles[..., 1]
+
+    # Merge (pkt, t_sub) into one time axis, packet outer / t_sub inner:
+    # transpose to (ant, chan, pkt, t_sub, pol) then collapse (pkt, t_sub).
+    real = np.transpose(real, (1, 2, 0, 3, 4))
+    imag = np.transpose(imag, (1, 2, 0, 3, 4))
+    new_shape = (layout.n_antennas, layout.n_channels, layout.n_time, layout.n_pols)
+    real = real.reshape(new_shape)
+    imag = imag.reshape(new_shape)
+
+    out = (real.astype(np.float32) + 1j * imag.astype(np.float32)) * np.float32(scale)
+    return out.astype(np.complex64)
+
+
+def pack_block(
+    voltages: np.ndarray,
+    layout: PackedVoltageLayout,
+    scale: float = DEFAULT_QUANT_SCALE,
+) -> bytes:
+    """Quantize complex voltages into one packed 4-bit block.
+
+    Parameters
+    ----------
+    voltages : numpy.ndarray
+        Complex array of shape `PackedVoltageLayout.unpacked_shape` =
+        ``(n_antennas, n_channels, n_time, n_pols)``, with the merged time
+        axis ordered packet-outer / intra-packet-inner (the same
+        convention `unpack_block` produces).
+    layout : PackedVoltageLayout
+        Block dimensions.
+    scale : float, optional
+        Quantization scale: each nibble encodes ``round(component /
+        scale)``. Default `DEFAULT_QUANT_SCALE`.
+
+    Returns
+    -------
+    bytes
+        `PackedVoltageLayout.bytes_per_block` bytes in
+        `PackedVoltageLayout.raw_shape` C order.
+
+    Raises
+    ------
+    ValueError
+        If `voltages` is not shaped `PackedVoltageLayout.unpacked_shape`.
+
+    Notes
+    -----
+    Values are rounded half-to-even (`numpy.round`'s default) and then
+    **saturated** (clipped) to the symmetric signed range ``[-8, 7]``
+    rather than wrapped -- an out-of-range input clamps to the nearest
+    representable nibble instead of aliasing to a wildly different value.
+    """
+    if scale <= 0.0:
+        raise ValueError(f"scale must be > 0, got {scale}")
+    expected_shape = layout.unpacked_shape
+    if voltages.shape != expected_shape:
+        raise ValueError(f"voltages shape {voltages.shape} != expected {expected_shape}")
+
+    real_q = np.round(voltages.real / scale)
+    imag_q = np.round(voltages.imag / scale)
+    real_q = np.clip(real_q, _NIBBLE_MIN, _NIBBLE_MAX).astype(np.int8)
+    imag_q = np.clip(imag_q, _NIBBLE_MIN, _NIBBLE_MAX).astype(np.int8)
+
+    # Split merged time axis back into (n_packets, n_times_per_packet),
+    # packet outer / intra-packet inner, then move to raw_shape's axis
+    # order (pkt, ant, chan, t_sub, pol).
+    n_ant, n_chan, _n_time, n_pol = expected_shape
+    real_q = real_q.reshape(n_ant, n_chan, layout.n_packets, layout.n_times_per_packet, n_pol)
+    imag_q = imag_q.reshape(n_ant, n_chan, layout.n_packets, layout.n_times_per_packet, n_pol)
+    real_q = np.transpose(real_q, (2, 0, 1, 3, 4))
+    imag_q = np.transpose(imag_q, (2, 0, 1, 3, 4))
+
+    real_u8 = real_q.view(np.uint8) & 0x0F
+    imag_u8 = imag_q.view(np.uint8) & 0x0F
+    byte = (imag_u8 << 4) | real_u8  # imag = high nibble, real = low nibble
+    return np.ascontiguousarray(byte, dtype=np.uint8).tobytes()
+
+
+def read_packed_file(
+    path: str | Path,
+    layout: PackedVoltageLayout,
+    scale: float = DEFAULT_QUANT_SCALE,
+    block_indices: Iterable[int] | None = None,
+) -> Iterator[np.ndarray]:
+    """Iterate over the blocks of a headerless packed voltage file.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Path to the file. Its size must be an exact multiple of
+        `PackedVoltageLayout.bytes_per_block`.
+    layout : PackedVoltageLayout
+        Block dimensions.
+    scale : float, optional
+        Dequantization scale, passed through to `unpack_block`.
+    block_indices : iterable of int, optional
+        Zero-based block indices to yield, in the given order. Defaults
+        to every block in the file, in order.
+
+    Yields
+    ------
+    numpy.ndarray
+        One complex64 array per requested block, shaped
+        `PackedVoltageLayout.unpacked_shape` (see `unpack_block`).
+
+    Raises
+    ------
+    ValueError
+        If the file size is not an exact multiple of
+        `PackedVoltageLayout.bytes_per_block`, or if a requested block
+        index is out of range.
+
+    Notes
+    -----
+    Uses `numpy.memmap` so only the requested blocks are ever paged into
+    memory -- suitable for multi-gigabyte files that must not be loaded
+    whole.
+    """
+    path = Path(path)
+    bytes_per_block = layout.bytes_per_block
+    file_size = path.stat().st_size
+    if file_size % bytes_per_block != 0:
+        raise ValueError(
+            f"file size {file_size} bytes is not an exact multiple of "
+            f"bytes_per_block ({bytes_per_block}); path={path}"
+        )
+    n_blocks = file_size // bytes_per_block
+
+    if block_indices is None:
+        indices: Iterable[int] = range(n_blocks)
+    else:
+        indices = list(block_indices)
+        for idx in indices:
+            if not 0 <= idx < n_blocks:
+                raise ValueError(f"block index {idx} out of range [0, {n_blocks})")
+
+    mmap = np.memmap(path, dtype=np.uint8, mode="r", shape=(n_blocks, bytes_per_block))
+    for idx in indices:
+        yield unpack_block(mmap[idx], layout, scale)
+
+
+def pack_from_voltage_block(
+    data: np.ndarray,
+    layout: PackedVoltageLayout,
+    scale: float = DEFAULT_QUANT_SCALE,
+    *,
+    pol_mode: str = "duplicate",
+) -> bytes:
+    """Pack a simulator `VoltageBlock`-style array into one raw block.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Complex voltages, either shaped ``(n_antennas, n_channels,
+        n_time)`` (single-pol, as produced by
+        `rfi_simulator.voltages.VoltageBlock.data`) or ``(n_antennas,
+        n_channels, n_time, n_pols)`` (already carrying a polarization
+        axis).
+    layout : PackedVoltageLayout
+        Target block dimensions. ``n_time = layout.n_packets *
+        layout.n_times_per_packet`` must equal `data`'s time axis length.
+    scale : float, optional
+        Quantization scale, passed through to `pack_block`.
+    pol_mode : {"duplicate", "stack"}, optional
+        How to handle the polarization axis:
+
+        ``"duplicate"``
+            `data` is 3-D, single-pol; the same voltage is copied into
+            every polarization of the packed block (only sensible for
+            `layout.n_pols == 1`, or as a placeholder for an
+            unpolarized/Stokes-I-only simulation run through a dual-pol
+            layout).
+        ``"stack"``
+            `data` is already 4-D with a trailing polarization axis of
+            length `layout.n_pols` and is used as-is.
+
+    Returns
+    -------
+    bytes
+        `PackedVoltageLayout.bytes_per_block` bytes, ready to append to a
+        packed voltage file.
+
+    Raises
+    ------
+    ValueError
+        If `pol_mode` is not recognised, if `data`'s shape does not match
+        `layout` under the requested `pol_mode`, or if `data`'s time axis
+        does not equal `layout.n_time`.
+    """
+    if pol_mode == "duplicate":
+        if data.ndim != 3:
+            raise ValueError(
+                f"pol_mode='duplicate' expects a 3-D (n_ant, n_chan, n_time) array, "
+                f"got shape {data.shape}"
+            )
+        n_ant, n_chan, n_time = data.shape
+        if n_time != layout.n_time:
+            raise ValueError(f"data n_time {n_time} != layout.n_time {layout.n_time}")
+        voltages = np.repeat(data[..., np.newaxis], layout.n_pols, axis=-1)
+    elif pol_mode == "stack":
+        if data.ndim != 4:
+            raise ValueError(
+                f"pol_mode='stack' expects a 4-D (n_ant, n_chan, n_time, n_pols) array, "
+                f"got shape {data.shape}"
+            )
+        voltages = data
+    else:
+        raise ValueError(f"pol_mode must be 'duplicate' or 'stack', got {pol_mode!r}")
+
+    if voltages.shape != layout.unpacked_shape:
+        raise ValueError(
+            f"voltage shape {voltages.shape} != layout.unpacked_shape "
+            f"{layout.unpacked_shape} (check n_antennas/n_channels/n_time/n_pols)"
+        )
+    return pack_block(voltages.astype(np.complex64, copy=False), layout, scale)
+
+
+def suggest_quant_scale(voltages: np.ndarray, target_counts: float = 2.5) -> float:
+    """Pick a quantization scale so the input's RMS lands near `target_counts`.
+
+    Parameters
+    ----------
+    voltages : numpy.ndarray
+        Complex voltages to be packed (any shape).
+    target_counts : float, optional
+        Desired RMS magnitude of each real/imaginary quantization count,
+        i.e. the per-component signal RMS divided by the returned scale.
+        Default 2.5, matching the light loading (a few LSBs of RMS, well
+        clear of both the 0 floor and the +-7 saturation ceiling) typical
+        of correlator 4-bit voltage quantization -- it leaves headroom for
+        the occasional large sample (RFI, gain drift) without saturating
+        every high-power event, while still using enough of the dynamic
+        range that quantization noise stays a small fraction of the
+        signal.
+
+    Returns
+    -------
+    float
+        A scale such that ``rms(voltages.real) / scale`` and
+        ``rms(voltages.imag) / scale`` are approximately `target_counts`.
+        Returns `DEFAULT_QUANT_SCALE` if `voltages` is all-zero (RMS 0),
+        since any positive scale is equally valid there.
+
+    Raises
+    ------
+    ValueError
+        If `target_counts` is not positive.
+    """
+    if target_counts <= 0.0:
+        raise ValueError(f"target_counts must be > 0, got {target_counts}")
+    # Per-component (real and imaginary treated together) RMS.
+    component_rms = np.sqrt(
+        0.5 * np.mean(voltages.real.astype(np.float64) ** 2 + voltages.imag.astype(np.float64) ** 2)
+    )
+    if component_rms == 0.0:
+        return DEFAULT_QUANT_SCALE
+    return float(component_rms / target_counts)
