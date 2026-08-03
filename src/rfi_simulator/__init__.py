@@ -49,6 +49,7 @@ from rfi_simulator.rfi import (
     enu_from_horizontal,
     path_delays_s,
     resolve_coupling,
+    resolve_polarization,
 )
 from rfi_simulator.satellites import (
     SatelliteTransmitter,
@@ -111,6 +112,7 @@ __all__ = [
     "radec_from_lm",
     "read_tle_file",
     "resolve_coupling",
+    "resolve_polarization",
     "source_unit_vectors_enu",
     "spectral_kurtosis_mask",
     "sumthreshold_mask",

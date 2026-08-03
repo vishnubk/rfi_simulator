@@ -67,6 +67,38 @@ switched on:
   through the quantize/dequantize round trip of the packed on-disk format
   and records which antennas railed.
 
+Polarization axis
+-----------------
+`VoltageSimulator` is single-polarization by default and grows a second
+receptor when built with ``n_pol=2``. The axis convention is deliberate:
+
+* a block's `VoltageBlock.data` is ``(n_antennas, n_chan, n_time)`` when
+  there is one receptor and ``(n_antennas, n_pol, n_chan, n_time)`` when
+  there are two. The polarization axis is *added*, never permuted in, so
+  a single-polarization run is bit-for-bit the data this simulator
+  produced before polarization existed and every consumer indexing
+  ``data[ant]`` keeps working. `VoltageBlock.pol_data` is the view that
+  always has the axis, for code that would rather not branch;
+* it sits directly after the antenna axis because a receptor belongs to
+  an antenna -- the pair ``(antenna, polarization)`` is what a real
+  backend calls an input -- and because it leaves ``(n_chan, n_time)``
+  trailing and contiguous, which is the shape every downstream operation
+  (the filterbank, the quantizer, the correlator's inner product) works
+  on.
+
+**Stokes convention.** Each receptor is calibrated in Stokes-I janskys:
+an unpolarized source of flux ``F`` gives ``XX = YY = F``, and Stokes I
+is formed as ``I = (XX + YY) / 2``. A dual-polarization run of a scene
+therefore images to the *same* flux as the single-polarization run of
+that scene, which is the property that makes the two comparable, and one
+receptor of a dual-polarization run is statistically what the
+single-polarization run models. Sky sources, receiver noise and spectral
+lines are unpolarized at this fidelity -- an independent realization per
+receptor -- while interference carries whatever state
+`rfi_simulator.rfi.resolve_polarization` was given, and a source's
+``received_power_jy`` is its Stokes I whatever that state is. Cross-hand
+products (XY, YX) are not formed; see `rfi_simulator.correlator`.
+
 They are applied in that order, and the order is a modelling decision
 worth stating. The filterbank goes first because it acts on the total
 wideband stream, sky and interference and noise alike, and because the
@@ -165,8 +197,17 @@ class VoltageBlock:
     Attributes
     ----------
     data : numpy.ndarray
-        Complex64 voltages of shape ``(n_antennas, n_chan, n_time)``, in
-        units of sqrt(Jy) (so ``|v|**2`` is in Jy).
+        Complex64 voltages in units of sqrt(Jy) (so ``|v|**2`` is in Jy),
+        of shape ``(n_antennas, n_chan, n_time)`` for a
+        single-polarization block and ``(n_antennas, n_pol, n_chan,
+        n_time)`` for a dual-polarization one. The polarization axis is
+        *present only when there is more than one receptor*: a
+        single-polarization block is exactly the array this simulator has
+        always produced, so every existing consumer of ``data[ant]``
+        keeps working, and code that wants one shape for both cases reads
+        `pol_data` instead. See the module docstring's "Polarization
+        axis" note for why the axis sits between the antennas and the
+        channels.
     time : astropy.time.Time
         Start time (UTC) of the block.
     center_time : astropy.time.Time
@@ -203,6 +244,19 @@ class VoltageBlock:
     rfi_source_names : tuple of str, optional
         Names of the interference sources, in the order of `rfi_mask`'s
         leading axis. Defaults to ``()``.
+    rfi_polarization : numpy.ndarray, optional
+        Complex128 ground-truth per-receptor amplitudes of shape
+        ``(n_interference_sources, n_pol)``: the amplitude factor each
+        source was received with in each polarization, so its power
+        contribution scales as ``|a|**2`` (see
+        `rfi_simulator.rfi.resolve_polarization`). All ones for an
+        unpolarized source -- the same convention as `rfi_coupling`, which
+        is all ones for uniform coupling. ``None`` for a block that was
+        not built by a simulator. This, and not `rfi_mask`, is where a
+        source's polarization lives: occupancy is a property of the
+        transmitter's spectrum, identical in both receptors, while the
+        *amplitude* each receptor sees is what the polarization state
+        sets.
     rfi_coupling : numpy.ndarray, optional
         Float64 ground-truth per-antenna coupling of shape
         ``(n_interference_sources, n_antennas)``: the linear *amplitude*
@@ -230,16 +284,21 @@ class VoltageBlock:
         `celestial_mask`'s leading axis. Defaults to ``()``.
     gains : numpy.ndarray, optional
         Complex ground-truth per-antenna gains of shape ``(n_antennas,
-        n_chan)`` that were applied to this block (see
+        n_chan)`` -- or ``(n_antennas, n_pol, n_chan)`` for a
+        dual-polarization block, whose two receptor chains may have been
+        given different models -- that were applied to this block (see
         `rfi_simulator.instrument`), or ``None`` (the default) when the
         block was simulated with no instrument model, i.e. with all gains
         exactly one. Carried so that calibration exercises can be scored
         against the truth.
     clip_fraction : numpy.ndarray, optional
-        Float64 array of shape ``(n_antennas,)``: the fraction of this
-        block's complex samples that saturated the quantizer, per antenna,
-        or ``None`` when the block was not quantized. Ground truth for
-        antennas driven into their rails.
+        Float64 array of shape ``(n_antennas,)`` -- or ``(n_antennas,
+        n_pol)`` for a dual-polarization block -- holding the fraction of
+        this block's complex samples that saturated the quantizer, per
+        antenna and receptor, or ``None`` when the block was not
+        quantized. Ground truth for antennas driven into their rails; a
+        polarized interferer rails one receptor long before the other,
+        which is exactly the asymmetry this field has to record.
     quant_scale : float, optional
         The quantization scale (voltage units per count) this block was
         quantized with, or ``None`` when the block was not quantized.
@@ -265,6 +324,7 @@ class VoltageBlock:
     rfi_mask: np.ndarray | None = None
     rfi_source_names: tuple[str, ...] = field(default_factory=tuple)
     rfi_coupling: np.ndarray | None = None
+    rfi_polarization: np.ndarray | None = None
     celestial_mask: np.ndarray | None = None
     celestial_source_names: tuple[str, ...] = field(default_factory=tuple)
     gains: np.ndarray | None = None
@@ -273,6 +333,13 @@ class VoltageBlock:
     channelizer: PFBChannelizer | None = None
 
     def __post_init__(self) -> None:
+        if self.data.ndim not in (3, 4):
+            raise ValueError(
+                "data must have shape (n_antennas, n_chan, n_time) or "
+                f"(n_antennas, n_pol, n_chan, n_time), got {self.data.shape}"
+            )
+        if self.data.ndim == 4 and self.data.shape[1] < 1:
+            raise ValueError(f"data has an empty polarization axis: {self.data.shape}")
         if self.rfi_mask is None:
             self.rfi_mask = np.zeros((0, self.n_chan, self.n_time), dtype=bool)
         self.rfi_source_names = tuple(self.rfi_source_names)
@@ -290,6 +357,15 @@ class VoltageBlock:
                 "rfi_coupling must have shape (n_sources, n_antennas) = "
                 f"({len(self.rfi_source_names)}, {self.n_antennas}), "
                 f"got {self.rfi_coupling.shape}"
+            )
+        if self.rfi_polarization is not None and self.rfi_polarization.shape != (
+            len(self.rfi_source_names),
+            self.n_pol,
+        ):
+            raise ValueError(
+                "rfi_polarization must have shape (n_sources, n_pol) = "
+                f"({len(self.rfi_source_names)}, {self.n_pol}), "
+                f"got {self.rfi_polarization.shape}"
             )
         if self.celestial_mask is None:
             self.celestial_mask = np.zeros((0, self.n_chan, self.n_time), dtype=bool)
@@ -321,14 +397,33 @@ class VoltageBlock:
         return self.data.shape[0]
 
     @property
+    def n_pol(self) -> int:
+        """int: Number of polarizations (receptors) in this block."""
+        return 1 if self.data.ndim == 3 else self.data.shape[1]
+
+    @property
+    def pol_data(self) -> np.ndarray:
+        """numpy.ndarray: `data` with the polarization axis always present.
+
+        Shape ``(n_antennas, n_pol, n_chan, n_time)``, a *view* of `data`
+        -- reshaped for a single-polarization block, `data` itself
+        otherwise. Anything that must handle both cases (the correlator,
+        the packed writer, a flagger) should read this instead of
+        branching on `data.ndim`.
+        """
+        if self.data.ndim == 3:
+            return self.data.reshape(self.data.shape[0], 1, *self.data.shape[1:])
+        return self.data
+
+    @property
     def n_chan(self) -> int:
         """int: Number of frequency channels."""
-        return self.data.shape[1]
+        return self.data.shape[-2]
 
     @property
     def n_time(self) -> int:
         """int: Number of time samples in the block."""
-        return self.data.shape[2]
+        return self.data.shape[-1]
 
     @property
     def duration_s(self) -> float:
@@ -385,7 +480,19 @@ class VoltageSimulator:
         Standard deviation of the per-antenna complex receiver noise, in
         root-Jy: the noise power added to every autocorrelation is
         ``noise_std**2`` Jy, i.e. ``noise_std**2`` plays the role of an
-        SEFD. Default 1.0. Set to 0.0 for noiseless runs.
+        SEFD. Default 1.0. Set to 0.0 for noiseless runs. With
+        ``n_pol=2`` each receptor gets its own independent realization at
+        this same level -- receiver noise is unpolarized.
+    n_pol : int, optional
+        Number of receptors per antenna: 1 (the default) or 2. The
+        default is bit-for-bit the data this simulator produced before
+        dual polarization existed. With 2, blocks grow a polarization
+        axis (see the module docstring), sky sources, spectral lines and
+        receiver noise are drawn independently per receptor, and each
+        interference source is split between the receptors according to
+        its `rfi_simulator.rfi.RFISource` ``polarization`` state -- which
+        is the point of the option: a polarized transmitter against
+        unpolarized noise is what a polarization-aware flagger keys on.
     channelizer : PFBChannelizer, optional
         Polyphase-filterbank response (see
         `rfi_simulator.channelizer`). Default ``None``: the perfect
@@ -398,9 +505,12 @@ class VoltageSimulator:
         arbitrary frequency rather than at a channel center. The operator
         is deterministic, so attaching it never perturbs any component's
         realization for a given seed.
-    instrument : InstrumentModel, optional
+    instrument : InstrumentModel or sequence of InstrumentModel, optional
         Per-antenna direction-independent complex gains (see
-        `rfi_simulator.instrument`). Default ``None``: every antenna has
+        `rfi_simulator.instrument`). With ``n_pol=2``, pass one model to
+        give both receptors the same gains or a sequence of two to give
+        them independently drawn ones (see `_instrument_models`). Default
+        ``None``: every antenna has
         exactly unit gain, which is bit-for-bit the same data as a run with
         `InstrumentModel.identity`. The gains multiply each antenna's
         **total** stream -- sky, interference and receiver noise together
@@ -468,6 +578,15 @@ class VoltageSimulator:
     seed with and without `rfi_sources` and the difference between the two
     datasets is the interference and nothing else.
 
+    Polarization does not add a branch to that tree. A second receptor
+    only widens the *shape* of each existing draw -- the sky spectrum
+    becomes ``(n_pol, n_chan, n_time)``, the noise ``(n_ant, n_pol,
+    n_chan, n_time)``, and an unpolarized interference source draws one
+    waveform realization per receptor -- so the generator is consumed in
+    the same order, and ``n_pol=1`` is bit-for-bit unchanged. A receptor
+    of a dual-polarization run is therefore *statistically*, not
+    literally, the single-polarization run of the same seed.
+
     `spectral_lines` draw from the sky/noise branch's own generator,
     *after* the sky sources and receiver noise of a block (see `block`),
     the same way adding another `PointSource` would: they are celestial,
@@ -514,8 +633,9 @@ class VoltageSimulator:
         n_time_per_block: int = DEFAULT_N_TIME_PER_BLOCK,
         n_blocks: int = DEFAULT_N_BLOCKS,
         noise_std=1.0,
+        n_pol: int = 1,
         channelizer: PFBChannelizer | None = None,
-        instrument: InstrumentModel | None = None,
+        instrument: InstrumentModel | Sequence[InstrumentModel] | None = None,
         quantization: str | None = None,
         quant_target_counts: float = DEFAULT_QUANT_TARGET_COUNTS,
         quant_scale: float | None = None,
@@ -539,6 +659,9 @@ class VoltageSimulator:
         self.n_chan = int(n_chan)
         self.n_time_per_block = int(n_time_per_block)
         self.n_blocks = int(n_blocks)
+        self.n_pol = int(n_pol)
+        if self.n_pol not in (1, 2):
+            raise ValueError(f"n_pol must be 1 or 2, got {self.n_pol}")
 
         if self.n_chan < 1:
             raise ValueError(f"n_chan must be >= 1, got {self.n_chan}")
@@ -572,21 +695,22 @@ class VoltageSimulator:
         self._seam_cache: tuple[int, np.ndarray] | None = None
 
         self.instrument = instrument
-        if instrument is not None:
-            if not isinstance(instrument, InstrumentModel):
-                raise ValueError(
-                    f"instrument must be an InstrumentModel or None, got {type(instrument)!r}"
-                )
-            if instrument.n_antennas != self.array.n_antennas:
-                raise ValueError(
-                    f"instrument describes {instrument.n_antennas} antennas but the array has "
-                    f"{self.array.n_antennas}"
-                )
+        if instrument is None:
+            self._gains = None
+        else:
+            models = self._instrument_models(instrument)
+            for model in models:
+                if model.n_antennas != self.array.n_antennas:
+                    raise ValueError(
+                        f"instrument describes {model.n_antennas} antennas but the array has "
+                        f"{self.array.n_antennas}"
+                    )
             # Evaluated once: the gains are a property of the receivers, not
             # of the block, so every block sees the identical bandpass.
-            self._gains = instrument.gains(self.freq_hz).astype(np.complex64)
-        else:
-            self._gains = None
+            # (n_antennas, n_pol, n_chan), one plane per receptor.
+            self._gains = np.stack(
+                [model.gains(self.freq_hz).astype(np.complex64) for model in models], axis=1
+            )
 
         if quantization not in QUANTIZATION_MODES:
             raise ValueError(
@@ -617,6 +741,60 @@ class VoltageSimulator:
 
         self.location = earth_location(array)
         self._precompute_geometry()
+
+    def _instrument_models(self, instrument) -> list[InstrumentModel]:
+        """Validate `instrument` into one `InstrumentModel` per receptor.
+
+        Parameters
+        ----------
+        instrument : InstrumentModel or sequence of InstrumentModel
+            A single model, applied to every receptor, or exactly `n_pol`
+            models, one per receptor in polarization order.
+
+        Returns
+        -------
+        list of InstrumentModel
+            Length `n_pol`.
+
+        Raises
+        ------
+        ValueError
+            If the argument is neither an `InstrumentModel` nor a sequence
+            of them, or if a sequence has the wrong length.
+
+        Notes
+        -----
+        `InstrumentModel` itself stays single-feed on purpose: a receptor
+        chain is exactly what it already describes, and a dual-polarization
+        array is two of them. Passing one model broadcasts it to both
+        receptors -- the "the two feeds share a receiver" idealization,
+        and the only behavior that keeps a `n_pol=2` run comparable to the
+        `n_pol=1` run of the same instrument -- while passing two
+        independently drawn models (different seeds) gives the two
+        receptors genuinely different bandpasses, which is the realistic
+        case.
+        """
+        if isinstance(instrument, InstrumentModel):
+            return [instrument] * self.n_pol
+        try:
+            models = list(instrument)
+        except TypeError as exc:
+            raise ValueError(
+                "instrument must be an InstrumentModel, a sequence of them (one per "
+                f"polarization), or None, got {type(instrument)!r}"
+            ) from exc
+        if not models or not all(isinstance(model, InstrumentModel) for model in models):
+            raise ValueError(
+                "instrument must be an InstrumentModel, a sequence of them (one per "
+                f"polarization), or None, got {type(instrument)!r}"
+            )
+        if len(models) != self.n_pol:
+            raise ValueError(
+                f"instrument has {len(models)} models but the simulator has "
+                f"n_pol={self.n_pol}; pass one model per polarization, or a single "
+                "model to give both receptors the same gains"
+            )
+        return models
 
     # ------------------------------------------------------------------
     # Timing
@@ -650,11 +828,29 @@ class VoltageSimulator:
     def instrument_gains(self) -> np.ndarray | None:
         """numpy.ndarray or None: Applied gains, shape ``(n_antennas, n_chan)``.
 
-        The `instrument` model evaluated on `freq_hz`, complex64, or
-        ``None`` for a run with no instrument model. A copy, so the
-        simulator's own copy cannot be edited through it.
+        The `instrument` model evaluated on `freq_hz`, complex64 -- shape
+        ``(n_antennas, n_pol, n_chan)`` for a dual-polarization run, whose
+        receptors may carry different models -- or ``None`` for a run with
+        no instrument model. A copy, so the simulator's own copy cannot be
+        edited through it.
         """
-        return None if self._gains is None else self._gains.copy()
+        return None if self._gains is None else self._block_gains()
+
+    def _block_gains(self) -> np.ndarray:
+        """A copy of the applied gains in the shape a block carries them.
+
+        Returns
+        -------
+        numpy.ndarray
+            Complex64 ``(n_antennas, n_chan)`` for a single-polarization
+            run -- the polarization axis is dropped for the same reason
+            `VoltageBlock.data`'s is -- and ``(n_antennas, n_pol,
+            n_chan)`` otherwise.
+        """
+        gains = self._gains
+        if self.n_pol == 1:
+            gains = gains.reshape(gains.shape[0], gains.shape[2])
+        return gains.copy()
 
     def block_start_times(self) -> Time:
         """Start times of every block.
@@ -787,9 +983,13 @@ class VoltageSimulator:
         Returns
         -------
         data : numpy.ndarray
-            Complex64 ``(n_antennas, n_chan, n_time)`` voltages: sky,
-            receiver noise, spectral lines and interference, with neither
-            the filterbank, nor the gains, nor quantization applied.
+            Complex64 voltages -- sky, receiver noise, spectral lines and
+            interference, with neither the filterbank, nor the gains, nor
+            quantization applied -- in the same shape convention as
+            `VoltageBlock.data`: ``(n_antennas, n_chan, n_time)`` for a
+            single-polarization run and ``(n_antennas, n_pol, n_chan,
+            n_time)`` otherwise. Synthesis itself always carries the
+            polarization axis (`_with_pol_axis`); it is dropped here, once.
         rfi_mask : numpy.ndarray
             Boolean ``(n_rfi_sources, n_chan, n_time)`` occupancy labels.
         celestial_mask : numpy.ndarray
@@ -805,30 +1005,72 @@ class VoltageSimulator:
         rng = self.block_rng(index)
 
         n_ant = self.array.n_antennas
+        n_pol = self.n_pol
         n_chan = self.n_chan
         n_time = self.n_time_per_block
 
-        data = np.zeros((n_ant, n_chan, n_time), dtype=np.complex64)
+        data = np.zeros((n_ant, n_pol, n_chan, n_time), dtype=np.complex64)
 
         for i_src, source in enumerate(self.sources):
             if source.flux_jy == 0.0:
                 continue
-            # One sky signal, shared by every antenna.
-            spectrum = self._circular_normal(rng, (n_chan, n_time), np.sqrt(source.flux_jy))
+            # One sky signal, shared by every antenna -- but an independent
+            # realization per receptor at the *same* level: the sky is
+            # unpolarized here, so each receptor sees the source at its
+            # full Stokes-I flux and the two are uncorrelated. That is the
+            # convention that keeps a dual-polarization image's flux equal
+            # to a single-polarization one (see the module docstring).
+            spectrum = self._circular_normal(rng, (n_pol, n_chan, n_time), np.sqrt(source.flux_jy))
             tau_s = self._source_delays_s[i_src, index]  # (n_ant,)
             # RF frequency of each channel -- NOT a baseband offset.
             phase = np.exp(-2j * np.pi * self.freq_hz[np.newaxis, :] * tau_s[:, np.newaxis]).astype(
                 np.complex64
             )
-            data += phase[:, :, np.newaxis] * spectrum[np.newaxis, :, :]
+            data += phase[:, np.newaxis, :, np.newaxis] * spectrum[np.newaxis]
 
         if self.noise_std > 0.0:
-            # Independent receiver noise per antenna.
-            data += self._circular_normal(rng, (n_ant, n_chan, n_time), self.noise_std)
+            # Independent receiver noise per antenna and per receptor.
+            data += self._circular_normal(rng, (n_ant, n_pol, n_chan, n_time), self.noise_std)
 
         celestial_mask = self._add_spectral_lines(data, rng)
         rfi_mask = self._add_rfi(data, index)
-        return data, rfi_mask, celestial_mask
+        return self._without_pol_axis(data), rfi_mask, celestial_mask
+
+    def _with_pol_axis(self, data: np.ndarray) -> np.ndarray:
+        """View of `data` with the polarization axis always present.
+
+        Parameters
+        ----------
+        data : numpy.ndarray
+            Voltages in the `VoltageBlock.data` shape convention.
+
+        Returns
+        -------
+        numpy.ndarray
+            Shape ``(n_antennas, n_pol, n_chan, n_time)``; a reshaped view
+            for a single-polarization run, `data` itself otherwise.
+        """
+        if self.n_pol == 1:
+            return data.reshape(data.shape[0], 1, *data.shape[1:])
+        return data
+
+    def _without_pol_axis(self, data: np.ndarray) -> np.ndarray:
+        """View of `data` in the `VoltageBlock.data` shape convention.
+
+        Parameters
+        ----------
+        data : numpy.ndarray
+            Voltages of shape ``(n_antennas, n_pol, n_chan, n_time)``.
+
+        Returns
+        -------
+        numpy.ndarray
+            The same array without its length-one polarization axis for a
+            single-polarization run, and unchanged otherwise.
+        """
+        if self.n_pol == 1:
+            return data.reshape(data.shape[0], *data.shape[2:])
+        return data
 
     def _seam_state(self, index: int) -> np.ndarray | None:
         """The filterbank state left over from the block before `index`.
@@ -862,7 +1104,7 @@ class VoltageSimulator:
         if cached is not None and cached[0] == index - 1:
             return cached[1]
         previous, _, _ = self._ideal_block(index - 1)
-        return self.channelizer.trailing_state(previous)
+        return self.channelizer.trailing_state(self._with_pol_axis(previous))
 
     def block(self, index: int) -> VoltageBlock:
         """Synthesize a single block of voltages.
@@ -886,9 +1128,14 @@ class VoltageSimulator:
         has to be regenerated from the previous block (see `_seam_state`).
         """
         data, rfi_mask, celestial_mask = self._ideal_block(index)
+        data = self._with_pol_axis(data)
         start_time = self.start_time + index * self.block_duration_s * u.s
 
         if self.channelizer is not None:
+            # The filterbank's leading axes are just independent streams,
+            # so (antenna, receptor) pairs pass through it exactly as
+            # antennas alone used to: each receptor is its own signal
+            # chain and is filtered independently.
             data, tail = self.channelizer.apply(data, self._seam_state(index))
             if tail is not None:
                 self._seam_cache = (index, tail)
@@ -903,7 +1150,7 @@ class VoltageSimulator:
         # The receiver chain sees sky, interference and noise alike, so the
         # gains go on last, on the total stream.
         if self._gains is not None:
-            data *= self._gains[:, :, np.newaxis]
+            data *= self._gains[:, :, :, np.newaxis]
 
         clip_fraction: np.ndarray | None = None
         quant_scale: float | None = None
@@ -917,7 +1164,18 @@ class VoltageSimulator:
             # digital gain setting: per-antenna gain scatter then shows up
             # as per-antenna saturation instead of being normalized away.
             data, clipped = quantize_roundtrip(data, quant_scale)
-            clip_fraction = clipped.reshape(self.n_antennas, -1).mean(axis=1, dtype=np.float64)
+            # Per antenna *and* per receptor: one polarized interferer can
+            # rail one receptor while the other stays clean, and a single
+            # per-antenna number would average that signature away.
+            clip_fraction = clipped.reshape(self.n_antennas, self.n_pol, -1).mean(
+                axis=2, dtype=np.float64
+            )
+            if self.n_pol == 1:
+                clip_fraction = clip_fraction[:, 0]
+
+        # The polarization axis exists only inside the synthesis; a
+        # single-receptor block carries the historical 3-D shape.
+        data = self._without_pol_axis(data)
 
         return VoltageBlock(
             data=data,
@@ -933,9 +1191,10 @@ class VoltageSimulator:
             rfi_mask=rfi_mask,
             rfi_source_names=tuple(source.name for source in self.rfi_sources),
             rfi_coupling=self.rfi_coupling(),
+            rfi_polarization=self.rfi_polarization(),
             celestial_mask=celestial_mask,
             celestial_source_names=tuple(line.name for line in self.spectral_lines),
-            gains=None if self._gains is None else self._gains.copy(),
+            gains=None if self._gains is None else self._block_gains(),
             clip_fraction=clip_fraction,
             quant_scale=quant_scale,
             channelizer=self.channelizer,
@@ -947,8 +1206,8 @@ class VoltageSimulator:
         Parameters
         ----------
         data : numpy.ndarray
-            Complex64 ``(n_ant, n_chan, n_time)`` voltages, modified in
-            place. Called after the sky sources and receiver noise, before
+            Complex64 ``(n_ant, n_pol, n_chan, n_time)`` voltages, modified
+            in place. Called after the sky sources and receiver noise, before
             interference and before the instrument gains, so a line passes
             through gains exactly like every other component of the total
             stream.
@@ -965,7 +1224,7 @@ class VoltageSimulator:
             order of `spectral_lines`, class ``"celestial"`` -- see
             `VoltageBlock.celestial_mask`.
         """
-        n_ant = self.array.n_antennas
+        n_ant, n_pol = self.array.n_antennas, self.n_pol
         n_chan, n_time = self.n_chan, self.n_time_per_block
         masks = np.zeros((len(self.spectral_lines), n_chan, n_time), dtype=bool)
         for i_line, line in enumerate(self.spectral_lines):
@@ -976,8 +1235,10 @@ class VoltageSimulator:
             # rfi_simulator.sky.SpectralLineForeground): unit-power circular
             # Gaussian samples scaled by the line's frequency profile, so no
             # correlated component reaches the correlator.
-            unit = self._circular_normal(rng, (n_ant, n_chan, n_time), 1.0)
-            data += unit * scale[np.newaxis, :, np.newaxis]
+            # Unpolarized, like the receiver noise: an independent
+            # realization per receptor at the same level.
+            unit = self._circular_normal(rng, (n_ant, n_pol, n_chan, n_time), 1.0)
+            data += unit * scale[np.newaxis, np.newaxis, :, np.newaxis]
             masks[i_line] = line.mask(self.freq_hz, n_time)
         return masks
 
@@ -1007,6 +1268,35 @@ class VoltageSimulator:
         for i_src, source in enumerate(self.rfi_sources):
             coupling[i_src] = source.coupling_amplitudes(self.array.n_antennas)
         return coupling
+
+    def rfi_polarization(self) -> np.ndarray:
+        """Per-receptor amplitudes of every interference source -- ground truth.
+
+        Returns
+        -------
+        numpy.ndarray
+            Complex128 array of shape ``(n_interference_sources, n_pol)``
+            of amplitude factors, in the order of `rfi_sources`; received
+            power scales as ``|a|**2`` and Stokes I as the mean over
+            receptors (see `rfi_simulator.rfi.resolve_polarization`). All
+            ones for an unpolarized source and for every source of a
+            single-polarization run, so a run that configures no
+            polarization still gets a well-defined -- and correct --
+            ground truth rather than ``None``, exactly as `rfi_coupling`
+            does. Shape ``(0, n_pol)`` for a run with no interference.
+
+        Notes
+        -----
+        Kept separate from `VoltageBlock.rfi_mask`, which has no receptor
+        axis: which channels a transmitter occupies does not depend on the
+        receptor, only how strongly each one hears it does. A flagger that
+        exploits the polarization asymmetry is scored against the
+        occupancy labels and calibrated against these amplitudes.
+        """
+        amplitudes = np.ones((len(self.rfi_sources), self.n_pol), dtype=np.complex128)
+        for i_src, source in enumerate(self.rfi_sources):
+            amplitudes[i_src] = source.polarization_amplitudes(self.n_pol)
+        return amplitudes
 
     def block_context(self, index: int, rng: np.random.Generator) -> BlockContext:
         """Build the context handed to an interference source for block `index`.
@@ -1040,6 +1330,7 @@ class VoltageSimulator:
             phase_center_delays_s=self._phase_center_delays_s[index],
             rng=rng,
             channelizer=self.channelizer,
+            n_pol=self.n_pol,
         )
 
     def _add_rfi(self, data: np.ndarray, index: int) -> np.ndarray:
@@ -1048,8 +1339,8 @@ class VoltageSimulator:
         Parameters
         ----------
         data : numpy.ndarray
-            Complex64 ``(n_ant, n_chan, n_time)`` sky-plus-noise voltages,
-            modified in place.
+            Complex64 ``(n_ant, n_pol, n_chan, n_time)`` sky-plus-noise
+            voltages, modified in place.
         index : int
             Block index.
 
@@ -1070,7 +1361,9 @@ class VoltageSimulator:
             return masks
 
         rngs = self.rfi_block_rngs(index)
-        expected_voltage_shape = (self.array.n_antennas, n_chan, n_time)
+        n_ant = self.array.n_antennas
+        pol_shape = (n_ant, self.n_pol, n_chan, n_time)
+        expected_voltage_shape = (n_ant, n_chan, n_time) if self.n_pol == 1 else pol_shape
         for i_src, (source, source_rng) in enumerate(zip(self.rfi_sources, rngs)):
             ctx = self.block_context(index, source_rng)
             voltages, mask = source.contribution(ctx)
@@ -1084,7 +1377,7 @@ class VoltageSimulator:
                     f"interference source {source.name!r} returned a mask of shape "
                     f"{mask.shape}, expected {(n_chan, n_time)}"
                 )
-            data += voltages.astype(np.complex64, copy=False)
+            data += voltages.astype(np.complex64, copy=False).reshape(pol_shape)
             masks[i_src] = mask
         return masks
 

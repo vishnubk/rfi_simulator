@@ -157,6 +157,7 @@ def dirty_image(
     channels: slice | np.ndarray | None = None,
     include_autos: bool = False,
     warn_on_w_term: bool = True,
+    pol: str | int | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Naturally-weighted dirty image by direct DFT.
 
@@ -185,6 +186,15 @@ def dirty_image(
         If True (default) emit a `UserWarning` when the neglected ``w``
         term exceeds `W_TERM_WARN_PHASE_RAD` at the map edge, which is the
         usual symptom of imaging far from the zenith with a flat array.
+    pol : str or int, optional
+        Which polarization product to image. Default ``None``: Stokes I,
+        i.e. `rfi_simulator.correlator.Visibilities.stokes_i` -- for
+        single-polarization data that is the data itself, and for
+        dual-polarization data it is ``(XX + YY) / 2``, which puts the two
+        on the same flux scale (see `rfi_simulator.voltages`). Pass a name
+        from ``vis.pol_names`` (e.g. ``"XX"``) or an integer index to image
+        one receptor instead, which is what a polarization diagnostic
+        wants.
 
     Returns
     -------
@@ -200,6 +210,8 @@ def dirty_image(
     ------
     ValueError
         If the baseline/channel selection is empty.
+    KeyError
+        If `pol` names a product this dataset does not carry.
     """
     if l_grid is None:
         l_grid = lm_axis(field_of_view_rad, n_pix)
@@ -214,11 +226,13 @@ def dirty_image(
 
     chan_sel = slice(None) if channels is None else channels
 
+    selected = vis.stokes_i() if pol is None else vis.pol_data[:, :, vis.pol_index(pol), :]
+
     u, v, w = uvw_wavelengths(vis)
     u = u[:, baseline_sel, :][:, :, chan_sel].ravel()
     v = v[:, baseline_sel, :][:, :, chan_sel].ravel()
     w = w[:, baseline_sel, :][:, :, chan_sel].ravel()
-    data = vis.data[:, baseline_sel, :][:, :, chan_sel].ravel()
+    data = selected[:, baseline_sel, :][:, :, chan_sel].ravel()
 
     n_terms = data.size
     if n_terms == 0:

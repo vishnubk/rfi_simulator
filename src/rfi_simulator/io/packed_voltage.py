@@ -577,17 +577,15 @@ def pack_from_voltage_block(
     Parameters
     ----------
     data : numpy.ndarray
-        Complex voltages, either shaped ``(n_antennas, n_channels,
-        n_time)`` (single-pol, as produced by
-        `rfi_simulator.voltages.VoltageBlock.data`) or ``(n_antennas,
-        n_channels, n_time, n_pols)`` (already carrying a polarization
-        axis).
+        Complex voltages, shaped according to `pol_mode`: ``(n_antennas,
+        n_channels, n_time)``, ``(n_antennas, n_channels, n_time,
+        n_pols)`` or ``(n_antennas, n_pols, n_channels, n_time)``.
     layout : PackedVoltageLayout
         Target block dimensions. ``n_time = layout.n_packets *
         layout.n_times_per_packet`` must equal `data`'s time axis length.
     scale : float, optional
         Quantization scale, passed through to `pack_block`.
-    pol_mode : {"duplicate", "stack"}, optional
+    pol_mode : {"duplicate", "stack", "block"}, optional
         How to handle the polarization axis:
 
         ``"duplicate"``
@@ -599,6 +597,18 @@ def pack_from_voltage_block(
         ``"stack"``
             `data` is already 4-D with a trailing polarization axis of
             length `layout.n_pols` and is used as-is.
+        ``"block"``
+            `data` is a genuine dual-polarization
+            `rfi_simulator.voltages.VoltageBlock.data` array, ``(n_antennas,
+            n_pols, n_channels, n_time)``, and is transposed into the
+            on-disk order. Use this to write real two-receptor voltages
+            rather than the duplicated placeholder: the two receptors are
+            *different* data, and ``"duplicate"`` would silently write a
+            perfectly correlated pair. A 3-D single-polarization block is
+            also accepted here, and behaves exactly like ``"duplicate"``,
+            so a writer does not have to branch on the block's shape --
+            `rfi_simulator.voltages.VoltageBlock.pol_data` plus this mode
+            handles both.
 
     Returns
     -------
@@ -611,8 +621,23 @@ def pack_from_voltage_block(
     ValueError
         If `pol_mode` is not recognised, if `data`'s shape does not match
         `layout` under the requested `pol_mode`, or if `data`'s time axis
-        does not equal `layout.n_time`.
+        does not equal `layout.n_time`. A dual-polarization block whose
+        receptor count differs from ``layout.n_pols`` fails here rather
+        than being silently truncated or duplicated.
     """
+    if pol_mode == "block":
+        if data.ndim == 3:
+            pol_mode = "duplicate"
+        elif data.ndim == 4:
+            # (n_ant, n_pol, n_chan, n_time) -> (n_ant, n_chan, n_time, n_pol)
+            data = np.ascontiguousarray(np.transpose(data, (0, 2, 3, 1)))
+            pol_mode = "stack"
+        else:
+            raise ValueError(
+                "pol_mode='block' expects a (n_ant, n_chan, n_time) or "
+                f"(n_ant, n_pol, n_chan, n_time) array, got shape {data.shape}"
+            )
+
     if pol_mode == "duplicate":
         if data.ndim != 3:
             raise ValueError(
@@ -631,7 +656,7 @@ def pack_from_voltage_block(
             )
         voltages = data
     else:
-        raise ValueError(f"pol_mode must be 'duplicate' or 'stack', got {pol_mode!r}")
+        raise ValueError(f"pol_mode must be 'duplicate', 'stack' or 'block', got {pol_mode!r}")
 
     if voltages.shape != layout.unpacked_shape:
         raise ValueError(

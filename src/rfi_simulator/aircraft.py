@@ -47,6 +47,7 @@ from rfi_simulator.rfi import (
     channels_within,
     circular_normal,
     elevation_deg,
+    mix_polarizations,
     occupancy_mask,
     out_of_band_message,
 )
@@ -97,6 +98,10 @@ class ADSBTransponder(RFISource):
     coupling : None, array_like or mapping, optional
         Per-antenna linear amplitude coupling; see
         `rfi_simulator.rfi.resolve_coupling`. Default ``None`` (uniform).
+    polarization : None or mapping, optional
+        Polarization state of the emission; see
+        `rfi_simulator.rfi.resolve_polarization`. Default ``None``:
+        unpolarized, and ignored entirely by a single-polarization run.
     min_elevation_deg : float or astropy.units.Quantity, optional
         Elevation below which the aircraft is treated as over the
         horizon: blocks whose mid-point elevation is under this
@@ -161,9 +166,10 @@ class ADSBTransponder(RFISource):
         pulse_width_samples: int = 1,
         min_elevation_deg=0.0,
         coupling=None,
+        polarization=None,
         name: str = "transponder",
     ) -> None:
-        super().__init__(name, coupling=coupling)
+        super().__init__(name, coupling=coupling, polarization=polarization)
         self.position_enu_m = np.asarray(_to_value(position_enu_m, u.m), dtype=np.float64).reshape(
             3
         )
@@ -251,8 +257,9 @@ class ADSBTransponder(RFISource):
         Returns
         -------
         voltages : numpy.ndarray
-            Complex64 ``(n_antennas, n_chan, n_time)`` contribution in
-            root-Jy.
+            Complex64 ``(n_antennas, n_chan, n_time)`` -- or
+            ``(n_antennas, n_pol, n_chan, n_time)`` when ``ctx.n_pol >
+            1`` -- contribution in root-Jy.
         mask : numpy.ndarray
             Boolean ``(n_chan, n_time)`` occupancy labels: the occupied
             channels, on the samples a burst landed in. All False for a
@@ -284,7 +291,7 @@ class ADSBTransponder(RFISource):
             # returns before drawing any bursts, so an out-of-view block
             # costs nothing and consumes no randomness it does not need.
             return (
-                np.zeros((ctx.n_antennas, ctx.n_chan, ctx.n_time), dtype=np.complex64),
+                ctx.squeeze_pol(np.zeros(ctx.pol_shape(ctx.n_chan, ctx.n_time), np.complex64)),
                 np.zeros((ctx.n_chan, ctx.n_time), dtype=bool),
             )
 
@@ -298,18 +305,20 @@ class ADSBTransponder(RFISource):
         envelope[np.ix_(occupied, active)] = self.received_power_jy / n_occupied
         mask = occupancy_mask(envelope)
 
-        voltages = np.zeros((ctx.n_antennas, ctx.n_chan, ctx.n_time), dtype=np.complex64)
+        voltages = np.zeros(ctx.pol_shape(ctx.n_chan, ctx.n_time), dtype=np.complex64)
         active_samples = np.flatnonzero(active)
         if active_samples.size == 0:
-            return voltages, mask
+            return ctx.squeeze_pol(voltages), mask
 
-        waveform = circular_normal(ctx.rng, (n_occupied, active_samples.size))
+        mixing = self.pol_mixing(ctx.n_pol)
+        waveform = circular_normal(ctx.rng, (mixing.shape[1], n_occupied, active_samples.size))
         waveform *= np.float32(np.sqrt(self.received_power_jy / n_occupied))
+        per_pol = mix_polarizations(mixing, waveform)  # (n_pol, n_occupied, n_active)
 
         phasors = self.coupled_phasors(
             position_enu_m, ctx.antenna_positions_enu_m, ctx.freq_hz[occupied]
         )
-        voltages[np.ix_(np.arange(ctx.n_antennas), occupied, active_samples)] = (
-            phasors[:, :, np.newaxis] * waveform[np.newaxis, :, :]
-        )
-        return voltages, mask
+        voltages[
+            np.ix_(np.arange(ctx.n_antennas), np.arange(ctx.n_pol), occupied, active_samples)
+        ] = phasors[:, np.newaxis, :, np.newaxis] * per_pol[np.newaxis]
+        return ctx.squeeze_pol(voltages), mask
