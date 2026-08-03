@@ -148,6 +148,16 @@ class VoltageBlock:
     rfi_source_names : tuple of str, optional
         Names of the interference sources, in the order of `rfi_mask`'s
         leading axis. Defaults to ``()``.
+    rfi_coupling : numpy.ndarray, optional
+        Float64 ground-truth per-antenna coupling of shape
+        ``(n_interference_sources, n_antennas)``: the linear *amplitude*
+        factor each source was received with at each antenna, so its power
+        contribution scales as the square (see
+        `rfi_simulator.rfi.resolve_coupling`). All ones for a source with
+        the default uniform coupling. ``None`` (the default) for a block
+        that was not built by a simulator. Deliberately separate from
+        `rfi_mask`, which has no antenna axis -- see the labelling
+        convention in `rfi_simulator.rfi`.
     gains : numpy.ndarray, optional
         Complex ground-truth per-antenna gains of shape ``(n_antennas,
         n_chan)`` that were applied to this block (see
@@ -177,6 +187,7 @@ class VoltageBlock:
     s0_enu: np.ndarray
     rfi_mask: np.ndarray | None = None
     rfi_source_names: tuple[str, ...] = field(default_factory=tuple)
+    rfi_coupling: np.ndarray | None = None
     gains: np.ndarray | None = None
     clip_fraction: np.ndarray | None = None
     quant_scale: float | None = None
@@ -190,6 +201,15 @@ class VoltageBlock:
                 "rfi_mask must have shape (n_sources, n_chan, n_time) = "
                 f"({len(self.rfi_source_names)}, {self.n_chan}, {self.n_time}), "
                 f"got {self.rfi_mask.shape}"
+            )
+        if self.rfi_coupling is not None and self.rfi_coupling.shape != (
+            len(self.rfi_source_names),
+            self.n_antennas,
+        ):
+            raise ValueError(
+                "rfi_coupling must have shape (n_sources, n_antennas) = "
+                f"({len(self.rfi_source_names)}, {self.n_antennas}), "
+                f"got {self.rfi_coupling.shape}"
             )
 
     @property
@@ -685,10 +705,38 @@ class VoltageSimulator:
             s0_enu=self._phase_center_s_hat[index],
             rfi_mask=rfi_mask,
             rfi_source_names=tuple(source.name for source in self.rfi_sources),
+            rfi_coupling=self.rfi_coupling(),
             gains=None if self._gains is None else self._gains.copy(),
             clip_fraction=clip_fraction,
             quant_scale=quant_scale,
         )
+
+    def rfi_coupling(self) -> np.ndarray:
+        """Per-antenna coupling of every interference source -- ground truth.
+
+        Returns
+        -------
+        numpy.ndarray
+            Float64 array of shape ``(n_interference_sources, n_antennas)``
+            of linear amplitude factors, in the order of `rfi_sources`;
+            received power scales as the square. All ones for a source with
+            uniform coupling, so a run with no coupling configured still
+            gets a well-defined (and correct) ground truth rather than
+            ``None``. Shape ``(0, n_antennas)`` for a run with no
+            interference.
+
+        Notes
+        -----
+        Coupling is a fixed property of the installation, not of a block,
+        so this is the same array for every block of a run. It is attached
+        to each block anyway (`VoltageBlock.rfi_coupling`), for the same
+        reason the gains are: a block that has been written out and read
+        back should carry its own truth.
+        """
+        coupling = np.ones((len(self.rfi_sources), self.array.n_antennas), dtype=np.float64)
+        for i_src, source in enumerate(self.rfi_sources):
+            coupling[i_src] = source.coupling_amplitudes(self.array.n_antennas)
+        return coupling
 
     def block_context(self, index: int, rng: np.random.Generator) -> BlockContext:
         """Build the context handed to an interference source for block `index`.
