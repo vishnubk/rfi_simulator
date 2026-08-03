@@ -17,6 +17,7 @@ from rfi_simulator.io.packed_voltage import (
     PackedVoltageLayout,
     pack_block,
     pack_from_voltage_block,
+    quantize_roundtrip,
     read_packed_file,
     suggest_quant_scale,
     unpack_block,
@@ -247,6 +248,23 @@ def test_pack_from_voltage_block_rejects_nan():
         pack_from_voltage_block(data, layout, scale=0.05, pol_mode="duplicate")
 
 
+@pytest.mark.parametrize("nan_policy", ["zero", "ignore", "", "RAISE"])
+def test_pack_block_rejects_unknown_nan_policy(nan_policy):
+    """Only the documented 'raise' policy is implemented; anything else
+    must fail loudly rather than being silently treated as 'raise'."""
+    layout = SMALL_LAYOUT
+    voltages = np.zeros(layout.unpacked_shape, dtype=np.complex64)
+    with pytest.raises(ValueError, match="nan_policy"):
+        pack_block(voltages, layout, 0.05, nan_policy=nan_policy)
+
+
+@pytest.mark.parametrize("nan_policy", ["zero", "ignore", "", "RAISE"])
+def test_quantize_roundtrip_rejects_unknown_nan_policy(nan_policy):
+    voltages = np.zeros(4, dtype=np.complex64)
+    with pytest.raises(ValueError, match="nan_policy"):
+        quantize_roundtrip(voltages, 0.05, nan_policy=nan_policy)
+
+
 def test_pack_inf_still_saturates_correctly():
     """Regression: +-Inf is a documented, intentional saturation case, not an error.
 
@@ -349,6 +367,20 @@ def test_read_packed_file_rejects_bad_file_size(tmp_path):
         list(read_packed_file(path, layout, 0.05))
 
 
+def test_read_packed_file_empty_file_yields_nothing(tmp_path):
+    """A 0-byte file is a valid, empty file: zero blocks, no error.
+
+    0 is an exact multiple of `bytes_per_block`, so this must not raise
+    the file-size check above; and `numpy.memmap` cannot map an empty
+    file at all, so the empty case has to be short-circuited before that
+    call rather than surfacing memmap's unrelated error.
+    """
+    layout = SMALL_LAYOUT
+    path = tmp_path / "empty.dat"
+    path.write_bytes(b"")
+    assert list(read_packed_file(path, layout, 0.05)) == []
+
+
 # ---------------------------------------------------------------------
 # Converter helper.
 # ---------------------------------------------------------------------
@@ -365,6 +397,12 @@ def test_pack_from_voltage_block_duplicate_pol():
     assert out.shape == (n_ant, n_chan, n_time, n_pol)
     # Both polarizations should be (quantized) copies of the same input.
     assert np.array_equal(out[..., 0], out[..., 1])
+    # ...and specifically the correctly quantized single-pol expectation,
+    # not just copies of each other (which would also pass if both copies
+    # were quantized identically wrong).
+    expected_single_pol, _clipped = quantize_roundtrip(data, 0.05)
+    np.testing.assert_array_equal(out[..., 0], expected_single_pol)
+    np.testing.assert_array_equal(out[..., 1], expected_single_pol)
 
 
 def test_pack_from_voltage_block_stack_pol():
@@ -415,6 +453,18 @@ def test_suggest_quant_scale_zero_input_falls_back():
     voltages = np.zeros(16, dtype=np.complex64)
     scale = suggest_quant_scale(voltages)
     assert scale > 0.0
+
+
+def test_suggest_quant_scale_rejects_empty_input():
+    with pytest.raises(ValueError):
+        suggest_quant_scale(np.zeros(0, dtype=np.complex64))
+
+
+def test_suggest_quant_scale_rejects_nan_input():
+    voltages = np.zeros(16, dtype=np.complex64)
+    voltages[3] = complex(float("nan"), 0.0)
+    with pytest.raises(ValueError):
+        suggest_quant_scale(voltages)
 
 
 def test_suggest_quant_scale_rejects_non_positive_target():
@@ -481,6 +531,30 @@ def test_suggest_quant_scale_rejects_target_below_noise_floor():
     # Exactly at the floor is also rejected (residual == 0 -> division by zero).
     with pytest.raises(ValueError):
         suggest_quant_scale(voltages, target_counts=float(np.sqrt(1.0 / 12.0)))
+
+
+@pytest.mark.parametrize("target_counts", [1.33, 2.5])
+def test_suggest_quant_scale_realized_rms_matches_target(target_counts):
+    """The scale `suggest_quant_scale` picks actually lands near `target_counts`.
+
+    The other tests here check the closed-form formula only; this one
+    empirically puts the suggested scale through `quantize_roundtrip` and
+    measures the realized post-quantization RMS, so a formula/`_quantize_
+    components` mismatch (e.g. a sign or off-by-factor-of-two error) would
+    show up even if both halves independently reproduced their own math.
+    """
+    rng = np.random.default_rng(9)
+    voltages = rng.standard_normal(20000) + 1j * rng.standard_normal(20000)
+    scale = suggest_quant_scale(voltages, target_counts=target_counts)
+    dequantized, _clipped = quantize_roundtrip(voltages, scale)
+    realized_rms_signal_units = np.sqrt(
+        0.5
+        * np.mean(
+            dequantized.real.astype(np.float64) ** 2 + dequantized.imag.astype(np.float64) ** 2
+        )
+    )
+    realized_rms_counts = realized_rms_signal_units / scale
+    assert realized_rms_counts == pytest.approx(target_counts, rel=0.03)
 
 
 def test_suggest_quant_scale_uncorrected_still_accepts_target_below_floor():

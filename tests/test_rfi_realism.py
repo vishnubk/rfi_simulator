@@ -463,6 +463,8 @@ def test_duty_cycle_and_envelope_are_mutually_exclusive():
     [
         ({"type": "iid", "period_s": 1e-3}, "envelope type"),
         ({"type": "periodic", "period_s": 0.0}, "period_s"),
+        ({"type": "periodic", "period_s": float("nan")}, "period_s"),
+        ({"type": "periodic", "period_s": float("inf")}, "period_s"),
         ({"type": "periodic", "period_s": 1e-3, "duty": 1.5}, "duty"),
         ({"type": "periodic", "period_s": 1e-3, "rate_hz": 60.0}, "unexpected keys"),
         ("periodic", "envelope must be None or a mapping"),
@@ -526,7 +528,17 @@ def test_periodic_impulses_land_at_the_configured_spacing(default_array, start_t
         ({"arrival": "regular"}, "arrival must be"),
         ({"arrival": {"type": "poisson"}}, "arrival type"),
         ({"arrival": {"type": "periodic", "rate_hz": 0.0}}, "rate_hz must be > 0"),
+        ({"arrival": {"type": "periodic", "rate_hz": float("nan")}}, "rate_hz"),
+        ({"arrival": {"type": "periodic", "rate_hz": float("inf")}}, "rate_hz"),
         ({"arrival": {"type": "periodic", "rate_hz": 60.0, "jitter_s": -1.0}}, "jitter_s"),
+        (
+            {"arrival": {"type": "periodic", "rate_hz": 60.0, "jitter_s": float("nan")}},
+            "jitter_s",
+        ),
+        (
+            {"arrival": {"type": "periodic", "rate_hz": 60.0, "jitter_s": float("inf")}},
+            "jitter_s",
+        ),
         ({"arrival": {"type": "periodic", "rate_hz": 60.0, "duty": 0.5}}, "unexpected keys"),
     ],
 )

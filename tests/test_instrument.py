@@ -159,7 +159,11 @@ def test_from_params_rejects_non_finite_scatter_parameters(param, match, value):
     options[param] = value
     with pytest.raises(ValueError, match=match):
         InstrumentModel.from_params(**options)
-        InstrumentModel.from_params(options.pop("n_antennas"), **options)
+
+    positional_options = dict(options)
+    n_antennas = positional_options.pop("n_antennas")
+    with pytest.raises(ValueError, match=match):
+        InstrumentModel.from_params(n_antennas, **positional_options)
 
 
 @pytest.mark.parametrize(
@@ -169,11 +173,23 @@ def test_from_params_rejects_non_finite_scatter_parameters(param, match, value):
         ((np.ones(3), FREQ_HZ), "meaningless"),
         ((np.ones((2, 2, 2)),), "must have shape"),
         ((np.array([1.0, np.nan]),), "non-finite"),
+        ((np.ones((2, 3)), np.array([1.0e9, 2.0e9, np.nan])), "non-finite"),
     ],
 )
 def test_from_gains_validates(args, match):
     with pytest.raises(ValueError, match=match):
         InstrumentModel.from_gains(*args)
+
+
+@pytest.mark.parametrize("method", ["gains", "bandpass_db"])
+def test_gains_and_bandpass_db_reject_non_finite_freq_hz(method):
+    """A NaN in the call-time freq_hz grid must raise, not silently NaN
+    that channel's gain for every antenna."""
+    model = InstrumentModel.from_params(4, seed=4, bandpass_ripple_db=0.3)
+    bad_freq = FREQ_HZ.copy()
+    bad_freq[0] = np.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        getattr(model, method)(bad_freq)
 
 
 # ----------------------------------------------------------------------

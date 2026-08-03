@@ -227,9 +227,15 @@ def _reject_nan(voltages: np.ndarray, *, nan_policy: str, where: str) -> None:
     Raises
     ------
     ValueError
-        If any component is NaN. See `pack_block`'s Notes for why NaN is
-        rejected outright while ``+-Inf`` is allowed to saturate.
+        If `nan_policy` is not ``"raise"`` (the only currently implemented
+        policy), or if any component is NaN. See `pack_block`'s Notes for
+        why NaN is rejected outright while ``+-Inf`` is allowed to
+        saturate.
     """
+    if nan_policy != "raise":
+        raise ValueError(
+            f"{where}: nan_policy must be 'raise' (the only implemented policy), got {nan_policy!r}"
+        )
     real_nan = np.isnan(voltages.real)
     imag_nan = np.isnan(voltages.imag)
     if np.any(real_nan) or np.any(imag_nan):
@@ -324,8 +330,8 @@ def quantize_roundtrip(
     Raises
     ------
     ValueError
-        If `scale` is not a positive finite number, or if `voltages`
-        contains a NaN component.
+        If `scale` is not a positive finite number, if `nan_policy` is not
+        ``"raise"``, or if `voltages` contains a NaN component.
     """
     _require_positive_finite_scale(scale, where="quantize_roundtrip")
     _reject_nan(voltages, nan_policy=nan_policy, where="quantize_roundtrip")
@@ -433,8 +439,8 @@ def pack_block(
     ------
     ValueError
         If `voltages` is not shaped `PackedVoltageLayout.unpacked_shape`,
-        if `scale` is not a positive finite number, or if `voltages`
-        contains any NaN component.
+        if `scale` is not a positive finite number, if `nan_policy` is not
+        ``"raise"``, or if `voltages` contains any NaN component.
 
     Notes
     -----
@@ -524,7 +530,9 @@ def read_packed_file(
     memory -- suitable for multi-gigabyte files that must not be loaded
     whole. `scale` is validated up front (before the memmap is opened) so
     a bad scale fails fast with a clear error instead of only surfacing
-    once `unpack_block` runs on the first requested block.
+    once `unpack_block` runs on the first requested block. A 0-byte file
+    is a valid (empty) file under this format -- it has zero blocks, and
+    this function yields nothing for it, rather than raising.
     """
     _require_positive_finite_scale(scale, where="read_packed_file")
     path = Path(path)
@@ -545,6 +553,13 @@ def read_packed_file(
             if not 0 <= idx < n_blocks:
                 raise ValueError(f"block index {idx} out of range [0, {n_blocks})")
 
+    if n_blocks == 0:
+        # A 0-byte file has zero blocks by construction (0 is a multiple of
+        # bytes_per_block); `numpy.memmap` refuses to map an empty file at
+        # all, so that generic case must be short-circuited here rather
+        # than surfacing memmap's unrelated "cannot mmap an empty file"
+        # error. Empty iteration is the correct, documented behavior.
+        return
     mmap = np.memmap(path, dtype=np.uint8, mode="r", shape=(n_blocks, bytes_per_block))
     for idx in indices:
         yield unpack_block(mmap[idx], layout, scale)
@@ -683,7 +698,8 @@ def suggest_quant_scale(
     Raises
     ------
     ValueError
-        If `target_counts` is not finite and positive, or (when
+        If `target_counts` is not finite and positive, if `voltages` is
+        empty, if `voltages` contains a NaN component, or (when
         `correct_for_quantization_noise` is True) if `target_counts` is at
         or below the quantization noise floor
         (``sqrt(1/12) ~= 0.2887`` counts) -- below that floor, no scale
@@ -718,6 +734,10 @@ def suggest_quant_scale(
     """
     if not np.isfinite(target_counts) or target_counts <= 0.0:
         raise ValueError(f"target_counts must be finite and > 0, got {target_counts}")
+    voltages = np.asarray(voltages)
+    if voltages.size == 0:
+        raise ValueError("voltages must not be empty")
+    _reject_nan(voltages, nan_policy="raise", where="suggest_quant_scale")
     # Per-component (real and imaginary treated together) RMS.
     component_rms = np.sqrt(
         0.5 * np.mean(voltages.real.astype(np.float64) ** 2 + voltages.imag.astype(np.float64) ** 2)

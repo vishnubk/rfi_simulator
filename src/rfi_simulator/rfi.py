@@ -1174,8 +1174,8 @@ def _normalize_envelope(envelope) -> dict | None:
     ------
     ValueError
         If the type is unknown, a key is unexpected, ``period_s`` is not
-        positive, ``duty`` is outside ``[0, 1]``, or ``phase`` is not
-        finite.
+        finite and positive, ``duty`` is outside ``[0, 1]``, or ``phase``
+        is not finite.
     """
     if envelope is None:
         return None
@@ -1193,8 +1193,8 @@ def _normalize_envelope(envelope) -> dict | None:
     phase = float(spec.pop("phase", 0.0))
     if spec:
         raise ValueError(f"unexpected keys in the envelope specification: {sorted(spec)}")
-    if not period_s > 0.0:
-        raise ValueError(f"envelope period_s must be > 0, got {period_s}")
+    if not np.isfinite(period_s) or not period_s > 0.0:
+        raise ValueError(f"envelope period_s must be finite and > 0, got {period_s}")
     if not 0.0 <= duty <= 1.0:
         raise ValueError(f"envelope duty must be in [0, 1], got {duty}")
     if not np.isfinite(phase):
@@ -1221,8 +1221,8 @@ def _normalize_arrival(arrival):
     ------
     ValueError
         If the string is not ``"poisson"``, the mapping type is not
-        ``"periodic"``, a key is unexpected, ``rate_hz`` is not positive,
-        or ``jitter_s`` is negative.
+        ``"periodic"``, a key is unexpected, ``rate_hz`` is not finite and
+        positive, or ``jitter_s`` is not finite and non-negative.
     """
     if isinstance(arrival, str):
         if arrival != "poisson":
@@ -1240,10 +1240,10 @@ def _normalize_arrival(arrival):
     jitter_s = float(_to_value(spec.pop("jitter_s", 0.0), u.s))
     if spec:
         raise ValueError(f"unexpected keys in the arrival specification: {sorted(spec)}")
-    if not rate_hz > 0.0:
-        raise ValueError(f"arrival rate_hz must be > 0, got {rate_hz}")
-    if jitter_s < 0.0:
-        raise ValueError(f"arrival jitter_s must be >= 0, got {jitter_s}")
+    if not np.isfinite(rate_hz) or not rate_hz > 0.0:
+        raise ValueError(f"arrival rate_hz must be > 0 and finite, got {rate_hz}")
+    if not np.isfinite(jitter_s) or jitter_s < 0.0:
+        raise ValueError(f"arrival jitter_s must be >= 0 and finite, got {jitter_s}")
     return {"type": "periodic", "rate_hz": rate_hz, "jitter_s": jitter_s}
 
 

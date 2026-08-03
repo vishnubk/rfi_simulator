@@ -331,7 +331,7 @@ class SpectralLineForeground:
         sigma_hz = self.fwhm_hz * _FWHM_TO_SIGMA
         return self.line_flux_jy * np.exp(-0.5 * ((freq_hz - self.center_freq_hz) / sigma_hz) ** 2)
 
-    def mask(self, freq_hz, n_time: int, threshold: float = 0.01) -> np.ndarray:
+    def mask(self, freq_hz, n_time: int, threshold: float | None = None) -> np.ndarray:
         """Ground-truth occupancy mask, celestial label.
 
         Parameters
@@ -344,27 +344,40 @@ class SpectralLineForeground:
             interference source's, does not vary within a block -- there is
             no duty cycle or on/off pattern to a celestial line.
         threshold : float, optional
-            Fraction of the profile's peak channel value above which a
-            channel counts as occupied. Default 0.01 (1 %), the same
-            convention `rfi_simulator.rfi.OCCUPANCY_THRESHOLD` uses for
-            interference labels -- a shared numerical convention, not a
-            shared meaning; this mask's class is ``"celestial"``, kept in a
-            separate field from any `rfi_mask` (see
-            `rfi_simulator.voltages.VoltageBlock`).
+            Fraction of `line_flux_jy` (the true peak-channel power, by
+            definition -- see the Flux convention above) above which a
+            channel counts as occupied. Default (``None``) is
+            `rfi_simulator.rfi.OCCUPANCY_THRESHOLD` (1 %), the same
+            convention that module uses for interference labels -- a
+            shared numerical convention, not a shared meaning; this mask's
+            class is ``"celestial"``, kept in a separate field from any
+            `rfi_mask` (see `rfi_simulator.voltages.VoltageBlock`).
 
         Returns
         -------
         numpy.ndarray
             Boolean array of shape ``(n_chan, n_time)``. All False if the
-            line is entirely outside the simulated band (the profile never
-            exceeds `threshold` of its own peak in that case only because
-            the peak itself is negligible; in practice this is the
-            partially/fully-out-of-band case degrading gracefully to an
-            empty mask).
+            line is entirely outside the simulated band. The threshold is
+            evaluated against `line_flux_jy`, the line's true (analytic)
+            peak, rather than the evaluated envelope's own local maximum:
+            a line far enough outside the band underflows to exact zero
+            everywhere in `freq_hz` and the mask is empty by the explicit
+            zero guard below, but a line only moderately out of band can
+            still evaluate to a tiny *nonzero* in-band value -- thresholding
+            against that local maximum would then flag the nearest in-band
+            channel as occupied, which is exactly the ungraceful behavior
+            this is meant to avoid.
         """
+        if threshold is None:
+            # Imported locally: `rfi_simulator.rfi` pulls in
+            # `rfi_simulator.delays`, which imports this module, so a
+            # module-level import here would be circular.
+            from rfi_simulator.rfi import OCCUPANCY_THRESHOLD
+
+            threshold = OCCUPANCY_THRESHOLD
         freq_hz = np.asarray(freq_hz, dtype=np.float64)
         envelope = self.power_envelope_jy(freq_hz)
-        peak = float(envelope.max()) if envelope.size else 0.0
+        peak = self.line_flux_jy
         if peak <= 0.0:
             occupied_chan = np.zeros(envelope.shape, dtype=bool)
         else:

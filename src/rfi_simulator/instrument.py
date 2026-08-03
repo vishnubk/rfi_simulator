@@ -203,6 +203,8 @@ class InstrumentModel:
                 raise ValueError(
                     f"tabulated_freq_hz must have shape (n_chan,), got {table_freq.shape}"
                 )
+            if not np.all(np.isfinite(table_freq)):
+                raise ValueError("tabulated_freq_hz contains non-finite values")
             if table.shape != (scalar.size, table_freq.size):
                 raise ValueError(
                     "tabulated_gains must have shape (n_antennas, n_chan) = "
@@ -523,6 +525,8 @@ class InstrumentModel:
         freq = np.asarray(freq_hz, dtype=np.float64)
         if freq.ndim != 1 or freq.size < 1:
             raise ValueError(f"freq_hz must have shape (n_chan,), got {freq.shape}")
+        if not np.all(np.isfinite(freq)):
+            raise ValueError("freq_hz contains non-finite values")
         if self.bandpass_cos_db is None:
             return np.zeros((self.n_antennas, freq.size), dtype=np.float64)
 
@@ -553,13 +557,15 @@ class InstrumentModel:
         Raises
         ------
         ValueError
-            If `freq_hz` is not a 1-D non-empty array, or if this is a
-            tabulated model and `freq_hz` differs from the grid the table
-            was supplied on.
+            If `freq_hz` is not a 1-D non-empty array, if it contains a
+            non-finite value, or if this is a tabulated model and
+            `freq_hz` differs from the grid the table was supplied on.
         """
         freq = np.asarray(freq_hz, dtype=np.float64)
         if freq.ndim != 1 or freq.size < 1:
             raise ValueError(f"freq_hz must have shape (n_chan,), got {freq.shape}")
+        if not np.all(np.isfinite(freq)):
+            raise ValueError("freq_hz contains non-finite values")
 
         if self.tabulated_gains is not None:
             if freq.shape != self.tabulated_freq_hz.shape or not np.allclose(

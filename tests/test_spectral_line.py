@@ -102,6 +102,14 @@ def test_power_envelope_fwhm_matches_parameter():
         (dict(fwhm_hz=0.0), "fwhm_hz"),
         (dict(fwhm_hz=-1.0), "fwhm_hz"),
         (dict(line_flux_jy=-1.0), "line_flux_jy"),
+        # These are all sign-valid (positive or zero) and only rejected by
+        # the `not np.isfinite(...)` half of the guard, not the sign check.
+        (dict(center_freq_hz=float("nan")), "center_freq_hz"),
+        (dict(center_freq_hz=float("inf")), "center_freq_hz"),
+        (dict(fwhm_hz=float("nan")), "fwhm_hz"),
+        (dict(fwhm_hz=float("inf")), "fwhm_hz"),
+        (dict(line_flux_jy=float("nan")), "line_flux_jy"),
+        (dict(line_flux_jy=float("inf")), "line_flux_jy"),
     ],
 )
 def test_invalid_parameters_raise(kwargs, match):
@@ -257,6 +265,31 @@ def test_fully_out_of_band_is_graceful(default_array, start_time):
     assert np.all(np.isfinite(block.data))
     # No meaningful power added anywhere in the simulated band.
     assert np.mean(np.abs(block.data) ** 2) < 1e-6
+
+
+def test_moderately_out_of_band_mask_is_still_empty(default_array, start_time):
+    """A line moderately outside the band must not flag any channel.
+
+    `test_fully_out_of_band_is_graceful`'s ~23,000 sigma offset underflows
+    the Gaussian to an exact 0.0 everywhere, which the mask handles via
+    its explicit zero guard -- that alone doesn't exercise thresholding
+    against a genuinely nonzero envelope. This offset (35 sigma) is
+    chosen just inside the float64 underflow floor (``exp(-0.5 * 35**2)``
+    is a representable ~1e-267, whereas offsets much past ~38 sigma
+    underflow to exact 0.0), so the envelope is nonzero-but-negligible at
+    the nearest in-band channel: large enough that thresholding against
+    the envelope's own local maximum (rather than against `line_flux_jy`,
+    the line's true peak) would wrongly flag that channel as occupied.
+    """
+    edge_hz = LINE_CENTER_HZ + (N_CHAN // 2) * CHAN_WIDTH_HZ
+    sigma_hz = LINE_FWHM_HZ / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+    far_center = edge_hz + 35.0 * sigma_hz
+    line = make_line(center_freq_hz=far_center, fwhm_hz=LINE_FWHM_HZ)
+    sim = make_simulator(default_array, start_time, [line])
+    block = sim.block(0)
+
+    assert not block.celestial_mask[0].any()
+    assert np.all(np.isfinite(block.data))
 
 
 def test_reproducible_with_the_same_seed(default_array, start_time):
