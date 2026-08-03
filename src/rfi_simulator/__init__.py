@@ -55,7 +55,12 @@ from rfi_simulator.satellites import (
     fetch_tles,
     read_tle_file,
 )
-from rfi_simulator.sky import PointSource, lm_from_radec, radec_from_lm
+from rfi_simulator.sky import (
+    PointSource,
+    SpectralLineForeground,
+    lm_from_radec,
+    radec_from_lm,
+)
 from rfi_simulator.voltages import VoltageBlock, VoltageSimulator
 
 __version__ = "0.1.0.dev0"
@@ -74,6 +79,7 @@ __all__ = [
     "PointSource",
     "RFISource",
     "SatelliteTransmitter",
+    "SpectralLineForeground",
     "TwoLineElement",
     "Visibilities",
     "VoltageBlock",

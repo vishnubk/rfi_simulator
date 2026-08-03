@@ -113,6 +113,17 @@ class Visibilities:
     rfi_source_names : tuple of str
         Names of the interference sources, in the order of
         `rfi_fraction`'s middle axis.
+    celestial_fraction : numpy.ndarray
+        Float64 ground-truth labels of shape ``(n_int, n_celestial_sources,
+        n_chan)``, the same voltage-resolution-to-integration averaging as
+        `rfi_fraction` but for `rfi_simulator.sky.SpectralLineForeground`
+        celestial labels -- kept in a field of its own so the two classes
+        never share an axis. A run with no spectral lines gives a
+        zero-sized ``(n_int, 0, n_chan)`` array, matching the
+        `rfi_fraction` convention.
+    celestial_source_names : tuple of str
+        Names of the spectral-line foregrounds, in the order of
+        `celestial_fraction`'s middle axis.
     """
 
     data: np.ndarray
@@ -128,16 +139,26 @@ class Visibilities:
     s0_enu: np.ndarray
     rfi_fraction: np.ndarray | None = None
     rfi_source_names: tuple[str, ...] = field(default_factory=tuple)
+    celestial_fraction: np.ndarray | None = None
+    celestial_source_names: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if self.rfi_fraction is None:
             self.rfi_fraction = np.zeros((self.n_int, 0, self.n_chan), dtype=np.float64)
         self.rfi_source_names = tuple(self.rfi_source_names)
+        if self.celestial_fraction is None:
+            self.celestial_fraction = np.zeros((self.n_int, 0, self.n_chan), dtype=np.float64)
+        self.celestial_source_names = tuple(self.celestial_source_names)
 
     @property
     def n_rfi_sources(self) -> int:
         """int: Number of interference sources labelled in this dataset."""
         return self.rfi_fraction.shape[1]
+
+    @property
+    def n_celestial_sources(self) -> int:
+        """int: Number of spectral-line foregrounds labelled in this dataset."""
+        return self.celestial_fraction.shape[1]
 
     @property
     def n_int(self) -> int:
@@ -234,6 +255,7 @@ def correlate(
     e_m: list[np.ndarray] = []
     s0: list[np.ndarray] = []
     rfi_fraction: list[np.ndarray] = []
+    celestial_fraction: list[np.ndarray] = []
 
     pairs = None
     first: VoltageBlock | None = None
@@ -246,6 +268,11 @@ def correlate(
             raise ValueError(
                 "all blocks must carry the same interference-source labels, got "
                 f"{first.rfi_source_names} then {block.rfi_source_names}"
+            )
+        elif block.celestial_source_names != first.celestial_source_names:
+            raise ValueError(
+                "all blocks must carry the same celestial-source labels, got "
+                f"{first.celestial_source_names} then {block.celestial_source_names}"
             )
 
         voltages = np.ascontiguousarray(np.transpose(block.data, (1, 0, 2)))
@@ -272,6 +299,7 @@ def correlate(
         # Labels ride along untouched by the correlation itself: the
         # voltage-resolution mask simply averages down the time axis.
         rfi_fraction.append(block.rfi_mask.mean(axis=2, dtype=np.float64))
+        celestial_fraction.append(block.celestial_mask.mean(axis=2, dtype=np.float64))
 
     if first is None:
         raise ValueError("correlate() received no voltage blocks")
@@ -293,4 +321,6 @@ def correlate(
         s0_enu=np.stack(s0, axis=0),
         rfi_fraction=np.stack(rfi_fraction, axis=0),
         rfi_source_names=first.rfi_source_names,
+        celestial_fraction=np.stack(celestial_fraction, axis=0),
+        celestial_source_names=first.celestial_source_names,
     )
