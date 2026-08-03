@@ -2,7 +2,7 @@
 
 Tools for simulating radio-frequency interference (RFI) in radio-interferometric data.
 
-Simulates a small, configurable antenna array observing celestial sources, with RFI injected at the voltage level and propagated through channelization, correlation, and imaging. Currently implemented: point-source sky model, geometric delay tracking, FX correlation, dirty imaging, and a library of RFI sources — narrowband stationary transmitters, broadband impulsive events, TLE-driven satellites (with Doppler and near-field geometry), and ADS-B aircraft — each carrying ground-truth time–frequency contamination labels through every stage. Also included are classical flagging baselines (spectral kurtosis, robust sigma clipping, SumThreshold) and the metrics to score any predicted flag mask against those labels.
+Simulates a small, configurable antenna array observing celestial sources, with RFI injected at the voltage level and propagated through channelization, correlation, and imaging. Currently implemented: point-source sky model, geometric delay tracking, FX correlation, dirty imaging, and a library of RFI sources — narrowband stationary transmitters, broadband impulsive events, TLE-driven satellites (with Doppler and near-field geometry), and ADS-B aircraft — each carrying ground-truth time–frequency contamination labels through every stage. The receiver chain can be made non-ideal too: optional per-antenna complex gains (amplitude scatter, phase offsets, smooth bandpass ripple) and optional 4-bit voltage quantization, both reported as ground truth alongside the data. Also included are classical flagging baselines (spectral kurtosis, robust sigma clipping, SumThreshold) and the metrics to score any predicted flag mask against those labels.
 
 ## Quickstart
 

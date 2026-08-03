@@ -29,6 +29,7 @@ from rfi_simulator.flaggers import (
     sumthreshold_mask,
 )
 from rfi_simulator.imaging import dirty_image, lm_axis, uvw_wavelengths
+from rfi_simulator.instrument import InstrumentModel
 from rfi_simulator.metrics import (
     confusion_counts,
     flag_scores,
@@ -64,6 +65,7 @@ __all__ = [
     "ArrayConfig",
     "BlockContext",
     "ImpulsiveBroadband",
+    "InstrumentModel",
     "NarrowbandTransmitter",
     "PointSource",
     "RFISource",

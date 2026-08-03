@@ -42,6 +42,17 @@ branch** of the block seed sequence, so a run with interference and a run
 without it share the identical sky-plus-noise realization for a given
 seed -- which is what makes a clean/contaminated pair a usable training
 target rather than two unrelated datasets.
+
+Two optional stages sit at the end of the per-block synthesis, both off by
+default so that the expression above is the whole story unless they are
+switched on:
+
+* an `rfi_simulator.instrument.InstrumentModel`, whose per-antenna complex
+  gain multiplies the antenna's **total** stream -- sky, interference and
+  noise together, because the receiver chain amplifies its own noise;
+* 4-bit quantization (``quantization="int4"``), which passes the block
+  through the quantize/dequantize round trip of the packed on-disk format
+  and records which antennas railed.
 """
 
 from __future__ import annotations
@@ -61,16 +72,31 @@ from rfi_simulator.delays import (
     lm_basis_enu,
     source_unit_vectors_enu,
 )
+from rfi_simulator.instrument import InstrumentModel
+from rfi_simulator.io.packed_voltage import quantize_roundtrip, suggest_quant_scale
 from rfi_simulator.rfi import BlockContext, RFISource
 from rfi_simulator.sky import PointSource
 
-__all__ = ["VoltageBlock", "VoltageSimulator"]
+__all__ = ["QUANTIZATION_MODES", "VoltageBlock", "VoltageSimulator"]
 
 DEFAULT_CENTER_FREQ_HZ = 1.405e9
 DEFAULT_N_CHAN = 384
 DEFAULT_CHAN_WIDTH_HZ = 30517.578125
 DEFAULT_N_TIME_PER_BLOCK = 1000
 DEFAULT_N_BLOCKS = 61
+
+#: Accepted values of `VoltageSimulator`'s ``quantization`` argument.
+#: ``None`` keeps the voltages in full floating-point precision.
+QUANTIZATION_MODES = (None, "int4")
+
+#: Default loading of the 4-bit quantizer, in counts rms per real/imaginary
+#: component. Light loading (a little over one count rms against rails at
+#: +-7 counts) is what keeps a correlator front end clear of saturation on
+#: normal sky-plus-noise data while still leaving quantization noise a
+#: modest fraction of the signal; it also means a strong interferer or an
+#: over-gained antenna rails, which is exactly the behaviour a flagging
+#: benchmark should contain.
+DEFAULT_QUANT_TARGET_COUNTS = 1.33
 
 
 @dataclass
@@ -122,6 +148,21 @@ class VoltageBlock:
     rfi_source_names : tuple of str, optional
         Names of the interference sources, in the order of `rfi_mask`'s
         leading axis. Defaults to ``()``.
+    gains : numpy.ndarray, optional
+        Complex ground-truth per-antenna gains of shape ``(n_antennas,
+        n_chan)`` that were applied to this block (see
+        `rfi_simulator.instrument`), or ``None`` (the default) when the
+        block was simulated with no instrument model, i.e. with all gains
+        exactly one. Carried so that calibration exercises can be scored
+        against the truth.
+    clip_fraction : numpy.ndarray, optional
+        Float64 array of shape ``(n_antennas,)``: the fraction of this
+        block's complex samples that saturated the quantizer, per antenna,
+        or ``None`` when the block was not quantized. Ground truth for
+        antennas driven into their rails.
+    quant_scale : float, optional
+        The quantization scale (voltage units per count) this block was
+        quantized with, or ``None`` when the block was not quantized.
     """
 
     data: np.ndarray
@@ -136,6 +177,9 @@ class VoltageBlock:
     s0_enu: np.ndarray
     rfi_mask: np.ndarray | None = None
     rfi_source_names: tuple[str, ...] = field(default_factory=tuple)
+    gains: np.ndarray | None = None
+    clip_fraction: np.ndarray | None = None
+    quant_scale: float | None = None
 
     def __post_init__(self) -> None:
         if self.rfi_mask is None:
@@ -213,6 +257,35 @@ class VoltageSimulator:
         root-Jy: the noise power added to every autocorrelation is
         ``noise_std**2`` Jy, i.e. ``noise_std**2`` plays the role of an
         SEFD. Default 1.0. Set to 0.0 for noiseless runs.
+    instrument : InstrumentModel, optional
+        Per-antenna direction-independent complex gains (see
+        `rfi_simulator.instrument`). Default ``None``: every antenna has
+        exactly unit gain, which is bit-for-bit the same data as a run with
+        `InstrumentModel.identity`. The gains multiply each antenna's
+        **total** stream -- sky, interference and receiver noise together
+        -- because they describe the receiver chain behind the antenna,
+        which amplifies its own noise too. `InstrumentModel` draws its
+        gains from its own seed at construction, never from this
+        simulator's seed tree, so attaching one leaves the sky, noise and
+        interference realizations untouched.
+    quantization : {None, "int4"}, optional
+        Digitization applied to each block after the gains. ``None`` (the
+        default) keeps full floating-point precision. ``"int4"`` passes the
+        block through the signed 4-bit quantize/dequantize round trip of
+        `rfi_simulator.io.packed_voltage` -- the same code path as the
+        on-disk packed format -- so the data carries real quantization
+        noise and real saturation.
+    quant_target_counts : float, optional
+        Quantizer loading target in counts rms per real/imaginary
+        component, used to pick the scale when `quant_scale` is not given.
+        Default `DEFAULT_QUANT_TARGET_COUNTS`.
+    quant_scale : float, optional
+        Fixed quantization scale (voltage units per count). Default
+        ``None``: each block gets its own scale from
+        `rfi_simulator.io.packed_voltage.suggest_quant_scale` at
+        `quant_target_counts`. Pass a value to hold the scale constant
+        across blocks, which is what a real backend with a fixed digital
+        gain does.
     rng : numpy.random.Generator
         Seeded random generator. Required -- the package never seeds a
         global generator, so that every run is reproducible. It is drawn
@@ -291,6 +364,10 @@ class VoltageSimulator:
         n_time_per_block: int = DEFAULT_N_TIME_PER_BLOCK,
         n_blocks: int = DEFAULT_N_BLOCKS,
         noise_std=1.0,
+        instrument: InstrumentModel | None = None,
+        quantization: str | None = None,
+        quant_target_counts: float = DEFAULT_QUANT_TARGET_COUNTS,
+        quant_scale: float | None = None,
         rng: np.random.Generator,
     ) -> None:
         if not phase_center.isscalar:
@@ -325,6 +402,35 @@ class VoltageSimulator:
         # RF channel centers, ascending, symmetric about the band center.
         offsets = np.arange(self.n_chan, dtype=np.float64) - 0.5 * (self.n_chan - 1)
         self.freq_hz = self.center_freq_hz + offsets * self.chan_width_hz
+
+        self.instrument = instrument
+        if instrument is not None:
+            if not isinstance(instrument, InstrumentModel):
+                raise ValueError(
+                    f"instrument must be an InstrumentModel or None, got {type(instrument)!r}"
+                )
+            if instrument.n_antennas != self.array.n_antennas:
+                raise ValueError(
+                    f"instrument describes {instrument.n_antennas} antennas but the array has "
+                    f"{self.array.n_antennas}"
+                )
+            # Evaluated once: the gains are a property of the receivers, not
+            # of the block, so every block sees the identical bandpass.
+            self._gains = instrument.gains(self.freq_hz).astype(np.complex64)
+        else:
+            self._gains = None
+
+        if quantization not in QUANTIZATION_MODES:
+            raise ValueError(
+                f"quantization must be one of {QUANTIZATION_MODES}, got {quantization!r}"
+            )
+        self.quantization = quantization
+        self.quant_target_counts = float(quant_target_counts)
+        self.quant_scale = None if quant_scale is None else float(quant_scale)
+        if self.quant_target_counts <= 0.0:
+            raise ValueError(f"quant_target_counts must be > 0, got {self.quant_target_counts}")
+        if self.quant_scale is not None and not self.quant_scale > 0.0:
+            raise ValueError(f"quant_scale must be > 0, got {self.quant_scale}")
 
         # Draw from the caller's generator exactly once, then give every
         # block its own independent generator spawned from the result.
@@ -371,6 +477,16 @@ class VoltageSimulator:
     def n_antennas(self) -> int:
         """int: Number of antennas."""
         return self.array.n_antennas
+
+    @property
+    def instrument_gains(self) -> np.ndarray | None:
+        """numpy.ndarray or None: Applied gains, shape ``(n_antennas, n_chan)``.
+
+        The `instrument` model evaluated on `freq_hz`, complex64, or
+        ``None`` for a run with no instrument model. A copy, so the
+        simulator's own copy cannot be edited through it.
+        """
+        return None if self._gains is None else self._gains.copy()
 
     def block_start_times(self) -> Time:
         """Start times of every block.
@@ -537,6 +653,25 @@ class VoltageSimulator:
         start_time = self.start_time + index * self.block_duration_s * u.s
         rfi_mask = self._add_rfi(data, index)
 
+        # The receiver chain sees sky, interference and noise alike, so the
+        # gains go on last, on the total stream.
+        if self._gains is not None:
+            data *= self._gains[:, :, np.newaxis]
+
+        clip_fraction: np.ndarray | None = None
+        quant_scale: float | None = None
+        if self.quantization == "int4":
+            quant_scale = (
+                self.quant_scale
+                if self.quant_scale is not None
+                else suggest_quant_scale(data, target_counts=self.quant_target_counts)
+            )
+            # One scale for the whole block, as a real backend applies one
+            # digital gain setting: per-antenna gain scatter then shows up
+            # as per-antenna saturation instead of being normalized away.
+            data, clipped = quantize_roundtrip(data, quant_scale)
+            clip_fraction = clipped.reshape(n_ant, -1).mean(axis=1, dtype=np.float64)
+
         return VoltageBlock(
             data=data,
             time=start_time,
@@ -550,6 +685,9 @@ class VoltageSimulator:
             s0_enu=self._phase_center_s_hat[index],
             rfi_mask=rfi_mask,
             rfi_source_names=tuple(source.name for source in self.rfi_sources),
+            gains=None if self._gains is None else self._gains.copy(),
+            clip_fraction=clip_fraction,
+            quant_scale=quant_scale,
         )
 
     def block_context(self, index: int, rng: np.random.Generator) -> BlockContext:

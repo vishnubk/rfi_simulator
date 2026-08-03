@@ -59,6 +59,7 @@ __all__ = [
     "PackedVoltageLayout",
     "pack_block",
     "pack_from_voltage_block",
+    "quantize_roundtrip",
     "read_packed_file",
     "suggest_quant_scale",
     "unpack_block",
@@ -211,6 +212,128 @@ def _require_positive_finite_scale(scale: float, *, where: str) -> None:
         raise ValueError(f"{where}: scale must be a positive finite number, got {scale!r}")
 
 
+def _reject_nan(voltages: np.ndarray, *, nan_policy: str, where: str) -> None:
+    """Raise if `voltages` has any NaN real or imaginary component.
+
+    Parameters
+    ----------
+    voltages : numpy.ndarray
+        Complex voltages about to be quantized.
+    nan_policy : str
+        The caller's ``nan_policy`` value, quoted in the error message.
+    where : str
+        Name of the calling function, quoted in the error message.
+
+    Raises
+    ------
+    ValueError
+        If any component is NaN. See `pack_block`'s Notes for why NaN is
+        rejected outright while ``+-Inf`` is allowed to saturate.
+    """
+    real_nan = np.isnan(voltages.real)
+    imag_nan = np.isnan(voltages.imag)
+    if np.any(real_nan) or np.any(imag_nan):
+        parts = []
+        if np.any(real_nan):
+            parts.append(f"real ({int(np.count_nonzero(real_nan))} element(s))")
+        if np.any(imag_nan):
+            parts.append(f"imag ({int(np.count_nonzero(imag_nan))} element(s))")
+        raise ValueError(
+            "voltages contains NaN component(s) in "
+            + " and ".join(parts)
+            + f"; {where}(nan_policy={nan_policy!r}) refuses to silently quantize NaN "
+            "to an unspecified nibble value (+-Inf is fine and saturates correctly -- only "
+            "NaN is rejected)"
+        )
+
+
+def _quantize_components(
+    voltages: np.ndarray, scale: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Round and saturate complex voltages to signed 4-bit counts.
+
+    This is the single implementation of the quantization rule -- round
+    half-to-even, then saturate to ``[-8, 7]`` -- shared by `pack_block`
+    and `quantize_roundtrip`, so the on-disk format and the in-simulation
+    quantization stage can never drift apart.
+
+    Parameters
+    ----------
+    voltages : numpy.ndarray
+        Complex voltages, any shape.
+    scale : float
+        Quantization scale: one count corresponds to `scale` in the units
+        of `voltages`.
+
+    Returns
+    -------
+    real_q, imag_q : numpy.ndarray
+        int8 arrays shaped like `voltages`, in ``[-8, 7]``.
+    clipped : numpy.ndarray
+        Boolean array shaped like `voltages`, True where *either*
+        component's rounded value fell outside the representable range and
+        was therefore saturated -- i.e. where the sample railed.
+    """
+    real_r = np.round(voltages.real / scale)
+    imag_r = np.round(voltages.imag / scale)
+    clipped = (
+        (real_r < _NIBBLE_MIN)
+        | (real_r > _NIBBLE_MAX)
+        | (imag_r < _NIBBLE_MIN)
+        | (imag_r > _NIBBLE_MAX)
+    )
+    real_q = np.clip(real_r, _NIBBLE_MIN, _NIBBLE_MAX).astype(np.int8)
+    imag_q = np.clip(imag_r, _NIBBLE_MIN, _NIBBLE_MAX).astype(np.int8)
+    return real_q, imag_q, clipped
+
+
+def quantize_roundtrip(
+    voltages: np.ndarray, scale: float, *, nan_policy: str = "raise"
+) -> tuple[np.ndarray, np.ndarray]:
+    """Quantize to 4 bits and dequantize again, in memory.
+
+    This is the pack/unpack round trip without the bytes: it applies
+    exactly the quantization rule of `pack_block` (`_quantize_components`)
+    and then the dequantization of `unpack_block`, but skips the nibble
+    packing and the block-layout reshaping, so it works on an array of any
+    shape. Use it to put a signal through the dynamic range of a 4-bit
+    correlator front end -- the quantization noise and the saturation
+    behaviour are identical to what a packed file would give.
+
+    Parameters
+    ----------
+    voltages : numpy.ndarray
+        Complex voltages, any shape.
+    scale : float
+        Quantization scale, in the units of `voltages` per count. See
+        `suggest_quant_scale` for choosing one from a target loading.
+    nan_policy : {"raise"}, optional
+        As `pack_block`: NaN components are rejected.
+
+    Returns
+    -------
+    dequantized : numpy.ndarray
+        complex64 array shaped like `voltages`, holding
+        ``scale * (round(re / scale) + 1j * round(im / scale))`` with both
+        components saturated to ``[-8, 7]``.
+    clipped : numpy.ndarray
+        Boolean array shaped like `voltages`, True where the sample railed
+        (see `_quantize_components`). ``clipped.mean()`` over an antenna's
+        samples is that antenna's clipped-sample fraction.
+
+    Raises
+    ------
+    ValueError
+        If `scale` is not a positive finite number, or if `voltages`
+        contains a NaN component.
+    """
+    _require_positive_finite_scale(scale, where="quantize_roundtrip")
+    _reject_nan(voltages, nan_policy=nan_policy, where="quantize_roundtrip")
+    real_q, imag_q, clipped = _quantize_components(voltages, scale)
+    dequantized = (real_q.astype(np.float32) + 1j * imag_q.astype(np.float32)) * np.float32(scale)
+    return dequantized.astype(np.complex64), clipped
+
+
 def unpack_block(
     raw_bytes: bytes | bytearray | memoryview | np.ndarray,
     layout: PackedVoltageLayout,
@@ -343,26 +466,8 @@ def pack_block(
     if voltages.shape != expected_shape:
         raise ValueError(f"voltages shape {voltages.shape} != expected {expected_shape}")
 
-    real_nan = np.isnan(voltages.real)
-    imag_nan = np.isnan(voltages.imag)
-    if np.any(real_nan) or np.any(imag_nan):
-        parts = []
-        if np.any(real_nan):
-            parts.append(f"real ({int(np.count_nonzero(real_nan))} element(s))")
-        if np.any(imag_nan):
-            parts.append(f"imag ({int(np.count_nonzero(imag_nan))} element(s))")
-        raise ValueError(
-            "voltages contains NaN component(s) in "
-            + " and ".join(parts)
-            + f"; pack_block(nan_policy={nan_policy!r}) refuses to silently quantize NaN "
-            "to an unspecified nibble value (+-Inf is fine and saturates correctly -- only "
-            "NaN is rejected)"
-        )
-
-    real_q = np.round(voltages.real / scale)
-    imag_q = np.round(voltages.imag / scale)
-    real_q = np.clip(real_q, _NIBBLE_MIN, _NIBBLE_MAX).astype(np.int8)
-    imag_q = np.clip(imag_q, _NIBBLE_MIN, _NIBBLE_MAX).astype(np.int8)
+    _reject_nan(voltages, nan_policy=nan_policy, where="pack_block")
+    real_q, imag_q, _clipped = _quantize_components(voltages, scale)
 
     # Split merged time axis back into (n_packets, n_times_per_packet),
     # packet outer / intra-packet inner, then move to raw_shape's axis
