@@ -62,6 +62,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from astropy.time import Time
 
+from rfi_simulator.calibration import CalibrationErrors, resolve_calibration_error_models
 from rfi_simulator.voltages import VoltageBlock
 
 __all__ = ["PARALLEL_HAND_NAMES", "Visibilities", "baseline_index_pairs", "correlate"]
@@ -96,7 +97,7 @@ def baseline_index_pairs(n_antennas: int, include_autos: bool = True) -> np.ndar
 
 @dataclass
 class Visibilities:
-    """Fringe-stopped visibilities for a whole observation.
+    r"""Fringe-stopped visibilities for a whole observation.
 
     Attributes
     ----------
@@ -177,6 +178,22 @@ class Visibilities:
         and the amplitude asymmetry is a separate, multiplicative fact
         about the same cell. A per-receptor power weight for source ``s``
         in receptor ``p`` is ``abs(rfi_polarization[s, p])**2``.
+    calibration_error_gains : numpy.ndarray, optional
+        Complex128 ground truth of the residual calibration error applied
+        by `correlate`'s ``calibration_errors=`` argument (see
+        `rfi_simulator.calibration.CalibrationErrors`): shape
+        ``(n_antennas, n_chan)`` for single-polarization data or
+        ``(n_antennas, n_pol, n_chan)`` for dual-polarization data, the
+        per-antenna factor :math:`c_i(f)` this dataset's visibilities
+        were multiplied by (as :math:`c_i(f)\, c_j(f)^*` on each
+        baseline). ``None`` when `correlate` was not given
+        `calibration_errors`, i.e. exactly the same data as a perfectly
+        calibrated run. This is what a calibration exercise built against
+        this simulator is supposed to recover -- and is unrelated to the
+        *true* per-antenna gains an `rfi_simulator.instrument`-equipped
+        run carries on `rfi_simulator.voltages.VoltageBlock.gains`: this
+        field lives entirely downstream of the true instrument, at the
+        calibration-solution layer.
     """
 
     data: np.ndarray
@@ -196,6 +213,7 @@ class Visibilities:
     celestial_source_names: tuple[str, ...] = field(default_factory=tuple)
     pol_names: tuple[str, ...] = field(default_factory=tuple)
     rfi_polarization: np.ndarray | None = None
+    calibration_error_gains: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.data.ndim not in (3, 4):
@@ -222,6 +240,14 @@ class Visibilities:
                 f"({len(self.rfi_source_names)}, {self.n_pol}), "
                 f"got {self.rfi_polarization.shape}"
             )
+        if self.calibration_error_gains is not None:
+            expected_tail = (self.n_chan,) if self.n_pol == 1 else (self.n_pol, self.n_chan)
+            if self.calibration_error_gains.shape[1:] != expected_tail:
+                raise ValueError(
+                    "calibration_error_gains must have shape (n_antennas, n_chan) or "
+                    "(n_antennas, n_pol, n_chan) matching this dataset, got "
+                    f"{self.calibration_error_gains.shape}"
+                )
         if self.rfi_fraction is None:
             self.rfi_fraction = np.zeros((self.n_int, 0, self.n_chan), dtype=np.float64)
         self.rfi_source_names = tuple(self.rfi_source_names)
@@ -367,6 +393,7 @@ def correlate(
     *,
     fringe_stop: bool = True,
     include_autos: bool = True,
+    calibration_errors: CalibrationErrors | list[CalibrationErrors] | None = None,
 ) -> Visibilities:
     """Correlate a stream of voltage blocks into visibilities.
 
@@ -381,6 +408,19 @@ def correlate(
         each block, so that the phase center sits at zero fringe rate.
     include_autos : bool, optional
         If True (default) keep the ``i == j`` autocorrelations.
+    calibration_errors : CalibrationErrors or sequence of CalibrationErrors, optional
+        Residual calibration error to apply (see
+        `rfi_simulator.calibration.CalibrationErrors`), a single model
+        applied to every polarization or one model per polarization.
+        Default ``None``: perfect calibration, bit-identical to the data
+        this function produced before the feature existed. Applied to
+        every baseline's visibility as :math:`c_i(f)\\, c_j(f)^*`,
+        *after* fringe stopping (the two commute: both are per-baseline,
+        per-frequency multiplicative factors) and purely at the
+        visibility level -- it never touches the blocks' voltages or
+        `rfi_simulator.instrument.InstrumentModel`'s true-gain ground
+        truth. The applied factors are recorded on
+        `Visibilities.calibration_error_gains`.
 
     Returns
     -------
@@ -395,8 +435,9 @@ def correlate(
     ------
     ValueError
         If `blocks` is empty, if the blocks do not all carry the same
-        interference-source labels, or if they do not all carry the same
-        number of polarizations.
+        interference-source labels, if they do not all carry the same
+        number of polarizations, or if `calibration_errors` describes a
+        different number of antennas than the blocks.
 
     Notes
     -----
@@ -415,11 +456,28 @@ def correlate(
 
     pairs = None
     first: VoltageBlock | None = None
+    # (n_antennas, n_pol, n_chan) residual calibration factors, evaluated
+    # once against the first block's frequency grid -- like the fringe
+    # geometry, the residual error is a property of the antennas and the
+    # band, not of any one block.
+    cal_gains: np.ndarray | None = None
 
     for block in blocks:
         if first is None:
             first = block
             pairs = baseline_index_pairs(block.n_antennas, include_autos=include_autos)
+            if calibration_errors is not None:
+                cal_models = resolve_calibration_error_models(calibration_errors, block.n_pol)
+                for model in cal_models:
+                    if model.n_antennas != block.n_antennas:
+                        raise ValueError(
+                            f"calibration_errors describes {model.n_antennas} antennas but "
+                            f"the data has {block.n_antennas}"
+                        )
+                cal_gains = np.stack(
+                    [model.factors(block.freq_hz).astype(np.complex64) for model in cal_models],
+                    axis=1,
+                )
         elif block.n_pol != first.n_pol:
             raise ValueError(
                 "all blocks must carry the same number of polarizations, got "
@@ -457,6 +515,15 @@ def correlate(
             # streams.
             vis = vis * stop[:, np.newaxis, :]
 
+        if cal_gains is not None:
+            # (n_base, n_pol, n_chan): the baseline structure calibration
+            # divides back out, exactly like InstrumentModel's true gains
+            # (see the module docstring), applied here at the visibility
+            # level instead of the voltage level.
+            c_i = cal_gains[pairs[:, 0]]
+            c_j = cal_gains[pairs[:, 1]]
+            vis = vis * (c_i * np.conjugate(c_j))
+
         if block.n_pol == 1:
             vis = vis.reshape(vis.shape[0], vis.shape[2])
 
@@ -477,6 +544,14 @@ def correlate(
     baseline_vectors = positions[pairs[:, 0]] - positions[pairs[:, 1]]
     pol_names = () if first.n_pol == 1 else PARALLEL_HAND_NAMES[: first.n_pol]
 
+    calibration_error_gains = None
+    if cal_gains is not None:
+        calibration_error_gains = cal_gains.copy()
+        if first.n_pol == 1:
+            calibration_error_gains = calibration_error_gains.reshape(
+                calibration_error_gains.shape[0], calibration_error_gains.shape[2]
+            )
+
     return Visibilities(
         data=np.stack(accumulated, axis=0),
         ant_1=pairs[:, 0].copy(),
@@ -495,4 +570,5 @@ def correlate(
         celestial_source_names=first.celestial_source_names,
         pol_names=pol_names,
         rfi_polarization=first.rfi_polarization,
+        calibration_error_gains=calibration_error_gains,
     )
