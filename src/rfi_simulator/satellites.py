@@ -81,7 +81,6 @@ from rfi_simulator.rfi import (
     circular_normal,
     elevation_deg,
     enu_from_ecef_offset,
-    near_field_phasors,
     occupancy_mask,
     out_of_band_message,
 )
@@ -566,6 +565,9 @@ class SatelliteTransmitter(RFISource):
         If True (default) shift the received frequency by
         ``-carrier_freq_hz * range_rate / c``. Set False to isolate the
         geometry when debugging.
+    coupling : None, array_like or mapping, optional
+        Per-antenna linear amplitude coupling; see
+        `rfi_simulator.rfi.resolve_coupling`. Default ``None`` (uniform).
     min_elevation_deg : float or astropy.units.Quantity, optional
         Elevation below which the satellite is treated as set: blocks
         whose mid-point elevation is under this contribute exactly zero
@@ -629,9 +631,10 @@ class SatelliteTransmitter(RFISource):
         sideband_power_fraction: float = 0.0,
         apply_doppler: bool = True,
         min_elevation_deg=0.0,
+        coupling=None,
         name: str = "satellite",
     ) -> None:
-        super().__init__(name)
+        super().__init__(name, coupling=coupling)
         self.tle = tle if isinstance(tle, TwoLineElement) else TwoLineElement.from_string(tle)
         self.carrier_freq_hz = float(_to_value(carrier_freq_hz, u.Hz))
         self.received_power_jy = float(_to_value(received_power_jy, u.Jy))
@@ -815,7 +818,7 @@ class SatelliteTransmitter(RFISource):
         waveform = circular_normal(ctx.rng, (n_occupied, ctx.n_time))
         waveform *= np.sqrt(envelope[occupied, 0]).astype(np.float32)[:, np.newaxis]
 
-        phasors = near_field_phasors(
+        phasors = self.coupled_phasors(
             position_enu_m, ctx.antenna_positions_enu_m, ctx.freq_hz[occupied]
         )
         voltages = np.zeros((ctx.n_antennas, ctx.n_chan, ctx.n_time), dtype=np.complex64)

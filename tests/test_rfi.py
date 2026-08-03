@@ -703,6 +703,38 @@ def test_narrowband_validation(kwargs, match):
 
 
 @pytest.mark.parametrize(
+    ("param", "match"),
+    [
+        ("center_freq_hz", "center_freq_hz"),
+        ("bandwidth_hz", "bandwidth_hz"),
+        ("received_power_jy", "received_power_jy"),
+        ("frame_duration_s", "frame_duration_s"),
+    ],
+)
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_narrowband_rejects_non_finite_parameters(param, match, value):
+    """A naive ``< 0`` guard lets NaN and Inf through; these must not.
+
+    NaN and Inf both fail every ``< 0`` comparison, so a transmitter built
+    with either would otherwise carry a non-finite parameter into
+    `NarrowbandTransmitter.contribution` and emit NaN voltages under a
+    ground-truth mask that still reads as clean.
+    """
+    with pytest.raises(ValueError, match=match):
+        make_tower(**{param: value})
+
+
+def test_narrowband_nan_power_cannot_reach_a_block(default_array, start_time):
+    """A NaN `received_power_jy` is rejected at construction time.
+
+    It never survives to be handed to a simulator, let alone reach
+    `block`, so it cannot produce NaN voltages under a clean-looking mask.
+    """
+    with pytest.raises(ValueError, match="received_power_jy"):
+        make_tower(received_power_jy=float("nan"))
+
+
+@pytest.mark.parametrize(
     ("kwargs", "match"),
     [
         ({"rate_hz": -1.0}, "rate_hz"),
@@ -715,6 +747,24 @@ def test_narrowband_validation(kwargs, match):
 def test_impulsive_validation(kwargs, match):
     options = dict(rate_hz=10.0)
     options.update(kwargs)
+    with pytest.raises(ValueError, match=match):
+        ImpulsiveBroadband(**options)
+
+
+@pytest.mark.parametrize(
+    ("param", "match"),
+    [
+        ("rate_hz", "rate_hz"),
+        ("received_power_jy", "received_power_jy"),
+        ("power_law_index", "power_law_index"),
+        ("max_power_ratio", "max_power_ratio"),
+    ],
+)
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_impulsive_rejects_non_finite_parameters(param, match, value):
+    """As with the narrowband guards, NaN and Inf must not pass a ``< 0`` check."""
+    options = dict(rate_hz=10.0)
+    options[param] = value
     with pytest.raises(ValueError, match=match):
         ImpulsiveBroadband(**options)
 

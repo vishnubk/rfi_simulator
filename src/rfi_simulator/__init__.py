@@ -29,6 +29,7 @@ from rfi_simulator.flaggers import (
     sumthreshold_mask,
 )
 from rfi_simulator.imaging import dirty_image, lm_axis, uvw_wavelengths
+from rfi_simulator.instrument import InstrumentModel
 from rfi_simulator.metrics import (
     confusion_counts,
     flag_scores,
@@ -38,12 +39,15 @@ from rfi_simulator.metrics import (
 from rfi_simulator.rfi import (
     OCCUPANCY_THRESHOLD,
     BlockContext,
+    CombTransmitter,
     ImpulsiveBroadband,
     NarrowbandTransmitter,
     RFISource,
+    constant_envelope,
     enu_from_geodetic,
     enu_from_horizontal,
     path_delays_s,
+    resolve_coupling,
 )
 from rfi_simulator.satellites import (
     SatelliteTransmitter,
@@ -51,7 +55,12 @@ from rfi_simulator.satellites import (
     fetch_tles,
     read_tle_file,
 )
-from rfi_simulator.sky import PointSource, lm_from_radec, radec_from_lm
+from rfi_simulator.sky import (
+    PointSource,
+    SpectralLineForeground,
+    lm_from_radec,
+    radec_from_lm,
+)
 from rfi_simulator.voltages import VoltageBlock, VoltageSimulator
 
 __version__ = "0.1.0.dev0"
@@ -63,11 +72,14 @@ __all__ = [
     "ADSBTransponder",
     "ArrayConfig",
     "BlockContext",
+    "CombTransmitter",
     "ImpulsiveBroadband",
+    "InstrumentModel",
     "NarrowbandTransmitter",
     "PointSource",
     "RFISource",
     "SatelliteTransmitter",
+    "SpectralLineForeground",
     "TwoLineElement",
     "Visibilities",
     "VoltageBlock",
@@ -78,6 +90,7 @@ __all__ = [
     "bin_mean",
     "block_any",
     "confusion_counts",
+    "constant_envelope",
     "correlate",
     "dirty_image",
     "earth_location",
@@ -95,6 +108,7 @@ __all__ = [
     "pool_truth_accumulations",
     "radec_from_lm",
     "read_tle_file",
+    "resolve_coupling",
     "source_unit_vectors_enu",
     "spectral_kurtosis_mask",
     "sumthreshold_mask",

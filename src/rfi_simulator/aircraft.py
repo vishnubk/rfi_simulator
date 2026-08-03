@@ -47,7 +47,6 @@ from rfi_simulator.rfi import (
     channels_within,
     circular_normal,
     elevation_deg,
-    near_field_phasors,
     occupancy_mask,
     out_of_band_message,
 )
@@ -95,6 +94,9 @@ class ADSBTransponder(RFISource):
         Burst length in post-channelization samples. Default 1: at the
         package defaults a real burst is ~30 times shorter than one
         sample, so one sample is already an over-estimate.
+    coupling : None, array_like or mapping, optional
+        Per-antenna linear amplitude coupling; see
+        `rfi_simulator.rfi.resolve_coupling`. Default ``None`` (uniform).
     min_elevation_deg : float or astropy.units.Quantity, optional
         Elevation below which the aircraft is treated as over the
         horizon: blocks whose mid-point elevation is under this
@@ -158,9 +160,10 @@ class ADSBTransponder(RFISource):
         message_rate_hz=6.2,
         pulse_width_samples: int = 1,
         min_elevation_deg=0.0,
+        coupling=None,
         name: str = "transponder",
     ) -> None:
-        super().__init__(name)
+        super().__init__(name, coupling=coupling)
         self.position_enu_m = np.asarray(_to_value(position_enu_m, u.m), dtype=np.float64).reshape(
             3
         )
@@ -303,7 +306,7 @@ class ADSBTransponder(RFISource):
         waveform = circular_normal(ctx.rng, (n_occupied, active_samples.size))
         waveform *= np.float32(np.sqrt(self.received_power_jy / n_occupied))
 
-        phasors = near_field_phasors(
+        phasors = self.coupled_phasors(
             position_enu_m, ctx.antenna_positions_enu_m, ctx.freq_hz[occupied]
         )
         voltages[np.ix_(np.arange(ctx.n_antennas), occupied, active_samples)] = (

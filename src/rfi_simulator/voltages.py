@@ -42,6 +42,25 @@ branch** of the block seed sequence, so a run with interference and a run
 without it share the identical sky-plus-noise realization for a given
 seed -- which is what makes a clean/contaminated pair a usable training
 target rather than two unrelated datasets.
+
+Optional `rfi_simulator.sky.SpectralLineForeground` foregrounds (e.g. a
+Galactic HI-line bump) add independent per-antenna noise, frequency-shaped
+into a Gaussian instead of flat, from the **same** seed branch as the sky
+and receiver noise -- they are celestial, not interference, so they belong
+with the sky/noise stream and are labelled with their own
+`VoltageBlock.celestial_mask`, kept separate from `rfi_mask` so scoring can
+tell a flagged line apart from flagged interference.
+
+Two optional stages sit at the end of the per-block synthesis, both off by
+default so that the expression above is the whole story unless they are
+switched on:
+
+* an `rfi_simulator.instrument.InstrumentModel`, whose per-antenna complex
+  gain multiplies the antenna's **total** stream -- sky, interference and
+  noise together, because the receiver chain amplifies its own noise;
+* 4-bit quantization (``quantization="int4"``), which passes the block
+  through the quantize/dequantize round trip of the packed on-disk format
+  and records which antennas railed.
 """
 
 from __future__ import annotations
@@ -61,16 +80,31 @@ from rfi_simulator.delays import (
     lm_basis_enu,
     source_unit_vectors_enu,
 )
+from rfi_simulator.instrument import InstrumentModel
+from rfi_simulator.io.packed_voltage import quantize_roundtrip, suggest_quant_scale
 from rfi_simulator.rfi import BlockContext, RFISource
-from rfi_simulator.sky import PointSource
+from rfi_simulator.sky import PointSource, SpectralLineForeground
 
-__all__ = ["VoltageBlock", "VoltageSimulator"]
+__all__ = ["QUANTIZATION_MODES", "VoltageBlock", "VoltageSimulator"]
 
 DEFAULT_CENTER_FREQ_HZ = 1.405e9
 DEFAULT_N_CHAN = 384
 DEFAULT_CHAN_WIDTH_HZ = 30517.578125
 DEFAULT_N_TIME_PER_BLOCK = 1000
 DEFAULT_N_BLOCKS = 61
+
+#: Accepted values of `VoltageSimulator`'s ``quantization`` argument.
+#: ``None`` keeps the voltages in full floating-point precision.
+QUANTIZATION_MODES = (None, "int4")
+
+#: Default loading of the 4-bit quantizer, in counts rms per real/imaginary
+#: component. Light loading (a little over one count rms against rails at
+#: +-7 counts) is what keeps a correlator front end clear of saturation on
+#: normal sky-plus-noise data while still leaving quantization noise a
+#: modest fraction of the signal; it also means a strong interferer or an
+#: over-gained antenna rails, which is exactly the behaviour a flagging
+#: benchmark should contain.
+DEFAULT_QUANT_TARGET_COUNTS = 1.33
 
 
 @dataclass
@@ -122,6 +156,46 @@ class VoltageBlock:
     rfi_source_names : tuple of str, optional
         Names of the interference sources, in the order of `rfi_mask`'s
         leading axis. Defaults to ``()``.
+    rfi_coupling : numpy.ndarray, optional
+        Float64 ground-truth per-antenna coupling of shape
+        ``(n_interference_sources, n_antennas)``: the linear *amplitude*
+        factor each source was received with at each antenna, so its power
+        contribution scales as the square (see
+        `rfi_simulator.rfi.resolve_coupling`). All ones for a source with
+        the default uniform coupling. ``None`` (the default) for a block
+        that was not built by a simulator. Deliberately separate from
+        `rfi_mask`, which has no antenna axis -- see the labelling
+        convention in `rfi_simulator.rfi`.
+    celestial_mask : numpy.ndarray, optional
+        Boolean ground-truth labels of shape
+        ``(n_celestial_sources, n_chan, n_time)``, one entry per
+        `rfi_simulator.sky.SpectralLineForeground` attached to the
+        simulator: ``celestial_mask[s, c, t]`` is True where line ``s``
+        occupies cell ``(c, t)``. Defaults to an empty ``(0, n_chan,
+        n_time)`` array. Kept entirely separate from `rfi_mask` -- the two
+        never share an axis or an index -- because the two label classes
+        (``"celestial"`` vs the interference sources' implicit ``"rfi"``)
+        must never be confusable, in bookkeeping as much as in meaning: a
+        scoring harness that treats a flagged celestial cell as a correctly
+        excised one would penalize an algorithm for doing the right thing.
+    celestial_source_names : tuple of str, optional
+        Names of the spectral-line foregrounds, in the order of
+        `celestial_mask`'s leading axis. Defaults to ``()``.
+    gains : numpy.ndarray, optional
+        Complex ground-truth per-antenna gains of shape ``(n_antennas,
+        n_chan)`` that were applied to this block (see
+        `rfi_simulator.instrument`), or ``None`` (the default) when the
+        block was simulated with no instrument model, i.e. with all gains
+        exactly one. Carried so that calibration exercises can be scored
+        against the truth.
+    clip_fraction : numpy.ndarray, optional
+        Float64 array of shape ``(n_antennas,)``: the fraction of this
+        block's complex samples that saturated the quantizer, per antenna,
+        or ``None`` when the block was not quantized. Ground truth for
+        antennas driven into their rails.
+    quant_scale : float, optional
+        The quantization scale (voltage units per count) this block was
+        quantized with, or ``None`` when the block was not quantized.
     """
 
     data: np.ndarray
@@ -136,6 +210,12 @@ class VoltageBlock:
     s0_enu: np.ndarray
     rfi_mask: np.ndarray | None = None
     rfi_source_names: tuple[str, ...] = field(default_factory=tuple)
+    rfi_coupling: np.ndarray | None = None
+    celestial_mask: np.ndarray | None = None
+    celestial_source_names: tuple[str, ...] = field(default_factory=tuple)
+    gains: np.ndarray | None = None
+    clip_fraction: np.ndarray | None = None
+    quant_scale: float | None = None
 
     def __post_init__(self) -> None:
         if self.rfi_mask is None:
@@ -147,11 +227,38 @@ class VoltageBlock:
                 f"({len(self.rfi_source_names)}, {self.n_chan}, {self.n_time}), "
                 f"got {self.rfi_mask.shape}"
             )
+        if self.rfi_coupling is not None and self.rfi_coupling.shape != (
+            len(self.rfi_source_names),
+            self.n_antennas,
+        ):
+            raise ValueError(
+                "rfi_coupling must have shape (n_sources, n_antennas) = "
+                f"({len(self.rfi_source_names)}, {self.n_antennas}), "
+                f"got {self.rfi_coupling.shape}"
+            )
+        if self.celestial_mask is None:
+            self.celestial_mask = np.zeros((0, self.n_chan, self.n_time), dtype=bool)
+        self.celestial_source_names = tuple(self.celestial_source_names)
+        if self.celestial_mask.shape != (
+            len(self.celestial_source_names),
+            self.n_chan,
+            self.n_time,
+        ):
+            raise ValueError(
+                "celestial_mask must have shape (n_celestial_sources, n_chan, n_time) = "
+                f"({len(self.celestial_source_names)}, {self.n_chan}, {self.n_time}), "
+                f"got {self.celestial_mask.shape}"
+            )
 
     @property
     def n_rfi_sources(self) -> int:
         """int: Number of interference sources labelled in this block."""
         return self.rfi_mask.shape[0]
+
+    @property
+    def n_celestial_sources(self) -> int:
+        """int: Number of spectral-line foregrounds labelled in this block."""
+        return self.celestial_mask.shape[0]
 
     @property
     def n_antennas(self) -> int:
@@ -195,6 +302,17 @@ class VoltageSimulator:
         occupancy masks are attached to every block. Defaults to ``()``.
         Adding or removing them never perturbs the sky-plus-noise
         realization of a given seed.
+    spectral_lines : sequence of SpectralLineForeground, optional
+        Celestial spectral-line foregrounds (see `rfi_simulator.sky`),
+        e.g. a Galactic HI-line bump. Defaults to ``()``: no line, which is
+        bit-for-bit the current behavior. Each line adds independent
+        per-antenna noise, frequency-shaped into a Gaussian instead of
+        being flat like `noise_std`, drawn from the **same** seed branch as
+        the sky and receiver noise (they are celestial, not interference),
+        so adding or removing rfi_sources never perturbs a run's spectral
+        lines or vice versa. Ground truth is
+        `VoltageBlock.celestial_mask`, kept in a field separate from
+        `rfi_mask` -- see the module docstring.
     center_freq_hz : float or astropy.units.Quantity, optional
         Band center frequency in Hz. Default 1.405 GHz (L band).
     n_chan : int, optional
@@ -213,6 +331,35 @@ class VoltageSimulator:
         root-Jy: the noise power added to every autocorrelation is
         ``noise_std**2`` Jy, i.e. ``noise_std**2`` plays the role of an
         SEFD. Default 1.0. Set to 0.0 for noiseless runs.
+    instrument : InstrumentModel, optional
+        Per-antenna direction-independent complex gains (see
+        `rfi_simulator.instrument`). Default ``None``: every antenna has
+        exactly unit gain, which is bit-for-bit the same data as a run with
+        `InstrumentModel.identity`. The gains multiply each antenna's
+        **total** stream -- sky, interference and receiver noise together
+        -- because they describe the receiver chain behind the antenna,
+        which amplifies its own noise too. `InstrumentModel` draws its
+        gains from its own seed at construction, never from this
+        simulator's seed tree, so attaching one leaves the sky, noise and
+        interference realizations untouched.
+    quantization : {None, "int4"}, optional
+        Digitization applied to each block after the gains. ``None`` (the
+        default) keeps full floating-point precision. ``"int4"`` passes the
+        block through the signed 4-bit quantize/dequantize round trip of
+        `rfi_simulator.io.packed_voltage` -- the same code path as the
+        on-disk packed format -- so the data carries real quantization
+        noise and real saturation.
+    quant_target_counts : float, optional
+        Quantizer loading target in counts rms per real/imaginary
+        component, used to pick the scale when `quant_scale` is not given.
+        Default `DEFAULT_QUANT_TARGET_COUNTS`.
+    quant_scale : float, optional
+        Fixed quantization scale (voltage units per count). Default
+        ``None``: each block gets its own scale from
+        `rfi_simulator.io.packed_voltage.suggest_quant_scale` at
+        `quant_target_counts`. Pass a value to hold the scale constant
+        across blocks, which is what a real backend with a fixed digital
+        gain does.
     rng : numpy.random.Generator
         Seeded random generator. Required -- the package never seeds a
         global generator, so that every run is reproducible. It is drawn
@@ -254,6 +401,14 @@ class VoltageSimulator:
     seed with and without `rfi_sources` and the difference between the two
     datasets is the interference and nothing else.
 
+    `spectral_lines` draw from the sky/noise branch's own generator,
+    *after* the sky sources and receiver noise of a block (see `block`),
+    the same way adding another `PointSource` would: they are celestial,
+    so they belong on that branch rather than the interference one, at the
+    cost that attaching a line does shift the noise realization drawn
+    after it -- exactly as attaching another sky source already does.
+    `rfi_sources` are never affected either way.
+
     Raises
     ------
     ValueError
@@ -285,12 +440,17 @@ class VoltageSimulator:
         sources: Sequence[PointSource] = (),
         *,
         rfi_sources: Sequence[RFISource] = (),
+        spectral_lines: Sequence[SpectralLineForeground] = (),
         center_freq_hz=DEFAULT_CENTER_FREQ_HZ,
         n_chan: int = DEFAULT_N_CHAN,
         chan_width_hz=DEFAULT_CHAN_WIDTH_HZ,
         n_time_per_block: int = DEFAULT_N_TIME_PER_BLOCK,
         n_blocks: int = DEFAULT_N_BLOCKS,
         noise_std=1.0,
+        instrument: InstrumentModel | None = None,
+        quantization: str | None = None,
+        quant_target_counts: float = DEFAULT_QUANT_TARGET_COUNTS,
+        quant_scale: float | None = None,
         rng: np.random.Generator,
     ) -> None:
         if not phase_center.isscalar:
@@ -303,6 +463,7 @@ class VoltageSimulator:
         self.start_time = start_time
         self.sources = list(sources)
         self.rfi_sources = list(rfi_sources)
+        self.spectral_lines = list(spectral_lines)
 
         self.center_freq_hz = float(_to_value(center_freq_hz, u.Hz))
         self.chan_width_hz = float(_to_value(chan_width_hz, u.Hz))
@@ -321,10 +482,45 @@ class VoltageSimulator:
             raise ValueError(f"chan_width_hz must be > 0, got {self.chan_width_hz}")
         if self.noise_std < 0.0:
             raise ValueError(f"noise_std must be >= 0, got {self.noise_std}")
+        for line in self.spectral_lines:
+            if not isinstance(line, SpectralLineForeground):
+                raise ValueError(
+                    "spectral_lines must contain SpectralLineForeground instances, "
+                    f"got {type(line)!r}"
+                )
 
         # RF channel centers, ascending, symmetric about the band center.
         offsets = np.arange(self.n_chan, dtype=np.float64) - 0.5 * (self.n_chan - 1)
         self.freq_hz = self.center_freq_hz + offsets * self.chan_width_hz
+
+        self.instrument = instrument
+        if instrument is not None:
+            if not isinstance(instrument, InstrumentModel):
+                raise ValueError(
+                    f"instrument must be an InstrumentModel or None, got {type(instrument)!r}"
+                )
+            if instrument.n_antennas != self.array.n_antennas:
+                raise ValueError(
+                    f"instrument describes {instrument.n_antennas} antennas but the array has "
+                    f"{self.array.n_antennas}"
+                )
+            # Evaluated once: the gains are a property of the receivers, not
+            # of the block, so every block sees the identical bandpass.
+            self._gains = instrument.gains(self.freq_hz).astype(np.complex64)
+        else:
+            self._gains = None
+
+        if quantization not in QUANTIZATION_MODES:
+            raise ValueError(
+                f"quantization must be one of {QUANTIZATION_MODES}, got {quantization!r}"
+            )
+        self.quantization = quantization
+        self.quant_target_counts = float(quant_target_counts)
+        self.quant_scale = None if quant_scale is None else float(quant_scale)
+        if self.quant_target_counts <= 0.0:
+            raise ValueError(f"quant_target_counts must be > 0, got {self.quant_target_counts}")
+        if self.quant_scale is not None and not self.quant_scale > 0.0:
+            raise ValueError(f"quant_scale must be > 0, got {self.quant_scale}")
 
         # Draw from the caller's generator exactly once, then give every
         # block its own independent generator spawned from the result.
@@ -371,6 +567,16 @@ class VoltageSimulator:
     def n_antennas(self) -> int:
         """int: Number of antennas."""
         return self.array.n_antennas
+
+    @property
+    def instrument_gains(self) -> np.ndarray | None:
+        """numpy.ndarray or None: Applied gains, shape ``(n_antennas, n_chan)``.
+
+        The `instrument` model evaluated on `freq_hz`, complex64, or
+        ``None`` for a run with no instrument model. A copy, so the
+        simulator's own copy cannot be edited through it.
+        """
+        return None if self._gains is None else self._gains.copy()
 
     def block_start_times(self) -> Time:
         """Start times of every block.
@@ -534,8 +740,29 @@ class VoltageSimulator:
             # Independent receiver noise per antenna.
             data += self._circular_normal(rng, (n_ant, n_chan, n_time), self.noise_std)
 
+        celestial_mask = self._add_spectral_lines(data, rng)
+
         start_time = self.start_time + index * self.block_duration_s * u.s
         rfi_mask = self._add_rfi(data, index)
+
+        # The receiver chain sees sky, interference and noise alike, so the
+        # gains go on last, on the total stream.
+        if self._gains is not None:
+            data *= self._gains[:, :, np.newaxis]
+
+        clip_fraction: np.ndarray | None = None
+        quant_scale: float | None = None
+        if self.quantization == "int4":
+            quant_scale = (
+                self.quant_scale
+                if self.quant_scale is not None
+                else suggest_quant_scale(data, target_counts=self.quant_target_counts)
+            )
+            # One scale for the whole block, as a real backend applies one
+            # digital gain setting: per-antenna gain scatter then shows up
+            # as per-antenna saturation instead of being normalized away.
+            data, clipped = quantize_roundtrip(data, quant_scale)
+            clip_fraction = clipped.reshape(n_ant, -1).mean(axis=1, dtype=np.float64)
 
         return VoltageBlock(
             data=data,
@@ -550,7 +777,80 @@ class VoltageSimulator:
             s0_enu=self._phase_center_s_hat[index],
             rfi_mask=rfi_mask,
             rfi_source_names=tuple(source.name for source in self.rfi_sources),
+            rfi_coupling=self.rfi_coupling(),
+            celestial_mask=celestial_mask,
+            celestial_source_names=tuple(line.name for line in self.spectral_lines),
+            gains=None if self._gains is None else self._gains.copy(),
+            clip_fraction=clip_fraction,
+            quant_scale=quant_scale,
         )
+
+    def _add_spectral_lines(self, data: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        """Add every spectral-line foreground to `data` and collect their labels.
+
+        Parameters
+        ----------
+        data : numpy.ndarray
+            Complex64 ``(n_ant, n_chan, n_time)`` voltages, modified in
+            place. Called after the sky sources and receiver noise, before
+            interference and before the instrument gains, so a line passes
+            through gains exactly like every other component of the total
+            stream.
+        rng : numpy.random.Generator
+            This block's sky/noise generator (see the class Notes) --
+            spectral lines are celestial, so they draw from the same
+            branch as the sky and receiver noise, never the interference
+            branch.
+
+        Returns
+        -------
+        numpy.ndarray
+            Boolean ``(n_lines, n_chan, n_time)`` occupancy masks, in the
+            order of `spectral_lines`, class ``"celestial"`` -- see
+            `VoltageBlock.celestial_mask`.
+        """
+        n_ant = self.array.n_antennas
+        n_chan, n_time = self.n_chan, self.n_time_per_block
+        masks = np.zeros((len(self.spectral_lines), n_chan, n_time), dtype=bool)
+        for i_line, line in enumerate(self.spectral_lines):
+            envelope_jy = line.power_envelope_jy(self.freq_hz)  # (n_chan,)
+            scale = np.sqrt(envelope_jy).astype(np.float32)
+            # Independent per antenna, exactly like the receiver noise --
+            # the "fully resolved extended emission" approximation (see
+            # rfi_simulator.sky.SpectralLineForeground): unit-power circular
+            # Gaussian samples scaled by the line's frequency profile, so no
+            # correlated component reaches the correlator.
+            unit = self._circular_normal(rng, (n_ant, n_chan, n_time), 1.0)
+            data += unit * scale[np.newaxis, :, np.newaxis]
+            masks[i_line] = line.mask(self.freq_hz, n_time)
+        return masks
+
+    def rfi_coupling(self) -> np.ndarray:
+        """Per-antenna coupling of every interference source -- ground truth.
+
+        Returns
+        -------
+        numpy.ndarray
+            Float64 array of shape ``(n_interference_sources, n_antennas)``
+            of linear amplitude factors, in the order of `rfi_sources`;
+            received power scales as the square. All ones for a source with
+            uniform coupling, so a run with no coupling configured still
+            gets a well-defined (and correct) ground truth rather than
+            ``None``. Shape ``(0, n_antennas)`` for a run with no
+            interference.
+
+        Notes
+        -----
+        Coupling is a fixed property of the installation, not of a block,
+        so this is the same array for every block of a run. It is attached
+        to each block anyway (`VoltageBlock.rfi_coupling`), for the same
+        reason the gains are: a block that has been written out and read
+        back should carry its own truth.
+        """
+        coupling = np.ones((len(self.rfi_sources), self.array.n_antennas), dtype=np.float64)
+        for i_src, source in enumerate(self.rfi_sources):
+            coupling[i_src] = source.coupling_amplitudes(self.array.n_antennas)
+        return coupling
 
     def block_context(self, index: int, rng: np.random.Generator) -> BlockContext:
         """Build the context handed to an interference source for block `index`.
