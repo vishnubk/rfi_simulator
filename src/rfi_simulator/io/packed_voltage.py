@@ -186,6 +186,31 @@ class PackedVoltageLayout:
         return self.samples_per_block
 
 
+def _require_positive_finite_scale(scale: float, *, where: str) -> None:
+    """Validate that `scale` is a positive, finite number.
+
+    Parameters
+    ----------
+    scale : float
+        Value to validate.
+    where : str
+        Name of the calling function, used only to make the error message
+        identify which entry point rejected the value.
+
+    Raises
+    ------
+    ValueError
+        If `scale` is not a finite number strictly greater than zero. This
+        also rejects ``float('nan')`` and ``float('inf')``/``float('-inf')``
+        explicitly: a naive ``scale <= 0.0`` check does *not* catch
+        ``nan`` (every comparison with ``nan`` is ``False``, so
+        ``nan <= 0.0`` is ``False`` and would silently slip through), so
+        this helper checks `numpy.isfinite` in addition to positivity.
+    """
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError(f"{where}: scale must be a positive finite number, got {scale!r}")
+
+
 def unpack_block(
     raw_bytes: bytes | bytearray | memoryview | np.ndarray,
     layout: PackedVoltageLayout,
@@ -216,8 +241,9 @@ def unpack_block(
     ------
     ValueError
         If `raw_bytes` is not exactly `PackedVoltageLayout.bytes_per_block`
-        bytes.
+        bytes, or if `scale` is not a positive finite number.
     """
+    _require_positive_finite_scale(scale, where="unpack_block")
     arr = (
         np.frombuffer(bytes(raw_bytes), dtype=np.uint8)
         if isinstance(raw_bytes, (bytes, bytearray, memoryview))
@@ -249,6 +275,8 @@ def pack_block(
     voltages: np.ndarray,
     layout: PackedVoltageLayout,
     scale: float = DEFAULT_QUANT_SCALE,
+    *,
+    nan_policy: str = "raise",
 ) -> bytes:
     """Quantize complex voltages into one packed 4-bit block.
 
@@ -264,6 +292,13 @@ def pack_block(
     scale : float, optional
         Quantization scale: each nibble encodes ``round(component /
         scale)``. Default `DEFAULT_QUANT_SCALE`.
+    nan_policy : {"raise"}, optional
+        What to do about NaN components in `voltages`. Currently only
+        ``"raise"`` (the default) is implemented: any NaN real or
+        imaginary component raises `ValueError` before quantization. The
+        keyword exists so a future policy (e.g. replacing NaNs with zero)
+        can be added without changing the call signature; there is
+        currently no way to opt out of the NaN check.
 
     Returns
     -------
@@ -274,7 +309,9 @@ def pack_block(
     Raises
     ------
     ValueError
-        If `voltages` is not shaped `PackedVoltageLayout.unpacked_shape`.
+        If `voltages` is not shaped `PackedVoltageLayout.unpacked_shape`,
+        if `scale` is not a positive finite number, or if `voltages`
+        contains any NaN component.
 
     Notes
     -----
@@ -282,12 +319,45 @@ def pack_block(
     **saturated** (clipped) to the symmetric signed range ``[-8, 7]``
     rather than wrapped -- an out-of-range input clamps to the nearest
     representable nibble instead of aliasing to a wildly different value.
+    This saturation applies to ``+-inf`` too: an infinite component divides
+    by `scale` and rounds to ``+-inf``, which `numpy.clip` saturates to the
+    nibble rails exactly like any other too-large finite value, so
+    ``+-inf`` is handled correctly by construction and is *not* rejected
+    by `nan_policy` -- only NaN is.
+
+    NaN is a different case from Inf and is always rejected regardless of
+    `nan_policy`'s value: `numpy.round` propagates NaN unchanged, and
+    `numpy.clip` also propagates NaN unchanged (a NaN compares False
+    against both clip bounds), so a NaN component reaches
+    ``.astype(np.int8)`` as a float NaN. The result of casting NaN to an
+    integer dtype is *undefined by the C standard* and numpy inherits that
+    -- in practice it is usually silently ``0``, but the point is it is
+    unspecified. Left unchecked, a NaN anywhere upstream (e.g. a divide by
+    zero earlier in a physics pipeline) would silently masquerade as a
+    valid, plausible-looking zero sample in the packed output with no
+    error and, at best, a `RuntimeWarning`. `pack_block` therefore checks
+    for NaN explicitly and raises before that cast can happen.
     """
-    if scale <= 0.0:
-        raise ValueError(f"scale must be > 0, got {scale}")
+    _require_positive_finite_scale(scale, where="pack_block")
     expected_shape = layout.unpacked_shape
     if voltages.shape != expected_shape:
         raise ValueError(f"voltages shape {voltages.shape} != expected {expected_shape}")
+
+    real_nan = np.isnan(voltages.real)
+    imag_nan = np.isnan(voltages.imag)
+    if np.any(real_nan) or np.any(imag_nan):
+        parts = []
+        if np.any(real_nan):
+            parts.append(f"real ({int(np.count_nonzero(real_nan))} element(s))")
+        if np.any(imag_nan):
+            parts.append(f"imag ({int(np.count_nonzero(imag_nan))} element(s))")
+        raise ValueError(
+            "voltages contains NaN component(s) in "
+            + " and ".join(parts)
+            + f"; pack_block(nan_policy={nan_policy!r}) refuses to silently quantize NaN "
+            "to an unspecified nibble value (+-Inf is fine and saturates correctly -- only "
+            "NaN is rejected)"
+        )
 
     real_q = np.round(voltages.real / scale)
     imag_q = np.round(voltages.imag / scale)
@@ -340,15 +410,18 @@ def read_packed_file(
     ------
     ValueError
         If the file size is not an exact multiple of
-        `PackedVoltageLayout.bytes_per_block`, or if a requested block
-        index is out of range.
+        `PackedVoltageLayout.bytes_per_block`, if a requested block index
+        is out of range, or if `scale` is not a positive finite number.
 
     Notes
     -----
     Uses `numpy.memmap` so only the requested blocks are ever paged into
     memory -- suitable for multi-gigabyte files that must not be loaded
-    whole.
+    whole. `scale` is validated up front (before the memmap is opened) so
+    a bad scale fails fast with a clear error instead of only surfacing
+    once `unpack_block` runs on the first requested block.
     """
+    _require_positive_finite_scale(scale, where="read_packed_file")
     path = Path(path)
     bytes_per_block = layout.bytes_per_block
     file_size = path.stat().st_size
@@ -448,7 +521,20 @@ def pack_from_voltage_block(
     return pack_block(voltages.astype(np.complex64, copy=False), layout, scale)
 
 
-def suggest_quant_scale(voltages: np.ndarray, target_counts: float = 2.5) -> float:
+#: Variance (in quantization-count units, i.e. LSBs^2) contributed by
+#: uniform quantization noise for a step size of 1 count: Delta^2 / 12 with
+#: Delta = 1. Used by `suggest_quant_scale` to correct for the fact that
+#: quantizing a signal *adds* this much variance to each real/imaginary
+#: component, on top of the signal's own variance.
+_QUANT_NOISE_VARIANCE_COUNTS2 = 1.0 / 12.0
+
+
+def suggest_quant_scale(
+    voltages: np.ndarray,
+    target_counts: float = 2.5,
+    *,
+    correct_for_quantization_noise: bool = True,
+) -> float:
     """Pick a quantization scale so the input's RMS lands near `target_counts`.
 
     Parameters
@@ -456,28 +542,74 @@ def suggest_quant_scale(voltages: np.ndarray, target_counts: float = 2.5) -> flo
     voltages : numpy.ndarray
         Complex voltages to be packed (any shape).
     target_counts : float, optional
-        Desired RMS magnitude of each real/imaginary quantization count,
-        i.e. the per-component signal RMS divided by the returned scale.
-        Default 2.5, matching the light loading (a few LSBs of RMS, well
-        clear of both the 0 floor and the +-7 saturation ceiling) typical
-        of correlator 4-bit voltage quantization -- it leaves headroom for
-        the occasional large sample (RFI, gain drift) without saturating
-        every high-power event, while still using enough of the dynamic
-        range that quantization noise stays a small fraction of the
-        signal.
+        Desired RMS magnitude of each real/imaginary quantization count
+        *after* quantization (i.e. the RMS a caller would measure on the
+        packed-and-unpacked, dequantized samples). Default 2.5, matching
+        the light loading (a few LSBs of RMS, well clear of both the 0
+        floor and the +-7 saturation ceiling) typical of correlator 4-bit
+        voltage quantization -- it leaves headroom for the occasional
+        large sample (RFI, gain drift) without saturating every
+        high-power event, while still using enough of the dynamic range
+        that quantization noise stays a small fraction of the signal.
+    correct_for_quantization_noise : bool, optional
+        If True (the default), solve for the scale that makes the
+        *post*-quantization RMS equal `target_counts`, correcting for the
+        variance that quantization itself adds (see Notes). If False, use
+        the older, simpler formula that targets `target_counts` against
+        the *input* (pre-quantization) RMS directly -- because it ignores
+        the extra 1/12-count^2 variance quantization itself adds, the
+        actual (realized) post-quantization RMS then *overshoots*
+        `target_counts` by a factor ``sqrt(1 + 1/(12 * target_counts**2))``:
+        about 0.7% high at the default ``target_counts=2.5``, growing to
+        about 2.4% high at ``target_counts=1.315`` and larger still at
+        smaller targets, since the fixed 1/12-count^2 quantization-noise
+        contribution is a bigger fraction of a smaller target.
 
     Returns
     -------
     float
-        A scale such that ``rms(voltages.real) / scale`` and
-        ``rms(voltages.imag) / scale`` are approximately `target_counts`.
-        Returns `DEFAULT_QUANT_SCALE` if `voltages` is all-zero (RMS 0),
-        since any positive scale is equally valid there.
+        A scale such that, after quantizing with it, ``rms(quantized
+        real)`` and ``rms(quantized imag)`` are approximately
+        `target_counts` (or, with `correct_for_quantization_noise=False`,
+        such that the *input*'s RMS divided by the scale is approximately
+        `target_counts`). Returns `DEFAULT_QUANT_SCALE` if `voltages` is
+        all-zero (RMS 0), since any positive scale is equally valid there.
 
     Raises
     ------
     ValueError
-        If `target_counts` is not positive.
+        If `target_counts` is not positive, or (when
+        `correct_for_quantization_noise` is True) if `target_counts` is at
+        or below the quantization noise floor
+        (``sqrt(1/12) ~= 0.2887`` counts) -- below that floor, no scale
+        can make the post-quantization RMS that small, since quantization
+        alone already contributes at least that much variance.
+
+    Notes
+    -----
+    Quantizing a signal to the nearest integer count adds uniform
+    quantization noise with variance ``1/12`` count^2 per component (a
+    standard result for a quantization step of 1 count). So the *total*
+    post-quantization variance of one component is approximately
+    ``signal_variance_in_counts + 1/12``, not just
+    ``signal_variance_in_counts``. Solving for the scale that makes the
+    post-quantization RMS equal `target_counts` (rather than the simpler,
+    but biased, calculation that ignores this extra term) means dividing
+    the input RMS not by `target_counts` directly but by
+    ``sqrt(target_counts**2 - 1/12)``:
+
+    .. math::
+
+        \\mathrm{scale} = \\frac{\\mathrm{rms\\_in}}
+        {\\sqrt{\\mathrm{target\\_counts}^2 - 1/12}}
+
+    Ignoring the ``-1/12`` term (the `correct_for_quantization_noise=False`
+    path, and this function's behavior prior to this correction) makes the
+    realized post-quantization RMS come in *higher* than `target_counts`,
+    by a factor ``sqrt(1 + 1/(12 * target_counts**2))`` -- about 0.7% at
+    the default ``target_counts=2.5``, growing to roughly 2.4% at
+    ``target_counts=1.315`` (the bias is larger at smaller `target_counts`,
+    where the fixed 1/12-count^2 term is a bigger fraction of the target).
     """
     if target_counts <= 0.0:
         raise ValueError(f"target_counts must be > 0, got {target_counts}")
@@ -487,4 +619,17 @@ def suggest_quant_scale(voltages: np.ndarray, target_counts: float = 2.5) -> flo
     )
     if component_rms == 0.0:
         return DEFAULT_QUANT_SCALE
-    return float(component_rms / target_counts)
+
+    if not correct_for_quantization_noise:
+        return float(component_rms / target_counts)
+
+    residual = target_counts**2 - _QUANT_NOISE_VARIANCE_COUNTS2
+    if residual <= 0.0:
+        raise ValueError(
+            f"target_counts={target_counts!r} is at or below the quantization noise floor "
+            f"(sqrt(1/12) ~= {np.sqrt(_QUANT_NOISE_VARIANCE_COUNTS2):.4f} counts); "
+            "quantization alone already contributes this much RMS per component, so no "
+            "scale can hit a smaller post-quantization target. Pick a larger target_counts "
+            "or set correct_for_quantization_noise=False to use the uncorrected formula."
+        )
+    return float(component_rms / np.sqrt(residual))

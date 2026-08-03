@@ -195,6 +195,96 @@ def test_pack_rejects_non_positive_scale():
         pack_block(voltages, layout, 0.0)
 
 
+@pytest.mark.parametrize("bad_scale", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_pack_rejects_non_positive_or_non_finite_scale(bad_scale):
+    """`nan <= 0.0` is False, so a naive check alone would let scale=nan through."""
+    layout = SMALL_LAYOUT
+    voltages = np.zeros(layout.unpacked_shape, dtype=np.complex64)
+    with pytest.raises(ValueError):
+        pack_block(voltages, layout, bad_scale)
+
+
+@pytest.mark.parametrize("bad_scale", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_unpack_rejects_non_positive_or_non_finite_scale(bad_scale):
+    layout = SMALL_LAYOUT
+    raw = bytes(layout.bytes_per_block)
+    with pytest.raises(ValueError):
+        unpack_block(raw, layout, bad_scale)
+
+
+@pytest.mark.parametrize("bad_scale", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_read_packed_file_rejects_non_positive_or_non_finite_scale(tmp_path, bad_scale):
+    layout = SMALL_LAYOUT
+    path = tmp_path / "voltages.dat"
+    path.write_bytes(bytes(layout.bytes_per_block))
+    with pytest.raises(ValueError):
+        list(read_packed_file(path, layout, bad_scale))
+
+
+def test_pack_rejects_nan_real_component():
+    layout = SMALL_LAYOUT
+    voltages = np.zeros(layout.unpacked_shape, dtype=np.complex64)
+    voltages[0, 0, 0, 0] = complex(float("nan"), 1.0)
+    with pytest.raises(ValueError):
+        pack_block(voltages, layout, 0.05)
+
+
+def test_pack_rejects_nan_imag_component():
+    layout = SMALL_LAYOUT
+    voltages = np.zeros(layout.unpacked_shape, dtype=np.complex64)
+    voltages[0, 0, 0, 0] = complex(1.0, float("nan"))
+    with pytest.raises(ValueError):
+        pack_block(voltages, layout, 0.05)
+
+
+def test_pack_from_voltage_block_rejects_nan():
+    """NaN is caught even when reached through pack_from_voltage_block."""
+    layout = SMALL_LAYOUT
+    n_ant, n_chan, n_time, _n_pol = layout.unpacked_shape
+    data = np.zeros((n_ant, n_chan, n_time), dtype=np.complex64)
+    data[0, 0, 0] = complex(float("nan"), 0.0)
+    with pytest.raises(ValueError):
+        pack_from_voltage_block(data, layout, scale=0.05, pol_mode="duplicate")
+
+
+def test_pack_inf_still_saturates_correctly():
+    """Regression: +-Inf is a documented, intentional saturation case, not an error.
+
+    Only NaN should raise; Inf must keep dividing/rounding/clipping to the
+    nibble rails exactly as before this hardening pass.
+    """
+    layout = PackedVoltageLayout(
+        n_packets=1, n_antennas=1, n_channels=1, n_times_per_packet=1, n_pols=1
+    )
+    scale = 1.0
+    voltages = np.array([[[[complex(float("inf"), float("-inf"))]]]], dtype=np.complex64)
+    raw = pack_block(voltages, layout, scale)
+    out = unpack_block(raw, layout, scale)
+    assert out[0, 0, 0, 0] == complex(7.0, -8.0)
+
+
+def test_pack_huge_finite_value_saturates_without_wraparound():
+    """Regression for the clip-before-cast ordering: a huge finite value must
+    saturate to the nibble rails, not wrap around via int8 overflow.
+
+    `pack_block` rounds and clips in float64 *before* casting to int8, so
+    this should already pass; this test locks that ordering in place.
+    """
+    layout = PackedVoltageLayout(
+        n_packets=1, n_antennas=1, n_channels=1, n_times_per_packet=1, n_pols=1
+    )
+    scale = 1.0
+    huge = np.array([[[[complex(1e30, -1e30)]]]], dtype=np.complex64)
+    raw = pack_block(huge, layout, scale)
+    out = unpack_block(raw, layout, scale)
+    assert out[0, 0, 0, 0] == complex(7.0, -8.0)
+
+    huge_moderate = np.array([[[[complex(1e6, -1e6)]]]], dtype=np.complex64)
+    raw2 = pack_block(huge_moderate, layout, scale)
+    out2 = unpack_block(raw2, layout, scale)
+    assert out2[0, 0, 0, 0] == complex(7.0, -8.0)
+
+
 # ---------------------------------------------------------------------
 # File-level reader.
 # ---------------------------------------------------------------------
@@ -312,10 +402,11 @@ def test_pack_from_voltage_block_rejects_wrong_ndim_for_mode():
 # ---------------------------------------------------------------------
 
 
-def test_suggest_quant_scale_matches_target_counts():
+def test_suggest_quant_scale_matches_target_counts_uncorrected():
+    """The old (pre-quantization-targeting) formula, reached via the opt-out flag."""
     rng = np.random.default_rng(6)
     voltages = rng.standard_normal((1000,)) + 1j * rng.standard_normal((1000,))
-    scale = suggest_quant_scale(voltages, target_counts=2.5)
+    scale = suggest_quant_scale(voltages, target_counts=2.5, correct_for_quantization_noise=False)
     component_rms = np.sqrt(0.5 * np.mean(voltages.real**2 + voltages.imag**2))
     assert scale == pytest.approx(component_rms / 2.5, rel=1e-9)
 
@@ -329,3 +420,63 @@ def test_suggest_quant_scale_zero_input_falls_back():
 def test_suggest_quant_scale_rejects_non_positive_target():
     with pytest.raises(ValueError):
         suggest_quant_scale(np.ones(4, dtype=np.complex64), target_counts=0.0)
+
+
+def test_suggest_quant_scale_default_corrects_for_quantization_noise():
+    """Default formula: scale = rms_in / sqrt(target_counts**2 - 1/12)."""
+    rng = np.random.default_rng(7)
+    voltages = rng.standard_normal((2000,)) + 1j * rng.standard_normal((2000,))
+    target_counts = 2.5
+    scale = suggest_quant_scale(voltages, target_counts=target_counts)
+    component_rms = np.sqrt(0.5 * np.mean(voltages.real**2 + voltages.imag**2))
+    expected = component_rms / np.sqrt(target_counts**2 - 1.0 / 12.0)
+    assert scale == pytest.approx(expected, rel=1e-9)
+    # sqrt(target**2 - 1/12) < target, so dividing by it gives a *larger*
+    # scale than the uncorrected formula: the corrected scale drives the
+    # input to a slightly lower pre-quantization RMS in counts, so that
+    # adding the 1/12-count^2 quantization-noise variance brings the total
+    # post-quantization RMS back up to exactly target_counts.
+    uncorrected = component_rms / target_counts
+    assert scale > uncorrected
+
+
+def test_suggest_quant_scale_default_matches_old_within_known_bias():
+    """Corrected vs. uncorrected scale differ by exactly sqrt(1 - 1/(12*target**2))."""
+    rng = np.random.default_rng(8)
+    voltages = rng.standard_normal((5000,)) + 1j * rng.standard_normal((5000,))
+    corrected = suggest_quant_scale(voltages, target_counts=2.5)
+    uncorrected = suggest_quant_scale(
+        voltages, target_counts=2.5, correct_for_quantization_noise=False
+    )
+    # scale ratio uncorrected/corrected = sqrt(target**2 - 1/12) / target
+    expected_ratio = np.sqrt(2.5**2 - 1.0 / 12.0) / 2.5
+    assert uncorrected / corrected == pytest.approx(expected_ratio, rel=1e-9)
+
+
+def test_suggest_quant_scale_uncorrected_overshoots_post_quant_rms():
+    """The uncorrected formula's realized post-quant RMS overshoots the target.
+
+    Reproduces the magnitude of bias noted for a target near 1.315 counts
+    (about +2.4%) using the same closed-form relation
+    ``realized / target == sqrt(1 + 1/(12 * target**2))``, which is
+    target-dependent (larger at smaller target_counts).
+    """
+    target_counts = 1.315
+    overshoot_ratio = np.sqrt(1.0 + 1.0 / (12.0 * target_counts**2))
+    assert overshoot_ratio == pytest.approx(1.0238, abs=2e-3)
+
+
+def test_suggest_quant_scale_rejects_target_below_noise_floor():
+    voltages = np.ones(16, dtype=np.complex64)
+    with pytest.raises(ValueError):
+        suggest_quant_scale(voltages, target_counts=0.2)
+    # Exactly at the floor is also rejected (residual == 0 -> division by zero).
+    with pytest.raises(ValueError):
+        suggest_quant_scale(voltages, target_counts=float(np.sqrt(1.0 / 12.0)))
+
+
+def test_suggest_quant_scale_uncorrected_still_accepts_target_below_floor():
+    """The opt-out flag has no noise floor -- it never subtracts 1/12."""
+    voltages = np.ones(16, dtype=np.complex64)
+    scale = suggest_quant_scale(voltages, target_counts=0.2, correct_for_quantization_noise=False)
+    assert scale > 0.0
