@@ -182,6 +182,7 @@ from astropy.coordinates import EarthLocation
 from astropy.time import Time
 
 from rfi_simulator.array_config import ArrayConfig, _to_value
+from rfi_simulator.channelizer import PFBChannelizer, ideal_channel_weights
 from rfi_simulator.delays import SPEED_OF_LIGHT_M_S, earth_location, enu_unit_vector
 
 __all__ = [
@@ -608,6 +609,14 @@ class BlockContext:
     rng : numpy.random.Generator
         Generator for this ``(block, source)`` pair. Independent of the
         sky and receiver-noise streams, and of every other source.
+    channelizer : PFBChannelizer, optional
+        The filterbank the simulator will run the finished block through
+        (`rfi_simulator.channelizer`), or ``None`` (the default) for the
+        perfect-channelizer assumption. Sources emit into the *ideal*
+        channelized representation either way; the field is here so that a
+        source whose emission is not aligned to a channel center can spread
+        it correctly instead of snapping it -- see
+        `NarrowbandTransmitter`.
     """
 
     index: int
@@ -622,6 +631,7 @@ class BlockContext:
     phase_center_s_hat_enu: np.ndarray
     phase_center_delays_s: np.ndarray
     rng: np.random.Generator
+    channelizer: PFBChannelizer | None = None
 
     @property
     def n_antennas(self) -> int:
@@ -669,6 +679,7 @@ class BlockContext:
             phase_center_s_hat_enu=self.phase_center_s_hat_enu,
             phase_center_delays_s=self.phase_center_delays_s,
             rng=rng,
+            channelizer=self.channelizer,
         )
 
 
@@ -1460,6 +1471,98 @@ class _NarrowbandDevice(RFISource):
         waveform *= np.sqrt(envelope_jy[occupied], dtype=np.float64).astype(np.float32)
         out[:, occupied, :] += phasors[:, :, np.newaxis] * waveform[np.newaxis, :, :]
 
+    def add_offset_carrier(
+        self,
+        out: np.ndarray,
+        ctx: BlockContext,
+        phasors: np.ndarray,
+        center_freq_hz: float,
+        power_jy: np.ndarray,
+        bandwidth_hz: float,
+    ) -> np.ndarray:
+        r"""Add a carrier at an arbitrary frequency, in place, and label it.
+
+        The channel-snapping of `add_emission` is a consequence of the
+        perfect-channelizer assumption: with ideal brick-wall channels a
+        carrier is either inside a channel or outside it. A real filterbank
+        has no such edge, and a carrier between two channel centers appears
+        in both. This method is the sub-channel-resolution alternative,
+        used when the simulator has a `rfi_simulator.channelizer` attached.
+
+        Parameters
+        ----------
+        out : numpy.ndarray
+            Complex64 ``(n_antennas, n_chan, n_time)`` array to add into.
+        ctx : BlockContext
+            Block context; ``ctx.channelizer`` must not be ``None``.
+        phasors : numpy.ndarray
+            Complex64 ``(n_antennas, 1)`` per-antenna gains evaluated at
+            the carrier frequency, from `offset_phasors`. One phase per
+            antenna, not one per channel: the emission is monochromatic,
+            so its geometric delay is a single phase at ``center_freq_hz``.
+            A per-channel phase ramp would be a *cyclic time shift* of the
+            reconstructed wideband stream and would smear the carrier
+            across the band.
+        center_freq_hz : float
+            Carrier frequency, Hz -- continuous, not snapped to a channel.
+        power_jy : numpy.ndarray
+            Float64 ``(n_time,)`` total received power at the array origin,
+            summed over channels, for each sample: the on/off pattern
+            already applied.
+        bandwidth_hz : float
+            Occupied bandwidth, Hz, used only to set the symbol rate of a
+            constant-envelope waveform.
+
+        Returns
+        -------
+        numpy.ndarray
+            Float64 ``(n_chan, n_time)`` mean-power envelope of what was
+            added, in Jy: ``power_jy`` distributed over the channels by
+            ``abs(H(delta_k))**2``, the filterbank's channel response at
+            each channel's offset from the carrier. This is the truth the
+            occupancy mask must come from -- it is the power distribution
+            the data will actually have once the block is channelized.
+
+        Notes
+        -----
+        The *synthesis* weights are not the response ``H`` but the
+        perfect-channelizer weights of `ideal_channel_weights`, because
+        what is being built here is the ideal channelized representation of
+        the carrier -- the filterbank is applied afterwards, once, to the
+        whole block, and turns those weights into ``H`` by itself. Writing
+        ``H`` here instead would apply the channel response twice.
+
+        The weights span the whole band rather than a few channels around
+        the carrier: the Dirichlet kernel falls off only as ``1/offset``,
+        so truncating it would leave a spurious ``1/offset`` skirt across
+        the band, at a level that matters for a strong transmitter. One
+        emitted waveform is shared by every channel and every antenna --
+        it is a single carrier -- with the per-channel weights and the
+        per-antenna phasors applied on top.
+        """
+        channelizer = ctx.channelizer
+        if channelizer is None:  # pragma: no cover - guarded by the caller
+            raise ValueError("add_offset_carrier needs ctx.channelizer")
+
+        offsets = (center_freq_hz - ctx.freq_hz) / ctx.chan_width_hz  # (n_chan,)
+        weights = ideal_channel_weights(offsets, ctx.n_chan).astype(np.complex64)
+
+        # A carrier that misses the channel-center grid by `fraction` of a
+        # channel beats against the post-channelization sample rate at
+        # exactly that rate -- one turn of phase every 1/fraction samples.
+        nearest = int(np.argmin(np.abs(offsets)))
+        fraction = float(offsets[nearest])
+        samples = np.arange(ctx.n_time, dtype=np.float64)
+        beat = np.exp(2j * np.pi * fraction * samples).astype(np.complex64)
+
+        waveform = self.draw_waveform(ctx, 1, bandwidth_hz)[0] * beat
+        waveform *= np.sqrt(power_jy, dtype=np.float64).astype(np.float32)
+
+        out += (phasors * weights[np.newaxis, :])[:, :, np.newaxis] * waveform
+        response = np.abs(channelizer.channel_response(offsets, ctx.n_chan)) ** 2
+        response /= response.sum()
+        return response[:, np.newaxis] * power_jy[np.newaxis, :]
+
 
 # ----------------------------------------------------------------------
 # Concrete sources
@@ -1528,12 +1631,23 @@ class NarrowbandTransmitter(_NarrowbandDevice):
 
     Notes
     -----
-    The emission is confined to the occupied channels *exactly*: this
-    package assumes a perfect channelizer, so there is no spectral
-    leakage into neighbouring channels. Real polyphase filter banks leak,
-    and an excision algorithm tuned on this simulator will be optimistic
-    about how sharply interference is confined until a filter-bank model
-    is added.
+    With no filterbank attached to the simulator the emission is confined
+    to the occupied channels *exactly* -- the perfect-channelizer
+    assumption -- and `center_freq_hz` is effectively quantized to the
+    channel grid, because a carrier lands wholly in its nearest channel.
+    An excision algorithm tuned on such data will be optimistic about how
+    sharply interference is confined.
+
+    Attach a `rfi_simulator.channelizer.PFBChannelizer` to the simulator
+    and `center_freq_hz` becomes continuous for emissions narrower than a
+    channel: the carrier is placed at its true frequency, appears in
+    several channels weighted by the filterbank's channel response, beats
+    against the sample rate at its sub-channel offset, and is labelled
+    occupied in every channel that receives more than
+    `OCCUPANCY_THRESHOLD` of its peak power. Emissions *wider* than a
+    channel still snap their edges to the channel grid; the filterbank
+    then smears those edges by its own response, which is the dominant
+    effect, but the sub-channel position of the band edge is not modelled.
 
     The transmitter is always visible: it is specified by an ENU position
     with an implied line of sight, and **no terrain shadowing, horizon cut
@@ -1649,6 +1763,24 @@ class NarrowbandTransmitter(_NarrowbandDevice):
             )
 
         on = self.on_frames(ctx)
+        voltages = np.zeros((ctx.n_antennas, ctx.n_chan, ctx.n_time), dtype=np.complex64)
+
+        if ctx.channelizer is not None and self.bandwidth_hz < ctx.chan_width_hz:
+            # Sub-channel emission with a filterbank attached: place it at
+            # its true frequency instead of snapping it to a channel
+            # center. The same generator draw as the snapped path (one
+            # channel's worth of waveform), so switching the filterbank on
+            # does not shift this source's realization.
+            power_jy = np.where(on, self.received_power_jy, 0.0)
+            envelope = self.add_offset_carrier(
+                voltages,
+                ctx,
+                self.offset_phasors(ctx),
+                self.center_freq_hz,
+                power_jy,
+                self.bandwidth_hz,
+            )
+            return voltages, occupancy_mask(envelope)
 
         envelope = np.zeros((ctx.n_chan, ctx.n_time), dtype=np.float64)
         power_per_channel_jy = self.received_power_jy / n_occupied
@@ -1659,10 +1791,32 @@ class NarrowbandTransmitter(_NarrowbandDevice):
         phasors = self.coupled_phasors(
             self.position_enu_m, ctx.antenna_positions_enu_m, ctx.freq_hz[occupied]
         )
-        voltages = np.zeros((ctx.n_antennas, ctx.n_chan, ctx.n_time), dtype=np.complex64)
         self.add_emission(voltages, ctx, phasors, occupied, envelope, self.bandwidth_hz)
 
         return voltages, occupancy_mask(envelope)
+
+    def offset_phasors(self, ctx: BlockContext) -> np.ndarray:
+        """Per-antenna gain and phase at the carrier frequency itself.
+
+        Parameters
+        ----------
+        ctx : BlockContext
+            Block context.
+
+        Returns
+        -------
+        numpy.ndarray
+            Complex64 ``(n_antennas, 1)`` array from
+            `RFISource.coupled_phasors`, evaluated at `center_freq_hz`
+            rather than at the channel centers -- see
+            `_NarrowbandDevice.add_offset_carrier` for why a monochromatic
+            emission takes one phase and not a per-channel ramp.
+        """
+        return self.coupled_phasors(
+            self.position_enu_m,
+            ctx.antenna_positions_enu_m,
+            np.array([self.center_freq_hz], dtype=np.float64),
+        )
 
 
 class ImpulsiveBroadband(RFISource):

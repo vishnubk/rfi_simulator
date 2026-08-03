@@ -14,6 +14,7 @@ The pipeline is four steps long::
 from rfi_simulator.aircraft import ADSB_FREQ_HZ, ADSBTransponder
 from rfi_simulator.array_config import ArrayConfig
 from rfi_simulator.binning import bin_any, bin_mean, block_any
+from rfi_simulator.channelizer import PFBChannelizer
 from rfi_simulator.correlator import Visibilities, baseline_index_pairs, correlate
 from rfi_simulator.delays import (
     SPEED_OF_LIGHT_M_S,
@@ -76,6 +77,7 @@ __all__ = [
     "ImpulsiveBroadband",
     "InstrumentModel",
     "NarrowbandTransmitter",
+    "PFBChannelizer",
     "PointSource",
     "RFISource",
     "SatelliteTransmitter",

@@ -2,9 +2,10 @@ r"""Per-antenna channelized voltage synthesis.
 
 The simulator produces *channelized* complex baseband voltages: for every
 antenna, every frequency channel and every post-channelization time sample
-it emits one complex number. A perfect channelizer is assumed (no PFB
-leakage -- see the deliberate MVP simplifications in
-the module docstrings of ``delays`` and ``correlator``).
+it emits one complex number. A perfect channelizer is assumed by default
+(no PFB leakage -- see the deliberate MVP simplifications in the module
+docstrings of ``delays`` and ``correlator``); pass a `channelizer` to
+replace that assumption with a real filterbank response.
 
 Synthesis is done in the frequency domain, which is exact for noise-like
 celestial sources and needs no fractional-delay filtering:
@@ -51,16 +52,34 @@ with the sky/noise stream and are labelled with their own
 `VoltageBlock.celestial_mask`, kept separate from `rfi_mask` so scoring can
 tell a flagged line apart from flagged interference.
 
-Two optional stages sit at the end of the per-block synthesis, both off by
+Three optional stages sit at the end of the per-block synthesis, all off by
 default so that the expression above is the whole story unless they are
 switched on:
 
+* an `rfi_simulator.channelizer.PFBChannelizer`, which replaces the
+  perfect-channelizer assumption with a polyphase filterbank's response --
+  temporal memory within a channel, correlation between neighbouring
+  channels, and continuous carrier frequencies;
 * an `rfi_simulator.instrument.InstrumentModel`, whose per-antenna complex
   gain multiplies the antenna's **total** stream -- sky, interference and
   noise together, because the receiver chain amplifies its own noise;
 * 4-bit quantization (``quantization="int4"``), which passes the block
   through the quantize/dequantize round trip of the packed on-disk format
   and records which antennas railed.
+
+They are applied in that order, and the order is a modelling decision
+worth stating. The filterbank goes first because it acts on the total
+wideband stream, sky and interference and noise alike, and because the
+channel mixing it introduces must not be applied to something that has
+already been labelled per channel. The gains go *after* it rather than
+before, even though a receiver's analog chain physically precedes the
+digitizer, so that `VoltageBlock.gains` stays exactly the per-channel
+truth: a bandpass applied ahead of the filterbank would be smeared across
+channels by it, and the recorded gains would no longer be the numbers a
+calibration exercise is supposed to recover. For the smooth bandpasses
+`rfi_simulator.instrument` produces the two orders differ negligibly.
+Quantization stays last, which is also where a real backend requantizes:
+after channelization, not before.
 """
 
 from __future__ import annotations
@@ -74,6 +93,7 @@ from astropy.coordinates import SkyCoord
 from astropy.time import Time
 
 from rfi_simulator.array_config import ArrayConfig, _to_value
+from rfi_simulator.channelizer import PFBChannelizer
 from rfi_simulator.delays import (
     earth_location,
     geometric_delays_s,
@@ -82,7 +102,7 @@ from rfi_simulator.delays import (
 )
 from rfi_simulator.instrument import InstrumentModel
 from rfi_simulator.io.packed_voltage import quantize_roundtrip, suggest_quant_scale
-from rfi_simulator.rfi import BlockContext, RFISource
+from rfi_simulator.rfi import OCCUPANCY_THRESHOLD, BlockContext, RFISource
 from rfi_simulator.sky import PointSource, SpectralLineForeground
 
 __all__ = ["QUANTIZATION_MODES", "VoltageBlock", "VoltageSimulator"]
@@ -105,6 +125,33 @@ QUANTIZATION_MODES = (None, "int4")
 #: over-gained antenna rails, which is exactly the behaviour a flagging
 #: benchmark should contain.
 DEFAULT_QUANT_TARGET_COUNTS = 1.33
+
+
+def _widen_channels(mask: np.ndarray, radius: int) -> np.ndarray:
+    """Mark a mask's neighbouring channels occupied, out to `radius`.
+
+    Parameters
+    ----------
+    mask : numpy.ndarray
+        Boolean array of shape ``(n_sources, n_chan, n_time)``.
+    radius : int
+        Number of channels to spread each occupied cell over, on each
+        side. ``0`` returns `mask` unchanged.
+
+    Returns
+    -------
+    numpy.ndarray
+        Boolean array of the same shape. The channel axis is treated as
+        cyclic, matching the filterbank's own treatment of the band edges
+        (see `rfi_simulator.channelizer`).
+    """
+    if radius <= 0 or mask.size == 0:
+        return mask
+    widened = mask.copy()
+    for shift in range(1, int(radius) + 1):
+        widened |= np.roll(mask, shift, axis=1)
+        widened |= np.roll(mask, -shift, axis=1)
+    return widened
 
 
 @dataclass
@@ -196,6 +243,13 @@ class VoltageBlock:
     quant_scale : float, optional
         The quantization scale (voltage units per count) this block was
         quantized with, or ``None`` when the block was not quantized.
+    channelizer : PFBChannelizer, optional
+        The filterbank this block was passed through (see
+        `rfi_simulator.channelizer`), or ``None`` (the default) for a block
+        synthesized under the perfect-channelizer assumption. Carried as
+        ground truth, like `gains` and `quant_scale`: the temporal and
+        channel-to-channel correlations of the data are a property of this
+        object, and a flagger's statistics depend on them.
     """
 
     data: np.ndarray
@@ -216,6 +270,7 @@ class VoltageBlock:
     gains: np.ndarray | None = None
     clip_fraction: np.ndarray | None = None
     quant_scale: float | None = None
+    channelizer: PFBChannelizer | None = None
 
     def __post_init__(self) -> None:
         if self.rfi_mask is None:
@@ -331,6 +386,18 @@ class VoltageSimulator:
         root-Jy: the noise power added to every autocorrelation is
         ``noise_std**2`` Jy, i.e. ``noise_std**2`` plays the role of an
         SEFD. Default 1.0. Set to 0.0 for noiseless runs.
+    channelizer : PFBChannelizer, optional
+        Polyphase-filterbank response (see
+        `rfi_simulator.channelizer`). Default ``None``: the perfect
+        channelizer, which is bit-for-bit the data this simulator produced
+        before the model existed -- each channel white in time and
+        uncorrelated with its neighbours. Pass one and the finished block
+        is run through the filterbank, which colors every component alike
+        (they share one receiver), links neighbouring channels, and lets
+        `rfi_simulator.rfi.NarrowbandTransmitter` place a carrier at an
+        arbitrary frequency rather than at a channel center. The operator
+        is deterministic, so attaching it never perturbs any component's
+        realization for a given seed.
     instrument : InstrumentModel, optional
         Per-antenna direction-independent complex gains (see
         `rfi_simulator.instrument`). Default ``None``: every antenna has
@@ -447,6 +514,7 @@ class VoltageSimulator:
         n_time_per_block: int = DEFAULT_N_TIME_PER_BLOCK,
         n_blocks: int = DEFAULT_N_BLOCKS,
         noise_std=1.0,
+        channelizer: PFBChannelizer | None = None,
         instrument: InstrumentModel | None = None,
         quantization: str | None = None,
         quant_target_counts: float = DEFAULT_QUANT_TARGET_COUNTS,
@@ -492,6 +560,16 @@ class VoltageSimulator:
         # RF channel centers, ascending, symmetric about the band center.
         offsets = np.arange(self.n_chan, dtype=np.float64) - 0.5 * (self.n_chan - 1)
         self.freq_hz = self.center_freq_hz + offsets * self.chan_width_hz
+
+        if channelizer is not None and not isinstance(channelizer, PFBChannelizer):
+            raise ValueError(
+                f"channelizer must be a PFBChannelizer or None, got {type(channelizer)!r}"
+            )
+        self.channelizer = channelizer
+        # Filter state at the seam between block i-1 and block i, cached so
+        # that iterating over blocks in order costs nothing extra; see
+        # `_seam_state`.
+        self._seam_cache: tuple[int, np.ndarray] | None = None
 
         self.instrument = instrument
         if instrument is not None:
@@ -698,8 +776,8 @@ class VoltageSimulator:
         parts *= np.float32(scale / np.sqrt(2.0))
         return parts.view(np.complex64)[..., 0]
 
-    def block(self, index: int) -> VoltageBlock:
-        """Synthesize a single block of voltages.
+    def _ideal_block(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Synthesize one block's voltages under the perfect channelizer.
 
         Parameters
         ----------
@@ -708,13 +786,21 @@ class VoltageSimulator:
 
         Returns
         -------
-        VoltageBlock
-            The block's data and metadata.
+        data : numpy.ndarray
+            Complex64 ``(n_antennas, n_chan, n_time)`` voltages: sky,
+            receiver noise, spectral lines and interference, with neither
+            the filterbank, nor the gains, nor quantization applied.
+        rfi_mask : numpy.ndarray
+            Boolean ``(n_rfi_sources, n_chan, n_time)`` occupancy labels.
+        celestial_mask : numpy.ndarray
+            Boolean ``(n_celestial_sources, n_chan, n_time)`` labels.
 
         Notes
         -----
-        Deterministic in ``(seed, index)``: blocks may be generated in any
-        order, repeated, or skipped without changing any of them.
+        Split out from `block` because it is also what the *previous*
+        block contributes to a filterbank's state at a block seam: the
+        filter is FIR, so the seam depends on the neighbour's ideal
+        voltages and on nothing further back.
         """
         rng = self.block_rng(index)
 
@@ -741,9 +827,78 @@ class VoltageSimulator:
             data += self._circular_normal(rng, (n_ant, n_chan, n_time), self.noise_std)
 
         celestial_mask = self._add_spectral_lines(data, rng)
-
-        start_time = self.start_time + index * self.block_duration_s * u.s
         rfi_mask = self._add_rfi(data, index)
+        return data, rfi_mask, celestial_mask
+
+    def _seam_state(self, index: int) -> np.ndarray | None:
+        """The filterbank state left over from the block before `index`.
+
+        Parameters
+        ----------
+        index : int
+            Block index in ``[0, n_blocks)``.
+
+        Returns
+        -------
+        numpy.ndarray or None
+            State to hand to `rfi_simulator.channelizer.PFBChannelizer.apply`
+            -- ``None`` for block 0 (the backend has just been switched on,
+            so the first ``n_taps - 1`` samples of the observation ramp up)
+            and for a memoryless filterbank.
+
+        Notes
+        -----
+        This is what keeps a filterbank's temporal correlation *continuous
+        across block boundaries* while `block` stays a pure function of
+        ``(seed, index)``: the state is the tail of block ``index - 1``'s
+        ideal voltages, which is itself a pure function of the seed and
+        ``index - 1``. Regenerating it costs one extra ideal block, so
+        `blocks` caches the tail it produces on the way past and the common
+        case -- iterating in order -- pays nothing.
+        """
+        if self.channelizer is None or self.channelizer.n_taps == 1 or index == 0:
+            return None
+        cached = self._seam_cache
+        if cached is not None and cached[0] == index - 1:
+            return cached[1]
+        previous, _, _ = self._ideal_block(index - 1)
+        return self.channelizer.trailing_state(previous)
+
+    def block(self, index: int) -> VoltageBlock:
+        """Synthesize a single block of voltages.
+
+        Parameters
+        ----------
+        index : int
+            Block index in ``[0, n_blocks)``.
+
+        Returns
+        -------
+        VoltageBlock
+            The block's data and metadata.
+
+        Notes
+        -----
+        Deterministic in ``(seed, index)``: blocks may be generated in any
+        order, repeated, or skipped without changing any of them. With a
+        `channelizer` attached, a block out of sequence costs twice as much
+        as one in sequence, because the filter state at its leading edge
+        has to be regenerated from the previous block (see `_seam_state`).
+        """
+        data, rfi_mask, celestial_mask = self._ideal_block(index)
+        start_time = self.start_time + index * self.block_duration_s * u.s
+
+        if self.channelizer is not None:
+            data, tail = self.channelizer.apply(data, self._seam_state(index))
+            if tail is not None:
+                self._seam_cache = (index, tail)
+            # Ground truth must follow the data: a filterbank that spreads
+            # a channel-centered signal into its neighbours makes those
+            # neighbours occupied too. Zero for any reasonably long
+            # prototype, which leaves the labels untouched.
+            radius = self.channelizer.leakage_radius(self.n_chan, OCCUPANCY_THRESHOLD)
+            rfi_mask = _widen_channels(rfi_mask, radius)
+            celestial_mask = _widen_channels(celestial_mask, radius)
 
         # The receiver chain sees sky, interference and noise alike, so the
         # gains go on last, on the total stream.
@@ -762,7 +917,7 @@ class VoltageSimulator:
             # digital gain setting: per-antenna gain scatter then shows up
             # as per-antenna saturation instead of being normalized away.
             data, clipped = quantize_roundtrip(data, quant_scale)
-            clip_fraction = clipped.reshape(n_ant, -1).mean(axis=1, dtype=np.float64)
+            clip_fraction = clipped.reshape(self.n_antennas, -1).mean(axis=1, dtype=np.float64)
 
         return VoltageBlock(
             data=data,
@@ -783,6 +938,7 @@ class VoltageSimulator:
             gains=None if self._gains is None else self._gains.copy(),
             clip_fraction=clip_fraction,
             quant_scale=quant_scale,
+            channelizer=self.channelizer,
         )
 
     def _add_spectral_lines(self, data: np.ndarray, rng: np.random.Generator) -> np.ndarray:
@@ -883,6 +1039,7 @@ class VoltageSimulator:
             phase_center_s_hat_enu=self._phase_center_s_hat[index],
             phase_center_delays_s=self._phase_center_delays_s[index],
             rng=rng,
+            channelizer=self.channelizer,
         )
 
     def _add_rfi(self, data: np.ndarray, index: int) -> np.ndarray:
