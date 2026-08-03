@@ -422,6 +422,14 @@ def test_suggest_quant_scale_rejects_non_positive_target():
         suggest_quant_scale(np.ones(4, dtype=np.complex64), target_counts=0.0)
 
 
+@pytest.mark.parametrize("target_counts", [float("nan"), float("inf")])
+def test_suggest_quant_scale_rejects_non_finite_target(target_counts):
+    """A naive ``<= 0.0`` guard lets NaN through and returns 0.0 for +Inf;
+    neither is a usable scale."""
+    with pytest.raises(ValueError, match="target_counts"):
+        suggest_quant_scale(np.ones(4, dtype=np.complex64), target_counts=target_counts)
+
+
 def test_suggest_quant_scale_default_corrects_for_quantization_noise():
     """Default formula: scale = rms_in / sqrt(target_counts**2 - 1/12)."""
     rng = np.random.default_rng(7)

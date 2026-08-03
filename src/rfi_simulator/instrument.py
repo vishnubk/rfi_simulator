@@ -301,7 +301,8 @@ class InstrumentModel:
             If both `rng` and `seed` are given; if neither is given while
             a stochastic feature is switched on; if `n_antennas` or
             `bandpass_n_modes` is not positive; if a scatter parameter is
-            negative; or if `phase_offsets` is not recognised.
+            non-finite or negative; or if `phase_offsets` is not
+            recognised.
 
         Notes
         -----
@@ -318,10 +319,12 @@ class InstrumentModel:
         gain_scatter_db = float(gain_scatter_db)
         bandpass_ripple_db = float(bandpass_ripple_db)
         bandpass_n_modes = int(bandpass_n_modes)
-        if gain_scatter_db < 0.0:
-            raise ValueError(f"gain_scatter_db must be >= 0, got {gain_scatter_db}")
-        if bandpass_ripple_db < 0.0:
-            raise ValueError(f"bandpass_ripple_db must be >= 0, got {bandpass_ripple_db}")
+        if not np.isfinite(gain_scatter_db) or gain_scatter_db < 0.0:
+            raise ValueError(f"gain_scatter_db must be finite and >= 0, got {gain_scatter_db}")
+        if not np.isfinite(bandpass_ripple_db) or bandpass_ripple_db < 0.0:
+            raise ValueError(
+                f"bandpass_ripple_db must be finite and >= 0, got {bandpass_ripple_db}"
+            )
         if bandpass_n_modes < 1:
             raise ValueError(f"bandpass_n_modes must be >= 1, got {bandpass_n_modes}")
         if phase_offsets not in _PHASE_MODES:

@@ -683,7 +683,7 @@ def suggest_quant_scale(
     Raises
     ------
     ValueError
-        If `target_counts` is not positive, or (when
+        If `target_counts` is not finite and positive, or (when
         `correct_for_quantization_noise` is True) if `target_counts` is at
         or below the quantization noise floor
         (``sqrt(1/12) ~= 0.2887`` counts) -- below that floor, no scale
@@ -716,8 +716,8 @@ def suggest_quant_scale(
     ``target_counts=1.315`` (the bias is larger at smaller `target_counts`,
     where the fixed 1/12-count^2 term is a bigger fraction of the target).
     """
-    if target_counts <= 0.0:
-        raise ValueError(f"target_counts must be > 0, got {target_counts}")
+    if not np.isfinite(target_counts) or target_counts <= 0.0:
+        raise ValueError(f"target_counts must be finite and > 0, got {target_counts}")
     # Per-component (real and imaginary treated together) RMS.
     component_rms = np.sqrt(
         0.5 * np.mean(voltages.real.astype(np.float64) ** 2 + voltages.imag.astype(np.float64) ** 2)

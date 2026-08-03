@@ -694,8 +694,8 @@ def _normalize_coupling(coupling) -> np.ndarray | dict | None:
     ------
     ValueError
         If a mapping has an unknown ``type`` or unexpected keys, if
-        ``sigma_db`` is negative, if a vector is not 1-D, or if any factor
-        is negative or non-finite.
+        ``sigma_db`` is negative or non-finite, if a vector is not 1-D, or
+        if any factor is negative or non-finite.
 
     Notes
     -----
@@ -718,8 +718,8 @@ def _normalize_coupling(coupling) -> np.ndarray | dict | None:
         seed = spec.pop("seed", None)
         if spec:
             raise ValueError(f"unexpected keys in the coupling specification: {sorted(spec)}")
-        if sigma_db < 0.0:
-            raise ValueError(f"coupling sigma_db must be >= 0, got {sigma_db}")
+        if not np.isfinite(sigma_db) or sigma_db < 0.0:
+            raise ValueError(f"coupling sigma_db must be finite and >= 0, got {sigma_db}")
         if seed is None:
             raise ValueError(
                 "a lognormal coupling specification needs a 'seed': the coupling is a "
@@ -728,7 +728,7 @@ def _normalize_coupling(coupling) -> np.ndarray | dict | None:
             )
         return {"type": kind, "sigma_db": sigma_db, "seed": int(seed)}
 
-    factors = np.asarray(coupling, dtype=np.float64)
+    factors = np.array(coupling, dtype=np.float64, copy=True)
     if factors.ndim != 1 or factors.size < 1:
         raise ValueError(f"an explicit coupling must have shape (n_antennas,), got {factors.shape}")
     if not np.all(np.isfinite(factors)):
@@ -1301,8 +1301,10 @@ class _NarrowbandDevice(RFISource):
             raise ValueError(f"waveform must be one of {WAVEFORMS}, got {self.waveform!r}")
         if not 0.0 <= self.duty_cycle <= 1.0:
             raise ValueError(f"duty_cycle must be in [0, 1], got {self.duty_cycle}")
-        if self.frame_duration_s <= 0.0:
-            raise ValueError(f"frame_duration_s must be > 0, got {self.frame_duration_s}")
+        if not np.isfinite(self.frame_duration_s) or self.frame_duration_s <= 0.0:
+            raise ValueError(
+                f"frame_duration_s must be finite and > 0, got {self.frame_duration_s}"
+            )
         if self.envelope is not None and self.duty_cycle != 1.0:
             raise ValueError(
                 "duty_cycle and envelope both describe when the source is on, and "
@@ -1518,10 +1520,11 @@ class NarrowbandTransmitter(_NarrowbandDevice):
     Raises
     ------
     ValueError
-        If `bandwidth_hz` or `received_power_jy` is negative, `duty_cycle`
-        is outside ``[0, 1]``, `frame_duration_s` is not positive,
-        `waveform` or `coupling` or `envelope` is invalid, or both
-        `duty_cycle` and `envelope` are given.
+        If `center_freq_hz`, `bandwidth_hz` or `received_power_jy` is
+        non-finite, `bandwidth_hz` or `received_power_jy` is negative,
+        `duty_cycle` is outside ``[0, 1]``, `frame_duration_s` is not
+        finite and positive, `waveform` or `coupling` or `envelope` is
+        invalid, or both `duty_cycle` and `envelope` are given.
 
     Notes
     -----
@@ -1582,10 +1585,14 @@ class NarrowbandTransmitter(_NarrowbandDevice):
         self.bandwidth_hz = float(_to_value(bandwidth_hz, u.Hz))
         self.received_power_jy = float(_to_value(received_power_jy, u.Jy))
 
-        if self.bandwidth_hz < 0.0:
-            raise ValueError(f"bandwidth_hz must be >= 0, got {self.bandwidth_hz}")
-        if self.received_power_jy < 0.0:
-            raise ValueError(f"received_power_jy must be >= 0, got {self.received_power_jy}")
+        if not np.isfinite(self.center_freq_hz):
+            raise ValueError(f"center_freq_hz must be finite, got {self.center_freq_hz}")
+        if not np.isfinite(self.bandwidth_hz) or self.bandwidth_hz < 0.0:
+            raise ValueError(f"bandwidth_hz must be finite and >= 0, got {self.bandwidth_hz}")
+        if not np.isfinite(self.received_power_jy) or self.received_power_jy < 0.0:
+            raise ValueError(
+                f"received_power_jy must be finite and >= 0, got {self.received_power_jy}"
+            )
 
     def occupied_channels(self, freq_hz: np.ndarray) -> np.ndarray:
         """Boolean mask of the channels this transmitter emits into.
@@ -1724,7 +1731,7 @@ class ImpulsiveBroadband(RFISource):
     Raises
     ------
     ValueError
-        If any rate, power or width is non-positive, if
+        If any rate, power or width is non-finite or non-positive, if
         `power_law_index` is not greater than 1, if `max_power_ratio`
         is less than 1, if `arrival` is invalid, or if `rate_hz` and a
         periodic `arrival` are both given (or neither).
@@ -1795,14 +1802,16 @@ class ImpulsiveBroadband(RFISource):
                 _to_value(position_enu_m, u.m), dtype=np.float64
             ).reshape(3)
 
-        if self.rate_hz < 0.0:
-            raise ValueError(f"rate_hz must be >= 0, got {self.rate_hz}")
-        if self.received_power_jy < 0.0:
-            raise ValueError(f"received_power_jy must be >= 0, got {self.received_power_jy}")
-        if self.power_law_index <= 1.0:
-            raise ValueError(f"power_law_index must be > 1, got {self.power_law_index}")
-        if self.max_power_ratio < 1.0:
-            raise ValueError(f"max_power_ratio must be >= 1, got {self.max_power_ratio}")
+        if not np.isfinite(self.rate_hz) or self.rate_hz < 0.0:
+            raise ValueError(f"rate_hz must be finite and >= 0, got {self.rate_hz}")
+        if not np.isfinite(self.received_power_jy) or self.received_power_jy < 0.0:
+            raise ValueError(
+                f"received_power_jy must be finite and >= 0, got {self.received_power_jy}"
+            )
+        if not np.isfinite(self.power_law_index) or self.power_law_index <= 1.0:
+            raise ValueError(f"power_law_index must be finite and > 1, got {self.power_law_index}")
+        if not np.isfinite(self.max_power_ratio) or self.max_power_ratio < 1.0:
+            raise ValueError(f"max_power_ratio must be finite and >= 1, got {self.max_power_ratio}")
         if self.pulse_width_samples < 1:
             raise ValueError(f"pulse_width_samples must be >= 1, got {self.pulse_width_samples}")
 
@@ -1987,11 +1996,13 @@ class CombTransmitter(_NarrowbandDevice):
     Raises
     ------
     ValueError
-        If `fundamental_hz` is not positive, if `harmonic_numbers` is
+        If `fundamental_hz` or `bandwidth_hz` is non-finite, if
+        `fundamental_hz` is not positive, if `harmonic_numbers` is
         empty, non-positive or repeated, if `received_powers_jy` has the
-        wrong length or a negative entry, or if `bandwidth_hz` is negative.
-        `contribution` raises if *no* harmonic reaches the simulated band,
-        which is a configuration error rather than a clipped comb.
+        wrong length, a non-finite entry or a negative entry, or if
+        `bandwidth_hz` is negative. `contribution` raises if *no* harmonic
+        reaches the simulated band, which is a configuration error rather
+        than a clipped comb.
 
     Notes
     -----
@@ -2046,16 +2057,16 @@ class CombTransmitter(_NarrowbandDevice):
         numbers = np.asarray(harmonic_numbers, dtype=np.int64).reshape(-1)
         self.bandwidth_hz = float(_to_value(bandwidth_hz, u.Hz))
 
-        if not self.fundamental_hz > 0.0:
-            raise ValueError(f"fundamental_hz must be > 0, got {self.fundamental_hz}")
+        if not np.isfinite(self.fundamental_hz) or not self.fundamental_hz > 0.0:
+            raise ValueError(f"fundamental_hz must be finite and > 0, got {self.fundamental_hz}")
         if numbers.size == 0:
             raise ValueError("harmonic_numbers must name at least one harmonic")
         if np.any(numbers < 1):
             raise ValueError(f"harmonic_numbers must all be >= 1, got {numbers.tolist()}")
         if np.unique(numbers).size != numbers.size:
             raise ValueError(f"harmonic_numbers must be unique, got {numbers.tolist()}")
-        if self.bandwidth_hz < 0.0:
-            raise ValueError(f"bandwidth_hz must be >= 0, got {self.bandwidth_hz}")
+        if not np.isfinite(self.bandwidth_hz) or self.bandwidth_hz < 0.0:
+            raise ValueError(f"bandwidth_hz must be finite and >= 0, got {self.bandwidth_hz}")
 
         order = np.argsort(numbers)
         self.harmonic_numbers = numbers[order]
@@ -2070,6 +2081,8 @@ class CombTransmitter(_NarrowbandDevice):
             )
         else:
             powers = powers[order]
+        if not np.all(np.isfinite(powers)):
+            raise ValueError("received_powers_jy must all be finite")
         if np.any(powers < 0.0):
             raise ValueError("received_powers_jy must all be >= 0")
         self.received_powers_jy = powers

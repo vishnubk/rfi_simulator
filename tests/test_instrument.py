@@ -137,6 +137,28 @@ def test_from_params_validates(kwargs, match):
     options = dict(n_antennas=6, seed=4)
     options.update(kwargs)
     with pytest.raises(ValueError, match=match):
+        InstrumentModel.from_params(**options)
+
+
+@pytest.mark.parametrize(
+    ("param", "match"),
+    [
+        ("gain_scatter_db", "gain_scatter_db"),
+        ("bandpass_ripple_db", "bandpass_ripple_db"),
+    ],
+)
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_from_params_rejects_non_finite_scatter_parameters(param, match, value):
+    """A NaN or Inf scatter parameter must not slip past the ``< 0`` guard.
+
+    NaN in particular fails every comparison, so `gain_scatter_db > 0.0`
+    would be False and the feature would silently look switched off while
+    actually holding a non-finite value.
+    """
+    options = dict(n_antennas=6, seed=4)
+    options[param] = value
+    with pytest.raises(ValueError, match=match):
+        InstrumentModel.from_params(**options)
         InstrumentModel.from_params(options.pop("n_antennas"), **options)
 
 

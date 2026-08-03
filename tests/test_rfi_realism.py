@@ -215,11 +215,14 @@ def test_coupling_leaves_the_ground_truth_mask_alone(default_array, start_time):
     [
         ({"type": "spatial", "sigma_db": 1.0, "seed": 1}, "coupling type"),
         ({"type": "lognormal", "sigma_db": -1.0, "seed": 1}, "sigma_db"),
+        ({"type": "lognormal", "sigma_db": float("nan"), "seed": 1}, "sigma_db"),
+        ({"type": "lognormal", "sigma_db": float("inf"), "seed": 1}, "sigma_db"),
         ({"type": "lognormal", "sigma_db": 1.0}, "seed"),
         ({"type": "lognormal", "sigma_db": 1.0, "seed": 1, "extra": 2}, "unexpected keys"),
         ([[1.0, 2.0]], r"shape \(n_antennas,\)"),
         ([1.0, -2.0], "linear amplitudes"),
         ([1.0, np.nan], "non-finite"),
+        ([1.0, np.inf], "non-finite"),
     ],
 )
 def test_coupling_validation(coupling, match):
@@ -233,6 +236,19 @@ def test_coupling_length_must_match_the_array(default_array, start_time):
     sim = make_simulator(default_array, start_time, rfi_sources=[tower], n_blocks=1)
     with pytest.raises(ValueError, match="antennas"):
         sim.block(0)
+
+
+def test_coupling_does_not_alias_the_caller_s_array(default_array, start_time):
+    """`_normalize_coupling` freezes its own copy, not the caller's array.
+
+    Freezing the caller's own float64 array in place would make it
+    read-only outside the source's control -- surprising for code that
+    passed in a plain numpy array expecting to keep using it.
+    """
+    coupling = np.ones(default_array.n_antennas)
+    make_tower(coupling=coupling)
+    coupling[0] = 2.0  # still writable
+    assert coupling.flags.writeable
 
 
 # ----------------------------------------------------------------------
@@ -708,6 +724,26 @@ def test_comb_power_per_line_is_measured_at_the_array_origin(default_array, star
     ],
 )
 def test_comb_validation(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        make_comb(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"fundamental_hz": float("nan")}, "fundamental_hz"),
+        ({"fundamental_hz": float("inf")}, "fundamental_hz"),
+        ({"bandwidth_hz": float("nan")}, "bandwidth_hz"),
+        ({"bandwidth_hz": float("inf")}, "bandwidth_hz"),
+        ({"received_powers_jy": float("nan")}, "received_powers_jy"),
+        ({"received_powers_jy": float("inf")}, "received_powers_jy"),
+        ({"received_powers_jy": (1.0, float("nan"), 1.0)}, "received_powers_jy"),
+    ],
+)
+def test_comb_rejects_non_finite_parameters(kwargs, match):
+    """As with the narrowband guards, NaN and Inf must not pass a ``< 0`` check."""
+    if "received_powers_jy" in kwargs and isinstance(kwargs["received_powers_jy"], tuple):
+        kwargs = dict(kwargs, harmonic_numbers=(28, 29, 30))
     with pytest.raises(ValueError, match=match):
         make_comb(**kwargs)
 
