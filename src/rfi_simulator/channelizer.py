@@ -66,9 +66,26 @@ channel power is preserved exactly):
   :math:`\gamma_{\Delta k} = \sum_n h[n]^2 e^{2\pi i \Delta k\, n/M} /
   \sum_n h[n]^2` (`adjacent_channel_coherence` for
   :math:`\Delta k = 1`);
+* the correlation of the *powers* of two channels,
+  :math:`|\gamma_{\Delta k}|^2` (`adjacent_channel_power_correlation`) --
+  the same filter statistic seen through a detector, and the one a
+  dynamic-spectrum measurement returns;
 * the response to a tone offset by :math:`\delta` channels from a channel
   center, :math:`H(\delta) = M^{-1/2} \sum_n h[n] e^{2\pi i \delta n/M}`
   (`channel_response`).
+
+Voltage and power statistics
+----------------------------
+The two are easy to confuse and differ by a square. For circular-Gaussian
+input the channelized voltages stay jointly circular Gaussian, so the
+fourth moment factorizes and the Pearson correlation of the *powers*
+:math:`|v_k|^2, |v_{k+\Delta}|^2` is exactly :math:`|\gamma_\Delta|^2` --
+never :math:`|\gamma_\Delta|`. A detector looking at a dynamic spectrum
+measures the power quantity; a coherence measurement on the voltages
+measures the complex one. `adjacent_channel_power_correlation` and
+`temporal_power_autocorrelation` give the power-domain versions directly,
+so a filter can be matched against measurements made in either domain
+without anyone squaring the wrong number.
 
 Both correlations vanish as the prototype approaches an ideal brick wall,
 which is the perfect-channelizer limit and the reason the default model is
@@ -127,7 +144,7 @@ DEFAULT_WINDOW = "hamming"
 #: width equal to the channel spacing -- is the textbook choice; the
 #: default is a shade wider, which is what puts both default correlations
 #: where measured wideband backends put them (see `PFBChannelizer`).
-DEFAULT_SINC_BANDWIDTH = 1.025
+DEFAULT_SINC_BANDWIDTH = 1.01
 
 _WINDOW_BUILDERS = {
     "hann": np.hanning,
@@ -240,23 +257,42 @@ class PFBChannelizer:
 
     Notes
     -----
-    At the package defaults (4 taps, hamming window, sinc bandwidth 1.025)
+    Instances are immutable: every attribute is fixed at construction, so
+    the same instance can be attached to several simulators (or handed to
+    `prototype_filter` for several channel counts) without the per-``n_chan``
+    prototype cache ever going stale for one caller because another
+    mutated the filter's parameters in place. Build a new instance instead
+    of editing one in place.
+
+    At the package defaults (4 taps, hamming window, sinc bandwidth 1.01)
     the filter predicts, essentially independently of the channel count:
 
     ==========================================  =========
-    lag-1 temporal autocorrelation              ``0.136``
-    adjacent-channel coherence magnitude        ``0.133``
-    tone leakage ratio at 0.40 channels offset  ``0.45``
+    lag-1 temporal autocorrelation              ``0.149``
+    lag-1 autocorrelation of the *power*        ``0.022``
+    adjacent-channel coherence magnitude        ``0.126``
+    adjacent-channel *power* correlation        ``0.016``
+    tone leakage ratio at 0.40 channels offset  ``0.43``
     ==========================================  =========
 
-    Those are the numbers the defaults exist to produce: they are what
-    wideband receiver backends show, against ``0.0005`` and ``0.007`` for
-    the perfect channelizer. The three cannot be matched simultaneously by
-    any windowed-sinc prototype -- a filter leaky enough to share a tone
-    between two channels in a large ratio is also one whose neighbouring
-    channels are strongly coherent -- so the defaults sit at the best
-    joint fit for the two *correlations*, and the leakage ratio comes out
-    somewhat lower than a real bank's.
+    Those are the numbers the defaults exist to produce: they are
+    representative of wideband receiver backends, against ``0.0005`` and
+    ``0.007`` for the perfect channelizer. The two power figures are the
+    same two correlations as seen in a dynamic spectrum, which is where a
+    measurement of a real backend usually comes from; a quantized dynamic
+    spectrum reads somewhat below these white-noise predictions, because
+    digitizing an already-detected power adds its own independent
+    variance to the denominator of every correlation estimate without
+    adding any to the covariance -- the same dilution any ratio-of-powers
+    statistic suffers under quantization, worse for coarser quantization
+    and larger for the power correlations than for the voltage ones.
+
+    The correlations and the leakage ratio cannot all be matched
+    simultaneously by any windowed-sinc prototype -- a filter leaky enough
+    to share a tone between two channels in a large ratio is also one
+    whose neighbouring channels are strongly coherent -- so the defaults
+    sit at the best joint fit for the two *correlations*, and the leakage
+    ratio comes out somewhat lower than a real bank's.
 
     Cost: two length-``n_chan`` FFTs and ``n_taps`` complex multiply-adds
     per output sample, per antenna, applied once to the whole block, plus
@@ -267,16 +303,20 @@ class PFBChannelizer:
     carries. Generating blocks *out of order* doubles that again, because
     the filter state at a block's leading edge has to be regenerated from
     its predecessor; iterating with
-    `rfi_simulator.voltages.VoltageSimulator.blocks` does not.
+    `rfi_simulator.voltages.VoltageSimulator.blocks` does not. Block 0
+    pays the same surcharge once, for the pre-observation block that warms
+    the filter up (see that class's ``warm_start``).
 
     Examples
     --------
     >>> import numpy as np
     >>> pfb = PFBChannelizer()
     >>> float(round(pfb.temporal_autocorrelation(64)[1], 3))
-    0.136
+    0.149
     >>> float(round(abs(pfb.adjacent_channel_coherence(64)), 3))
-    0.133
+    0.126
+    >>> float(round(pfb.adjacent_channel_power_correlation(64), 4))
+    0.0159
     """
 
     def __init__(
@@ -300,6 +340,14 @@ class PFBChannelizer:
             raise ValueError(f"sinc_bandwidth must be finite and > 0, got {self.sinc_bandwidth}")
 
         self._prototype_cache: dict[int, np.ndarray] = {}
+        self._frozen = True
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError(
+                f"PFBChannelizer is immutable; construct a new instance instead of setting {name!r}"
+            )
+        object.__setattr__(self, name, value)
 
     def __repr__(self) -> str:
         return (
@@ -448,6 +496,86 @@ class PFBChannelizer:
             ``channel_coherence(n_chan, 1)``.
         """
         return self.channel_coherence(n_chan, 1)
+
+    def channel_power_correlation(self, n_chan: int, delta_channels: int = 1) -> float:
+        r"""Correlation of the *powers* of two channels `delta_channels` apart.
+
+        Parameters
+        ----------
+        n_chan : int
+            Number of channels.
+        delta_channels : int, optional
+            Channel separation. Default 1 (adjacent channels).
+
+        Returns
+        -------
+        float
+            Pearson correlation of :math:`|v_k|^2` and
+            :math:`|v_{k+\Delta}|^2` for circular-Gaussian input:
+            :math:`|\gamma_\Delta|^2`, the squared magnitude of
+            `channel_coherence`. Between 0 and 1.
+
+        Notes
+        -----
+        This is the cross-channel statistic a measurement on a *dynamic
+        spectrum* returns -- detected power, phase discarded -- and it is
+        the square of the coherence a measurement on the voltages returns.
+        The identity is exact rather than approximate: the filterbank is
+        linear, so circular-Gaussian input gives jointly circular-Gaussian
+        outputs, whose fourth moment factorizes as
+        :math:`\langle|a|^2|b|^2\rangle = \langle|a|^2\rangle
+        \langle|b|^2\rangle + |\langle a b^*\rangle|^2`. Averaging power
+        over independent antennas -- as a dynamic spectrum of an array
+        does -- divides covariance and variance alike, so it leaves the
+        correlation unchanged; adding independent noise (quantization,
+        say) dilutes it slightly.
+
+        Examples
+        --------
+        >>> pfb = PFBChannelizer()
+        >>> float(round(pfb.channel_power_correlation(64), 4))
+        0.0159
+        """
+        return float(abs(self.channel_coherence(n_chan, delta_channels)) ** 2)
+
+    def adjacent_channel_power_correlation(self, n_chan: int) -> float:
+        """Power correlation between neighbouring channels.
+
+        Parameters
+        ----------
+        n_chan : int
+            Number of channels.
+
+        Returns
+        -------
+        float
+            ``channel_power_correlation(n_chan, 1)``.
+        """
+        return self.channel_power_correlation(n_chan, 1)
+
+    def temporal_power_autocorrelation(self, n_chan: int) -> np.ndarray:
+        r"""Autocorrelation of one channel's *power* time series.
+
+        Parameters
+        ----------
+        n_chan : int
+            Number of channels.
+
+        Returns
+        -------
+        numpy.ndarray
+            Float64 array of length `n_taps`: :math:`\rho[p]^2`, the
+            entrywise square of `temporal_autocorrelation`, by the same
+            Gaussian fourth-moment identity
+            `channel_power_correlation` uses. Entry ``0`` is ``1``.
+
+        Examples
+        --------
+        >>> pfb = PFBChannelizer()
+        >>> float(round(pfb.temporal_power_autocorrelation(64)[1], 4))
+        0.0221
+        """
+        return self.temporal_autocorrelation(n_chan) ** 2
 
     def channel_response(self, offset_channels, n_chan: int) -> np.ndarray:
         r"""Complex response of a channel to a tone offset from its center.
@@ -605,7 +733,14 @@ class PFBChannelizer:
             block of the same streams, shape `state_shape`. Default
             ``None``: start cold, with zeros, which attenuates the first
             ``n_taps - 1`` output samples exactly as switching a real
-            backend on does.
+            backend on does -- sample zero comes out strongly attenuated
+            (identically zero for windows with zero endpoints).
+            A recording taken from a backend that was already running has
+            no such ramp, and the ramp is a conspicuous artifact (it
+            correlates every channel pair over the first few samples), so
+            `rfi_simulator.voltages.VoltageSimulator` hands block 0 a
+            state synthesized from pre-observation data instead; see its
+            ``warm_start`` parameter.
 
         Returns
         -------

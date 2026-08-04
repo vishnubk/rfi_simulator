@@ -15,7 +15,7 @@ import pytest
 from astropy import units as u
 from conftest import SOURCE_L, SOURCE_M, zenith_phase_center
 
-from rfi_simulator import ArrayConfig, PointSource, VoltageSimulator
+from rfi_simulator import ArrayConfig, PFBChannelizer, PointSource, VoltageSimulator
 from rfi_simulator.delays import (
     earth_location,
     geometric_delays_s,
@@ -214,11 +214,39 @@ def test_zero_flux_source_is_a_no_op(default_array, start_time):
         ({"n_time_per_block": 0}, "n_time_per_block"),
         ({"chan_width_hz": 0.0}, "chan_width_hz"),
         ({"noise_std": -1.0}, "noise_std"),
+        ({"center_freq_hz": float("nan")}, "center_freq_hz"),
+        ({"center_freq_hz": float("inf")}, "center_freq_hz"),
+        ({"chan_width_hz": float("nan")}, "chan_width_hz"),
+        ({"chan_width_hz": float("inf")}, "chan_width_hz"),
+        ({"noise_std": float("nan")}, "noise_std"),
+        ({"noise_std": float("inf")}, "noise_std"),
+        ({"quant_target_counts": float("nan")}, "quant_target_counts"),
+        ({"quant_target_counts": float("inf")}, "quant_target_counts"),
+        ({"quant_target_counts": 0.0}, "quant_target_counts"),
+        ({"quant_scale": float("nan")}, "quant_scale"),
+        ({"quant_scale": float("inf")}, "quant_scale"),
+        ({"quant_scale": -1.0}, "quant_scale"),
     ],
 )
 def test_invalid_parameters_raise(default_array, start_time, kwargs, match):
     with pytest.raises(ValueError, match=match):
         make_simulator(default_array, start_time, **kwargs)
+
+
+def test_channelizer_shorter_than_the_filter_history_is_rejected(default_array, start_time):
+    """Out-of-order block access needs a full block of seam history.
+
+    `_seam_state` rebuilds the filter state at a block's leading edge
+    from its predecessor's trailing ``n_taps - 1`` samples (see
+    `VoltageSimulator._seam_state`); a block shorter than that cannot
+    supply it, so generating blocks out of order would silently differ
+    from generating them in sequence.
+    """
+    pfb = PFBChannelizer(n_taps=5)
+    with pytest.raises(ValueError, match="n_time_per_block"):
+        make_simulator(default_array, start_time, channelizer=pfb, n_chan=8, n_time_per_block=3)
+    # n_time_per_block == n_taps - 1 is exactly enough history and is fine.
+    make_simulator(default_array, start_time, channelizer=pfb, n_chan=8, n_time_per_block=4)
 
 
 def test_block_index_is_range_checked(default_array, start_time):

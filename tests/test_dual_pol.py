@@ -76,13 +76,7 @@ def reference_simulator(array, start_time, **kwargs):
         received_power_jy=800.0,
         position_enu_m=enu_from_horizontal(10.0, 3.0, 900.0),
     )
-    return VoltageSimulator(
-        array,
-        phase_center,
-        start_time,
-        [source],
-        rfi_sources=[transmitter, burst],
-        spectral_lines=[line],
+    options = dict(
         n_chan=32,
         n_time_per_block=64,
         n_blocks=3,
@@ -91,8 +85,17 @@ def reference_simulator(array, start_time, **kwargs):
         ),
         channelizer=PFBChannelizer(),
         quantization="int4",
+    )
+    options.update(kwargs)
+    return VoltageSimulator(
+        array,
+        phase_center,
+        start_time,
+        [source],
+        rfi_sources=[transmitter, burst],
+        spectral_lines=[line],
         rng=np.random.default_rng(20260803),
-        **kwargs,
+        **options,
     )
 
 
@@ -157,20 +160,38 @@ def pol_coherence(data):
 # ----------------------------------------------------------------------
 # Default off: the single-polarization data must not move
 # ----------------------------------------------------------------------
-#: sha256 of ``VoltageBlock.data`` for blocks 0-2 of `reference_simulator`,
-#: recorded from the package as it stood before dual polarization existed.
+#: sha256 of ``VoltageBlock.data`` for blocks 0-2 of `reference_simulator`.
 #: A contract: ``n_pol=1`` is the default output of this simulator.
+#:
+#: This scene runs a *filterbank*, so unlike the perfect-channelizer
+#: digests in `tests/test_channelizer.py` -- which are frozen forever --
+#: these move whenever the filterbank model does. They were re-recorded
+#: when the channelizer gained a warm start and its default
+#: `sinc_bandwidth` was retuned;
+#: `test_pre_warm_start_bytes_are_recoverable` pins the previous bytes
+#: against the options that reproduce them, so the re-recording is a
+#: documented consequence of those two changes and not a silent drift.
 REFERENCE_DIGESTS = (
-    "cddd5c122a3347813294dcf8ef5f80db930c159da92eb82cc71fed2a62cba56a",
-    "107690a72961d937acdc62566490cff44f27e89ce9b3962f8a695f1fdf07b053",
-    "8df866459e72b1be091750006797d9095ac0cc35aeadf61d85692197eaecf926",
+    "4c41f0e26c0c266720af0fd130ff8ce7c5ff8897d58e7b9961111fe7464fdabe",
+    "6e67bc1b1254f95bfebeffb7ee4c6e4bac542f6077b362bae12e4ea70bb86d6d",
+    "72025a2d4671946fad534dee49ccde8f5776e4945e2580eff8c94dad20bf489e",
 )
 
 #: sha256 of ``Visibilities.data`` for the same scene, and of block 0's
 #: per-antenna ``clip_fraction`` -- the correlator and the quantizer's
 #: ground truth are part of the same contract.
-REFERENCE_VIS_DIGEST = "0b476b6dc5d78b43308d694621782a4181f62ad4de3a8d613be3030c51e529d1"
-REFERENCE_CLIP_DIGEST = "0903b3e06165e187762f307471b04fb07e16345aa29434ac942e9a21265e2246"
+REFERENCE_VIS_DIGEST = "bcc62e323ae218e892f0adfc29561344f4c50f3408e1aa076c3a2397e19c267d"
+REFERENCE_CLIP_DIGEST = "9df8bb32496b5ba088b12f11f60172297631c7be7197a67f2eeb4a8ff92f219e"
+
+#: The same five digests as this file recorded before the channelizer
+#: gained a warm start and a retuned default `sinc_bandwidth`.
+LEGACY_DIGESTS = (
+    "cddd5c122a3347813294dcf8ef5f80db930c159da92eb82cc71fed2a62cba56a",
+    "107690a72961d937acdc62566490cff44f27e89ce9b3962f8a695f1fdf07b053",
+    "8df866459e72b1be091750006797d9095ac0cc35aeadf61d85692197eaecf926",
+)
+LEGACY_VIS_DIGEST = "0b476b6dc5d78b43308d694621782a4181f62ad4de3a8d613be3030c51e529d1"
+LEGACY_CLIP_DIGEST = "0903b3e06165e187762f307471b04fb07e16345aa29434ac942e9a21265e2246"
 
 
 def test_single_pol_output_is_bit_identical(default_array, start_time):
@@ -188,6 +209,30 @@ def test_single_pol_output_is_bit_identical(default_array, start_time):
     assert hashlib.sha256(vis_bytes).hexdigest() == REFERENCE_VIS_DIGEST
     clip_bytes = np.ascontiguousarray(blocks[0].clip_fraction).tobytes()
     assert hashlib.sha256(clip_bytes).hexdigest() == REFERENCE_CLIP_DIGEST
+
+
+def test_pre_warm_start_bytes_are_recoverable(default_array, start_time):
+    """Two options recover the bytes this scene produced before the retune.
+
+    Which is the statement that the change to this scene's output is
+    exactly (a) the filterbank's warm start at ``t = 0`` and (b) the new
+    default `sinc_bandwidth`, and nothing else -- no draw moved, no
+    ordering changed.
+    """
+    sim = reference_simulator(
+        default_array,
+        start_time,
+        warm_start=False,
+        channelizer=PFBChannelizer(sinc_bandwidth=1.025),
+    )
+    blocks = list(sim.blocks())
+    for index, expected in enumerate(LEGACY_DIGESTS):
+        data = np.ascontiguousarray(blocks[index].data)
+        assert hashlib.sha256(data.tobytes()).hexdigest() == expected
+    vis_bytes = np.ascontiguousarray(correlate(blocks).data).tobytes()
+    assert hashlib.sha256(vis_bytes).hexdigest() == LEGACY_VIS_DIGEST
+    clip_bytes = np.ascontiguousarray(blocks[0].clip_fraction).tobytes()
+    assert hashlib.sha256(clip_bytes).hexdigest() == LEGACY_CLIP_DIGEST
 
 
 def test_single_pol_shapes_are_unchanged(default_array, start_time):

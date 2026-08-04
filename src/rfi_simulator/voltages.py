@@ -556,6 +556,18 @@ class VoltageSimulator:
         arbitrary frequency rather than at a channel center. The operator
         is deterministic, so attaching it never perturbs any component's
         realization for a given seed.
+    warm_start : bool, optional
+        Whether the filterbank's state at the very start of block 0 is
+        already full. Default ``True``, which is what a recording taken
+        from a running backend looks like: the filter has been fed for
+        hours before the dump began, so sample zero is statistically no
+        different from any other. The state is built by synthesizing one
+        virtual pre-observation block from a dedicated branch of the seed
+        tree (see `_warm_start_state`), so block 0 stays a pure function
+        of the seed. ``False`` starts the filter from zeros instead --
+        the first ``n_taps - 1`` samples of the observation ramp up from
+        an exact zero, as switching a backend on does. Only meaningful
+        together with `channelizer`.
     instrument : InstrumentModel or sequence of InstrumentModel, optional
         Per-antenna direction-independent complex gains (see
         `rfi_simulator.instrument`). With ``n_pol=2``, pass one model to
@@ -639,6 +651,8 @@ class VoltageSimulator:
         root -> sky/noise seeds, one per block   (spawned first)
              -> interference seeds, one per block (spawned second)
                   -> one per interference source
+             -> warm-start seed, one per run      (spawned last)
+                  -> one per interference source
 
     Sky and noise are spawned first and unconditionally, so their stream
     cannot depend on whether -- or how many -- interference sources are
@@ -646,7 +660,11 @@ class VoltageSimulator:
     a second transmitter does not disturb the first one either. Together
     these give exactly reproducible clean/contaminated pairs: run the same
     seed with and without `rfi_sources` and the difference between the two
-    datasets is the interference and nothing else.
+    datasets is the interference and nothing else. The warm-start branch
+    hangs off the end for the same reason: the virtual pre-observation
+    block that fills a filterbank's state at ``t = 0`` (see `warm_start`)
+    must not be able to move any real block's realization, whether or not
+    a channelizer is attached.
 
     Polarization does not add a branch to that tree. A second receptor
     only widens the *shape* of each existing draw -- the sky spectrum
@@ -668,8 +686,11 @@ class VoltageSimulator:
     Raises
     ------
     ValueError
-        If any count is non-positive, `noise_std` is negative, or
-        `phase_center` / `start_time` is not scalar.
+        If any count is non-positive, if `center_freq_hz`, `chan_width_hz`,
+        `noise_std`, `quant_target_counts` or `quant_scale` is not finite
+        (or is otherwise out of its documented range, e.g. `noise_std`
+        negative), if `phase_center` / `start_time` is not scalar, or if
+        `n_time_per_block` is shorter than `channelizer.n_taps - 1`.
 
     Examples
     --------
@@ -705,6 +726,7 @@ class VoltageSimulator:
         noise_std=1.0,
         n_pol: int = 1,
         channelizer: PFBChannelizer | None = None,
+        warm_start: bool = True,
         instrument: InstrumentModel | Sequence[InstrumentModel] | None = None,
         quantization: str | None = None,
         quant_target_counts: float = DEFAULT_QUANT_TARGET_COUNTS,
@@ -747,10 +769,12 @@ class VoltageSimulator:
             raise ValueError(f"n_time_per_block must be >= 1, got {self.n_time_per_block}")
         if self.n_blocks < 1:
             raise ValueError(f"n_blocks must be >= 1, got {self.n_blocks}")
-        if self.chan_width_hz <= 0.0:
-            raise ValueError(f"chan_width_hz must be > 0, got {self.chan_width_hz}")
-        if self.noise_std < 0.0:
-            raise ValueError(f"noise_std must be >= 0, got {self.noise_std}")
+        if not np.isfinite(self.center_freq_hz):
+            raise ValueError(f"center_freq_hz must be finite, got {self.center_freq_hz}")
+        if not np.isfinite(self.chan_width_hz) or self.chan_width_hz <= 0.0:
+            raise ValueError(f"chan_width_hz must be finite and > 0, got {self.chan_width_hz}")
+        if not np.isfinite(self.noise_std) or self.noise_std < 0.0:
+            raise ValueError(f"noise_std must be finite and >= 0, got {self.noise_std}")
         for line in self.spectral_lines:
             if not isinstance(line, SpectralLineForeground):
                 raise ValueError(
@@ -785,11 +809,24 @@ class VoltageSimulator:
             raise ValueError(
                 f"channelizer must be a PFBChannelizer or None, got {type(channelizer)!r}"
             )
+        if channelizer is not None and self.n_time_per_block < channelizer.n_taps - 1:
+            raise ValueError(
+                f"n_time_per_block={self.n_time_per_block} is shorter than "
+                f"channelizer.n_taps - 1={channelizer.n_taps - 1}; the seam state at a "
+                "block's leading edge is rebuilt from its predecessor's trailing "
+                "n_taps - 1 samples (see _seam_state), which a block shorter than that "
+                "cannot supply, so a block generated out of order would silently see a "
+                "different (short) history than one generated in sequence. Use a longer "
+                "n_time_per_block or a channelizer with fewer taps."
+            )
         self.channelizer = channelizer
+        self.warm_start = bool(warm_start)
         # Filter state at the seam between block i-1 and block i, cached so
         # that iterating over blocks in order costs nothing extra; see
         # `_seam_state`.
         self._seam_cache: tuple[int, np.ndarray] | None = None
+        # The state at the leading edge of block 0, built once on demand.
+        self._warm_cache: np.ndarray | None = None
 
         self.instrument = instrument
         if instrument is None:
@@ -816,10 +853,14 @@ class VoltageSimulator:
         self.quantization = quantization
         self.quant_target_counts = float(quant_target_counts)
         self.quant_scale = None if quant_scale is None else float(quant_scale)
-        if self.quant_target_counts <= 0.0:
-            raise ValueError(f"quant_target_counts must be > 0, got {self.quant_target_counts}")
-        if self.quant_scale is not None and not self.quant_scale > 0.0:
-            raise ValueError(f"quant_scale must be > 0, got {self.quant_scale}")
+        if not np.isfinite(self.quant_target_counts) or self.quant_target_counts <= 0.0:
+            raise ValueError(
+                f"quant_target_counts must be finite and > 0, got {self.quant_target_counts}"
+            )
+        if self.quant_scale is not None and (
+            not np.isfinite(self.quant_scale) or not self.quant_scale > 0.0
+        ):
+            raise ValueError(f"quant_scale must be finite and > 0, got {self.quant_scale}")
 
         # Draw from the caller's generator exactly once, then give every
         # block its own independent generator spawned from the result.
@@ -835,6 +876,13 @@ class VoltageSimulator:
             block_seed.spawn(len(self.rfi_sources))
             for block_seed in self.seed_sequence.spawn(self.n_blocks)
         ]
+        # The pre-observation block that warms the filterbank up (see
+        # `_warm_start_state`) gets its own branch, spawned last and
+        # unconditionally, so that neither attaching a channelizer nor
+        # switching `warm_start` off can move any block's realization.
+        warm_seed = self.seed_sequence.spawn(1)[0]
+        self._warm_seed_sequence = warm_seed
+        self._warm_rfi_seed_sequences = warm_seed.spawn(len(self.rfi_sources))
 
         self.location = earth_location(array)
         self._precompute_geometry()
@@ -1099,8 +1147,39 @@ class VoltageSimulator:
         filter is FIR, so the seam depends on the neighbour's ideal
         voltages and on nothing further back.
         """
-        rng = self.block_rng(index)
+        return self._synthesize_ideal(index, self.block_rng(index), self.rfi_block_rngs(index))
 
+    def _synthesize_ideal(
+        self,
+        index: int,
+        rng: np.random.Generator,
+        rfi_rngs: Sequence[np.random.Generator],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Synthesize one block from explicitly supplied generators.
+
+        Parameters
+        ----------
+        index : int
+            Block index, which fixes the *geometry and timing* of the
+            synthesis (delays, sample times, source positions).
+        rng : numpy.random.Generator
+            Generator for the sky/noise branch.
+        rfi_rngs : sequence of numpy.random.Generator
+            One generator per entry of `rfi_sources`.
+
+        Returns
+        -------
+        tuple
+            As `_ideal_block`.
+
+        Notes
+        -----
+        The randomness is a parameter rather than a lookup on `index` so
+        that the same synthesis can also produce the *virtual*
+        pre-observation block a warm filterbank start needs, from its own
+        branch of the seed tree -- see `_warm_start_state`. `_ideal_block`
+        is this method with the block's own generators.
+        """
         n_ant = self.array.n_antennas
         n_pol = self.n_pol
         n_chan = self.n_chan
@@ -1137,7 +1216,7 @@ class VoltageSimulator:
             data += self._circular_normal(rng, (n_ant, n_pol, n_chan, n_time), self.noise_std)
 
         celestial_mask = self._add_spectral_lines(data, rng)
-        rfi_mask = self._add_rfi(data, index)
+        rfi_mask = self._add_rfi(data, index, rfi_rngs)
         return self._without_pol_axis(data), rfi_mask, celestial_mask
 
     def _with_pol_axis(self, data: np.ndarray) -> np.ndarray:
@@ -1188,9 +1267,10 @@ class VoltageSimulator:
         -------
         numpy.ndarray or None
             State to hand to `rfi_simulator.channelizer.PFBChannelizer.apply`
-            -- ``None`` for block 0 (the backend has just been switched on,
-            so the first ``n_taps - 1`` samples of the observation ramp up)
-            and for a memoryless filterbank.
+            -- `_warm_start_state` for block 0, or ``None`` for block 0 of
+            a ``warm_start=False`` run (the backend has just been switched
+            on, so the first ``n_taps - 1`` samples of the observation ramp
+            up) and for a memoryless filterbank.
 
         Notes
         -----
@@ -1202,13 +1282,67 @@ class VoltageSimulator:
         `blocks` caches the tail it produces on the way past and the common
         case -- iterating in order -- pays nothing.
         """
-        if self.channelizer is None or self.channelizer.n_taps == 1 or index == 0:
+        if self.channelizer is None or self.channelizer.n_taps == 1:
             return None
+        if index == 0:
+            return self._warm_start_state() if self.warm_start else None
         cached = self._seam_cache
         if cached is not None and cached[0] == index - 1:
             return cached[1]
         previous, _, _ = self._ideal_block(index - 1)
         return self.channelizer.trailing_state(self._with_pol_axis(previous))
+
+    def _warm_start_state(self) -> np.ndarray:
+        """The filterbank state at the leading edge of block 0.
+
+        Returns
+        -------
+        numpy.ndarray
+            State to hand to `rfi_simulator.channelizer.PFBChannelizer.apply`
+            for block 0, built from a *virtual pre-observation block* --
+            one full block of ideal voltages synthesized exactly like any
+            other, from a dedicated branch of the seed tree, of which only
+            the last ``n_taps - 1`` samples survive into the filter state.
+
+        Notes
+        -----
+        Why this exists: a filter started from zeros makes the first
+        output sample of the observation strongly attenuated (identically
+        zero for windows with zero endpoints) and the next few ramp up,
+        in every channel at once. That is what switching a
+        backend on looks like, and it is *not* what a dump taken from a
+        running telescope looks like -- there the filterbank has been fed
+        for hours before the recording started. The all-channel ramp is
+        both an unphysical artifact and a strong statistical tell: it
+        correlates every channel pair over the first few samples, which
+        inflates any measurement of cross-channel correlation made on the
+        block (by half again at the package defaults, and worse for
+        longer prototypes).
+
+        The pre-observation block is drawn from its own seed branch, so
+        block 0 remains a pure function of ``(seed, 0)`` -- generated
+        first, last or twice, it is the same data. It is synthesized with
+        block 0's geometry rather than a genuine block ``-1``'s: over one
+        block the delays move by parts in :math:`10^{5}`, and the state
+        only has to be *statistically* indistinguishable from the stream
+        that would have preceded the observation, not to continue a
+        particular one. Cost: one extra ideal block, once, cached here --
+        the same price `_seam_state` already pays for a block generated
+        out of order. A run whose blocks were shorter than the filter
+        needs to look back further than one block holds, which
+        `VoltageSimulator.__init__` rejects outright (see its
+        `n_time_per_block` validation), so this always has a full
+        ``n_taps - 1`` rows of history to draw the state from.
+        """
+        if self._warm_cache is None:
+            data, _, _ = self._synthesize_ideal(
+                0,
+                np.random.default_rng(self._warm_seed_sequence),
+                [np.random.default_rng(child) for child in self._warm_rfi_seed_sequences],
+            )
+            state = self.channelizer.trailing_state(self._with_pol_axis(data))
+            self._warm_cache = state
+        return self._warm_cache
 
     def block(self, index: int) -> VoltageBlock:
         """Synthesize a single block of voltages.
@@ -1455,7 +1589,9 @@ class VoltageSimulator:
             n_pol=self.n_pol,
         )
 
-    def _add_rfi(self, data: np.ndarray, index: int) -> np.ndarray:
+    def _add_rfi(
+        self, data: np.ndarray, index: int, rngs: Sequence[np.random.Generator]
+    ) -> np.ndarray:
         """Add every interference source to `data` and collect their labels.
 
         Parameters
@@ -1464,7 +1600,12 @@ class VoltageSimulator:
             Complex64 ``(n_ant, n_pol, n_chan, n_time)`` sky-plus-noise
             voltages, modified in place.
         index : int
-            Block index.
+            Block index, which fixes the geometry and timing handed to
+            each source.
+        rngs : sequence of numpy.random.Generator
+            One generator per entry of `rfi_sources`, in the same order --
+            ordinarily `rfi_block_rngs`, but the warm-start branch for the
+            virtual pre-observation block.
 
         Returns
         -------
@@ -1482,7 +1623,6 @@ class VoltageSimulator:
         if not self.rfi_sources:
             return masks
 
-        rngs = self.rfi_block_rngs(index)
         n_ant = self.array.n_antennas
         pol_shape = (n_ant, self.n_pol, n_chan, n_time)
         expected_voltage_shape = (n_ant, n_chan, n_time) if self.n_pol == 1 else pol_shape

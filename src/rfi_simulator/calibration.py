@@ -23,11 +23,20 @@ switched off by default:
   small-angle regime the coherence-loss analysis below assumes.
 * **A residual delay**, `delay_error_ns_rms` -- the leftover of an
   imperfect *delay* (bandpass-slope) calibration, which shows up as a
-  phase that is *linear in frequency*, :math:`2\pi f \tau_i`, rather than
-  constant. A delay error and a phase error look identical at one
-  frequency and completely different across a wide band, which is why
-  real pipelines solve for both separately and why this module keeps them
-  separate too.
+  phase that is *linear in frequency about the band center*,
+  :math:`2\pi (f - f_\mathrm{ref}) \tau_i`, rather than constant. A delay
+  error and a phase error look identical at one frequency and completely
+  different across a wide band, which is why real pipelines solve for
+  both separately and why this module keeps them separate too. Referencing
+  the slope to :math:`f_\mathrm{ref}` rather than to zero frequency is
+  what makes that separation physical: a delay calibrated at
+  :math:`f_\mathrm{ref}` and residual by :math:`\tau_i` afterwards
+  contributes *zero* phase there and :math:`\pm\pi B \tau_i` at the edges
+  of a band of width :math:`B`, exactly the "the calibration was good at
+  one frequency and drifts away from it" error a delay residual actually
+  is -- not a large constant phase shared by the whole band, which is what
+  referencing to zero frequency would make even a sub-nanosecond residual
+  look like at RF.
 * **A residual amplitude**, `amplitude_error_db_rms` -- the leftover of an
   imperfect *amplitude* calibration, lognormal in the same dB-of-power
   convention `rfi_simulator.instrument` uses.
@@ -37,12 +46,16 @@ frequency ``f`` is
 
 .. math::
 
-    c_i(f) = 10^{a_i / 20}\, \exp\left[i \left(\phi_i + 2\pi f \tau_i\right)\right],
+    c_i(f) = 10^{a_i / 20}\,
+    \exp\left[i \left(\phi_i + 2\pi (f - f_\mathrm{ref}) \tau_i\right)\right],
 
 with :math:`a_i` the amplitude error in dB, :math:`\phi_i` the phase
-error in radians and :math:`\tau_i` the delay error in seconds. All three
-default to zero, i.e. :math:`c_i(f) \equiv 1` -- perfect calibration,
-bit-identical to not passing this feature at all.
+error in radians, :math:`\tau_i` the delay error in seconds and
+:math:`f_\mathrm{ref}` the reference frequency the delay slope is
+measured about (`reference_freq_hz`, defaulting to the mean of the band
+`factors` is evaluated on). All three error terms default to zero, i.e.
+:math:`c_i(f) \equiv 1` -- perfect calibration, bit-identical to not
+passing this feature at all.
 
 Application point
 ------------------
@@ -118,6 +131,14 @@ class CalibrationErrors:
         Float64 array of shape ``(n_antennas,)``: the residual amplitude
         error of each antenna, in dB of power (see the module
         docstring's :math:`c_i(f)` -- ``0`` is unit amplitude).
+    reference_freq_hz : float or None, optional
+        Frequency, in Hz, the delay-error phase slope is zero at. Default
+        ``None``: `factors` uses the mean of whatever `freq_hz` grid it is
+        evaluated on, so a residual delay contributes zero phase at band
+        center and the slope shows up entirely as a spread across the
+        band rather than as a large shared phase offset. Pin an explicit
+        value to keep the reference fixed across calls with different
+        `freq_hz` grids.
 
     Examples
     --------
@@ -135,6 +156,7 @@ class CalibrationErrors:
     phase_error_rad: np.ndarray
     delay_error_s: np.ndarray
     amplitude_error_db: np.ndarray
+    reference_freq_hz: float | None = None
 
     def __post_init__(self) -> None:
         phase = np.asarray(self.phase_error_rad, dtype=np.float64)
@@ -158,6 +180,13 @@ class CalibrationErrors:
             and np.all(np.isfinite(amplitude))
         ):
             raise ValueError("CalibrationErrors fields contain non-finite values")
+        if self.reference_freq_hz is not None:
+            reference_freq_hz = float(self.reference_freq_hz)
+            if not np.isfinite(reference_freq_hz):
+                raise ValueError(
+                    f"reference_freq_hz must be finite or None, got {self.reference_freq_hz}"
+                )
+            object.__setattr__(self, "reference_freq_hz", reference_freq_hz)
         object.__setattr__(self, "phase_error_rad", _readonly(phase))
         object.__setattr__(self, "delay_error_s", _readonly(delay))
         object.__setattr__(self, "amplitude_error_db", _readonly(amplitude))
@@ -197,6 +226,7 @@ class CalibrationErrors:
         phase_error_deg_rms: float = 0.0,
         delay_error_ns_rms: float = 0.0,
         amplitude_error_db_rms: float = 0.0,
+        reference_freq_hz: float | None = None,
     ) -> "CalibrationErrors":
         """Draw a random, repeatable residual calibration error.
 
@@ -226,6 +256,10 @@ class CalibrationErrors:
             width, i.e. a lognormal amplitude, the same convention as
             `rfi_simulator.instrument.InstrumentModel`. Default 0.0 (no
             residual amplitude error).
+        reference_freq_hz : float, optional
+            See the `CalibrationErrors` attribute of the same name.
+            Default ``None``: the delay-error slope is referenced to the
+            mean of whatever band `factors` is later evaluated on.
 
         Returns
         -------
@@ -315,6 +349,7 @@ class CalibrationErrors:
             phase_error_rad=phase_error_rad,
             delay_error_s=delay_error_s,
             amplitude_error_db=amplitude_error_db,
+            reference_freq_hz=reference_freq_hz,
         )
 
     # ------------------------------------------------------------------
@@ -345,6 +380,14 @@ class CalibrationErrors:
         ValueError
             If `freq_hz` is not a 1-D non-empty array, or if it contains a
             non-finite value.
+
+        Notes
+        -----
+        The delay-error phase is referenced to `reference_freq_hz` if set,
+        or otherwise to the mean of `freq_hz` itself -- evaluated fresh on
+        every call, so a fixed reference has to be pinned explicitly if
+        `factors` will be called on more than one grid and the two must
+        agree on where the delay slope crosses zero.
         """
         freq = np.asarray(freq_hz, dtype=np.float64)
         if freq.ndim != 1 or freq.size < 1:
@@ -352,10 +395,12 @@ class CalibrationErrors:
         if not np.all(np.isfinite(freq)):
             raise ValueError("freq_hz contains non-finite values")
 
-        phase = (
-            self.phase_error_rad[:, np.newaxis]
-            + 2.0 * np.pi * self.delay_error_s[:, np.newaxis] * freq[np.newaxis, :]
+        reference_freq_hz = (
+            float(freq.mean()) if self.reference_freq_hz is None else self.reference_freq_hz
         )
+        phase = self.phase_error_rad[:, np.newaxis] + 2.0 * np.pi * self.delay_error_s[
+            :, np.newaxis
+        ] * (freq[np.newaxis, :] - reference_freq_hz)
         amplitude = 10.0 ** (self.amplitude_error_db[:, np.newaxis] / 20.0)
         return (amplitude * np.exp(1j * phase)).astype(np.complex128)
 

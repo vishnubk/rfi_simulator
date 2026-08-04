@@ -63,6 +63,11 @@ from rfi_simulator import (
     uvw_wavelengths,
 )
 from rfi_simulator.binning import bin_any, bin_mean
+from rfi_simulator.channelizer import (
+    DEFAULT_N_TAPS,
+    DEFAULT_SINC_BANDWIDTH,
+    DEFAULT_WINDOW,
+)
 from rfi_simulator.delays import earth_location, zenith_coord
 from rfi_simulator.voltages import DEFAULT_CHAN_WIDTH_HZ, DEFAULT_QUANT_TARGET_COUNTS
 
@@ -608,12 +613,24 @@ _COMB_FIELDS = [
     _num("azimuth_deg", "Bearing", 200.0, unit="deg", minimum=0.0, maximum=360.0, step=1.0),
     _num("elevation_deg", "Elevation", 2.0, unit="deg", minimum=-5.0, maximum=90.0, step=0.1),
     _num(
-        "distance_m", "Range", 3000.0, unit="km", factor=1000.0,
-        minimum=10.0, maximum=5.0e5, step=0.1,
+        "distance_m",
+        "Range",
+        3000.0,
+        unit="km",
+        factor=1000.0,
+        minimum=10.0,
+        maximum=5.0e5,
+        step=0.1,
     ),
     _num(
-        "fundamental_hz", "Fundamental frequency", 1.405e6, unit="MHz", factor=MHZ,
-        minimum=1.0e3, maximum=1.0e10, step=0.000001,
+        "fundamental_hz",
+        "Fundamental frequency",
+        1.405e6,
+        unit="MHz",
+        factor=MHZ,
+        minimum=1.0e3,
+        maximum=1.0e10,
+        step=0.000001,
         help_text="May sit far below the simulated band; only in-band harmonics show up.",
     ),
     _text(
@@ -623,18 +640,35 @@ _COMB_FIELDS = [
         help_text="Which multiples of the fundamental the device emits, e.g. '999,1000,1001'.",
     ),
     _num(
-        "received_power_jy", "Received power per harmonic", 200.0, unit="Jy",
-        minimum=0.0, maximum=1.0e9, step=10.0,
+        "received_power_jy",
+        "Received power per harmonic",
+        200.0,
+        unit="Jy",
+        minimum=0.0,
+        maximum=1.0e9,
+        step=10.0,
     ),
     _num(
-        "bandwidth_hz", "Bandwidth per harmonic", 0.0, unit="kHz", factor=KHZ,
-        minimum=0.0, maximum=1.0e9, step=1.0,
+        "bandwidth_hz",
+        "Bandwidth per harmonic",
+        0.0,
+        unit="kHz",
+        factor=KHZ,
+        minimum=0.0,
+        maximum=1.0e9,
+        step=1.0,
         help_text="0 (default) makes every harmonic a pure line, one channel wide.",
     ),
     _num("duty_cycle", "Duty cycle", 1.0, minimum=0.0, maximum=1.0, step=0.05),
     _num(
-        "frame_duration_s", "Frame length", 0.01, unit="ms", factor=1.0e-3,
-        minimum=1.0e-5, maximum=10.0, step=1.0,
+        "frame_duration_s",
+        "Frame length",
+        0.01,
+        unit="ms",
+        factor=1.0e-3,
+        minimum=1.0e-5,
+        maximum=10.0,
+        step=1.0,
     ),
     _WAVEFORM_FIELD,
 ]
@@ -741,9 +775,7 @@ class FullPolarization(BaseModel):
     fraction: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
-PolarizationSpec = Annotated[
-    LinearPolarization | FullPolarization, Field(discriminator="type")
-]
+PolarizationSpec = Annotated[LinearPolarization | FullPolarization, Field(discriminator="type")]
 
 
 def _build_polarization(polarization: PolarizationSpec | None) -> dict[str, Any] | None:
@@ -1102,12 +1134,23 @@ SPECTRAL_LINE_FIELDS = [
         help_text="Default: the 21 cm neutral hydrogen line, rest frame.",
     ),
     _num(
-        "fwhm_hz", "Line width (FWHM)", 20.0e3, unit="kHz", factor=KHZ,
-        minimum=1.0, maximum=1.0e9, step=1.0,
+        "fwhm_hz",
+        "Line width (FWHM)",
+        20.0e3,
+        unit="kHz",
+        factor=KHZ,
+        minimum=1.0,
+        maximum=1.0e9,
+        step=1.0,
     ),
     _num(
-        "line_flux_jy", "Peak-channel power", 1.0, unit="Jy",
-        minimum=0.0, maximum=1.0e6, step=0.1,
+        "line_flux_jy",
+        "Peak-channel power",
+        1.0,
+        unit="Jy",
+        minimum=0.0,
+        maximum=1.0e6,
+        step=0.1,
         help_text="Added per antenna, like noise_std^2, tapering as a Gaussian in frequency.",
     ),
 ]
@@ -1168,7 +1211,7 @@ class CalibrationErrorParams(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     phase_error_deg_rms: float = Field(default=5.0, ge=0.0, le=180.0)
-    delay_error_ns_rms: float = Field(default=0.0, ge=0.0, le=1000.0)
+    delay_error_ns_rms: float = Field(default=0.0, ge=0.0, le=10.0)
     amplitude_error_db_rms: float = Field(default=0.0, ge=0.0, le=10.0)
 
     def build(self, n_antennas: int, seed: int) -> CalibrationErrors:
@@ -1181,9 +1224,9 @@ class ChannelizerParams(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    n_taps: int = Field(default=4, ge=1, le=32)
-    window: Literal["hann", "hamming", "blackman"] = "hamming"
-    sinc_bandwidth: float = Field(default=1.025, gt=0.0, le=8.0)
+    n_taps: int = Field(default=DEFAULT_N_TAPS, ge=1, le=32)
+    window: Literal["hann", "hamming", "blackman"] = DEFAULT_WINDOW
+    sinc_bandwidth: float = Field(default=DEFAULT_SINC_BANDWIDTH, gt=0.0, le=8.0)
 
     def build(self) -> PFBChannelizer:
         """The library channelizer this describes."""

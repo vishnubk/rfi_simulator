@@ -151,6 +151,17 @@ def test_constructor_validates_shapes_and_finiteness():
         )
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_constructor_rejects_non_finite_reference_freq_hz(value):
+    with pytest.raises(ValueError, match="reference_freq_hz"):
+        CalibrationErrors(
+            phase_error_rad=np.zeros(2),
+            delay_error_s=np.zeros(2),
+            amplitude_error_db=np.zeros(2),
+            reference_freq_hz=value,
+        )
+
+
 # ----------------------------------------------------------------------
 # Statistics: the parameters must be measurable back out
 # ----------------------------------------------------------------------
@@ -310,7 +321,8 @@ def test_delay_errors_produce_a_linear_phase_ramp(default_array, start_time):
         / plain.data[:, plain.baseline_index(i, j), :]
     )
     tau_ij = errors.delay_error_s[i] - errors.delay_error_s[j]
-    expected_phase = np.unwrap(2.0 * np.pi * tau_ij * plain.freq_hz)
+    f_ref = plain.freq_hz.mean()
+    expected_phase = np.unwrap(2.0 * np.pi * tau_ij * (plain.freq_hz - f_ref))
     measured_phase = np.unwrap(np.angle(row[0]))
     # Compare slopes (a constant offset from `phase_error_deg_rms` is
     # zero here, so slope and level should both match, but the slope is
@@ -318,6 +330,59 @@ def test_delay_errors_produce_a_linear_phase_ramp(default_array, start_time):
     expected_slope = np.polyfit(plain.freq_hz, expected_phase, 1)[0]
     measured_slope = np.polyfit(plain.freq_hz, measured_phase, 1)[0]
     assert measured_slope == pytest.approx(expected_slope, rel=1e-3)
+    # The slope is referenced to the band center, so the phase there --
+    # not at the band edge or at zero RF frequency -- is the intercept.
+    measured_at_ref = np.interp(f_ref, plain.freq_hz, measured_phase)
+    assert measured_at_ref == pytest.approx(0.0, abs=1e-3)
+
+
+def test_delay_error_phase_defaults_to_zero_at_the_band_mean():
+    """`reference_freq_hz` defaults to the mean of whatever grid is passed."""
+    errors = CalibrationErrors.from_params(3, seed=7, delay_error_ns_rms=5.0)
+    assert errors.reference_freq_hz is None
+    factors = errors.factors(FREQ_HZ)
+    f_ref = FREQ_HZ.mean()
+    at_ref = np.interp(f_ref, FREQ_HZ, np.unwrap(np.angle(factors[1])))
+    assert at_ref == pytest.approx(0.0, abs=1e-6)
+
+
+def test_reference_freq_hz_can_be_pinned_explicitly():
+    """An explicit reference makes the zero-phase point independent of the grid."""
+    pinned = CalibrationErrors.from_params(
+        3, seed=7, delay_error_ns_rms=5.0, reference_freq_hz=1.41e9
+    )
+    assert pinned.reference_freq_hz == pytest.approx(1.41e9)
+    factors_a = pinned.factors(FREQ_HZ)
+    factors_b = pinned.factors(np.linspace(1.40e9, 1.50e9, 40))
+    phase_a = np.interp(1.41e9, FREQ_HZ, np.unwrap(np.angle(factors_a[1])))
+    grid_b = np.linspace(1.40e9, 1.50e9, 40)
+    phase_b = np.interp(1.41e9, grid_b, np.unwrap(np.angle(factors_b[1])))
+    assert phase_a == pytest.approx(0.0, abs=1e-6)
+    assert phase_b == pytest.approx(0.0, abs=1e-6)
+
+
+def test_small_residual_delay_barely_perturbs_the_dirty_image(default_array, start_time):
+    """The observable that motivated referencing the slope to band center.
+
+    At absolute RF frequency a 0.3 ns residual delay contributes ~150 deg
+    of near-constant phase at L band and visibly corrupts the image; once
+    the slope is referenced to the band center that same residual is a
+    gentle phase ramp across the band and the dirty-image peak barely
+    moves.
+    """
+    source = PointSource.from_lm(
+        zenith_phase_center(default_array, start_time, 0.1), (SOURCE_L, SOURCE_M), flux_jy=5.0
+    )
+    sim = make_simulator(default_array, start_time, [source], n_chan=64, noise_std=0.0)
+    blocks = list(sim.blocks())
+    plain = correlate(blocks, include_autos=False)
+    plain_peak = dirty_image(plain)[0].max()
+
+    errors = CalibrationErrors.from_params(sim.n_antennas, seed=42, delay_error_ns_rms=0.3)
+    miscalibrated = correlate(blocks, include_autos=False, calibration_errors=errors)
+    miscalibrated_peak = dirty_image(miscalibrated)[0].max()
+
+    assert miscalibrated_peak == pytest.approx(plain_peak, rel=0.05)
 
 
 def test_amplitude_errors_do_not_touch_the_voltages(default_array, start_time):

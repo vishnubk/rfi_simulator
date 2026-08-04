@@ -835,7 +835,7 @@
       options: [{ value: "hann", label: "hann" }, { value: "hamming", label: "hamming" },
         { value: "blackman", label: "blackman" }] },
     { name: "sinc_bandwidth", label: "Sinc bandwidth", kind: "number", factor: 1,
-      min: 0.1, max: 8, step: 0.01, default: 1.025 },
+      min: 0.1, max: 8, step: 0.01, default: 1.01 },
 
     { name: "calibration_enabled", label: "Residual calibration errors", kind: "toggle",
       default: false, section: "Calibration errors" },
