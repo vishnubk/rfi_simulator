@@ -13,6 +13,7 @@ The pipeline is four steps long::
 
 from rfi_simulator.aircraft import ADSB_FREQ_HZ, ADSBTransponder
 from rfi_simulator.array_config import ArrayConfig
+from rfi_simulator.beam import AiryBeam, GaussianBeam, PrimaryBeam
 from rfi_simulator.binning import bin_any, bin_mean, block_any
 from rfi_simulator.calibration import CalibrationErrors
 from rfi_simulator.channelizer import PFBChannelizer
@@ -73,15 +74,18 @@ __all__ = [
     "OCCUPANCY_THRESHOLD",
     "SPEED_OF_LIGHT_M_S",
     "ADSBTransponder",
+    "AiryBeam",
     "ArrayConfig",
     "BlockContext",
     "CalibrationErrors",
     "CombTransmitter",
+    "GaussianBeam",
     "ImpulsiveBroadband",
     "InstrumentModel",
     "NarrowbandTransmitter",
     "PFBChannelizer",
     "PointSource",
+    "PrimaryBeam",
     "RFISource",
     "SatelliteTransmitter",
     "SpectralLineForeground",

@@ -52,6 +52,36 @@ with the sky/noise stream and are labelled with their own
 `VoltageBlock.celestial_mask`, kept separate from `rfi_mask` so scoring can
 tell a flagged line apart from flagged interference.
 
+An optional `rfi_simulator.beam.PrimaryBeam` (`primary_beam`, off by
+default) attenuates each `PointSource` by its offset from the pointing
+center, frequency-dependently -- a source at fixed offset is attenuated
+more at higher frequency, because the beam shrinks. Concretely, the
+beam's **voltage** (amplitude) response,
+:math:`\sqrt{B(\theta_{\mathrm{src}}, f)}` -- see `rfi_simulator.beam` for
+why it is the square root of the power response -- multiplies the fringe
+phase applied to that source's shared spectrum, per channel, before it is
+added to every antenna, so it is common to every antenna (all antennas
+are assumed to carry the same dish/beam in this v1) and every
+visibility's flux ends up scaled by the **power** response, which is what
+the module's acceptance test checks. Only `PointSource` is attenuated:
+`SpectralLineForeground` is not, because it already models a fully
+resolved, sky-filling emission (see its own docstring) that fills the
+whole main lobe rather than sitting at one offset the beam could
+discriminate against; near-field `rfi_simulator.rfi.RFISource`
+interference is not attenuated either, because it enters the array
+through the far sidelobes and the ground plane, not through the main
+beam this model describes, and its per-antenna coupling
+(`rfi_simulator.rfi.resolve_coupling`) already carries whatever
+attenuation that near-field geometry implies. The offset itself is the
+small-angle :math:`\theta \approx \sqrt{l^2 + m^2}` from
+`rfi_simulator.sky.PointSource.lm` relative to `pointing_center` (the
+phase center by default -- see `pointing_center` below); because ``(l,
+m)`` of a fixed source is constant across a whole observation (see
+`rfi_simulator.sky`), so is its beam response, and it is evaluated once
+at construction rather than per block. The applied per-source,
+per-channel power response is recorded as ground truth on
+`VoltageBlock.beam_response`.
+
 Three optional stages sit at the end of the per-block synthesis, all off by
 default so that the expression above is the whole story unless they are
 switched on:
@@ -125,6 +155,7 @@ from astropy.coordinates import SkyCoord
 from astropy.time import Time
 
 from rfi_simulator.array_config import ArrayConfig, _to_value
+from rfi_simulator.beam import PrimaryBeam
 from rfi_simulator.channelizer import PFBChannelizer
 from rfi_simulator.delays import (
     earth_location,
@@ -309,6 +340,17 @@ class VoltageBlock:
         ground truth, like `gains` and `quant_scale`: the temporal and
         channel-to-channel correlations of the data are a property of this
         object, and a flagger's statistics depend on them.
+    beam_response : numpy.ndarray, optional
+        Float64 ground-truth per-source, per-channel primary-beam **power**
+        response of shape ``(n_sources, n_chan)``, in the order of the
+        simulator's `PointSource` sky model: ``beam_response[s, c]`` is
+        the fraction of on-axis power source ``s`` was received with at
+        channel ``c`` (see `rfi_simulator.beam`), so its true catalog flux
+        times this factor is exactly the flux a noiseless correlator
+        recovers for that source. ``None`` (the default) for a block
+        simulated with no `primary_beam` attached, i.e. every source at
+        its full flux -- the same "``None`` means off" convention `gains`
+        and `channelizer` use.
     """
 
     data: np.ndarray
@@ -331,6 +373,7 @@ class VoltageBlock:
     clip_fraction: np.ndarray | None = None
     quant_scale: float | None = None
     channelizer: PFBChannelizer | None = None
+    beam_response: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.data.ndim not in (3, 4):
@@ -380,6 +423,14 @@ class VoltageBlock:
                 f"({len(self.celestial_source_names)}, {self.n_chan}, {self.n_time}), "
                 f"got {self.celestial_mask.shape}"
             )
+        if self.beam_response is not None:
+            if self.beam_response.ndim != 2 or self.beam_response.shape[1] != self.n_chan:
+                raise ValueError(
+                    "beam_response must have shape (n_sources, n_chan) with n_chan = "
+                    f"{self.n_chan}, got {self.beam_response.shape}"
+                )
+            if not np.all(np.isfinite(self.beam_response)):
+                raise ValueError("beam_response must be finite")
 
     @property
     def n_rfi_sources(self) -> int:
@@ -537,6 +588,25 @@ class VoltageSimulator:
         `quant_target_counts`. Pass a value to hold the scale constant
         across blocks, which is what a real backend with a fixed digital
         gain does.
+    primary_beam : rfi_simulator.beam.PrimaryBeam, optional
+        Frequency-dependent primary-beam model (see
+        `rfi_simulator.beam`). Default ``None``: every source is received
+        at its full catalog flux regardless of offset from the pointing
+        center, which is bit-for-bit the data this simulator produced
+        before the model existed. Attached, it attenuates each
+        `PointSource` by its offset from `pointing_center` -- see the
+        module docstring for exactly where the factor enters and why
+        `spectral_lines` and `rfi_sources` are unaffected. Deterministic
+        (no randomness of its own), evaluated once at construction, so
+        attaching one never perturbs any random draw.
+    pointing_center : astropy.coordinates.SkyCoord, optional
+        Scalar direction the (optional) primary beam is centered on.
+        Default ``None``: the pointing center is `phase_center` itself --
+        the ordinary case of an array phased up and pointed at the same
+        direction. Pass a different scalar `SkyCoord` for an
+        offset-pointing scene (phased on one direction, physically
+        pointed at another); only meaningful together with
+        `primary_beam`, but accepted either way.
     rng : numpy.random.Generator
         Seeded random generator. Required -- the package never seeds a
         global generator, so that every run is reproducible. It is drawn
@@ -639,12 +709,20 @@ class VoltageSimulator:
         quantization: str | None = None,
         quant_target_counts: float = DEFAULT_QUANT_TARGET_COUNTS,
         quant_scale: float | None = None,
+        primary_beam: PrimaryBeam | None = None,
+        pointing_center: SkyCoord | None = None,
         rng: np.random.Generator,
     ) -> None:
         if not phase_center.isscalar:
             raise ValueError("phase_center must be a scalar SkyCoord")
         if not start_time.isscalar:
             raise ValueError("start_time must be a scalar Time")
+        if pointing_center is not None and not pointing_center.isscalar:
+            raise ValueError("pointing_center must be a scalar SkyCoord")
+        if primary_beam is not None and not isinstance(primary_beam, PrimaryBeam):
+            raise ValueError(
+                f"primary_beam must be a PrimaryBeam or None, got {type(primary_beam)!r}"
+            )
 
         self.array = array
         self.phase_center = phase_center
@@ -683,6 +761,25 @@ class VoltageSimulator:
         # RF channel centers, ascending, symmetric about the band center.
         offsets = np.arange(self.n_chan, dtype=np.float64) - 0.5 * (self.n_chan - 1)
         self.freq_hz = self.center_freq_hz + offsets * self.chan_width_hz
+
+        self.primary_beam = primary_beam
+        self.pointing_center = phase_center if pointing_center is None else pointing_center
+        # A source's (l, m) relative to a fixed pointing center does not
+        # change as the Earth rotates (see rfi_simulator.sky), so its beam
+        # response is a property of the source, not the block, and is
+        # evaluated exactly once here -- never per block.
+        if self.primary_beam is None:
+            self._beam_power = None
+        elif self.sources:
+            offsets_lm = np.stack(
+                [source.lm(self.pointing_center) for source in self.sources], axis=0
+            )  # (n_src, 2)
+            theta_rad = np.sqrt(np.sum(offsets_lm**2, axis=-1))  # (n_src,), small-angle approx
+            self._beam_power = self.primary_beam.power_response(
+                theta_rad[:, np.newaxis], self.freq_hz[np.newaxis, :]
+            )  # (n_src, n_chan)
+        else:
+            self._beam_power = np.zeros((0, self.n_chan), dtype=np.float64)
 
         if channelizer is not None and not isinstance(channelizer, PFBChannelizer):
             raise ValueError(
@@ -1026,6 +1123,13 @@ class VoltageSimulator:
             phase = np.exp(-2j * np.pi * self.freq_hz[np.newaxis, :] * tau_s[:, np.newaxis]).astype(
                 np.complex64
             )
+            if self.primary_beam is not None:
+                # Voltage-domain factor is the square root of the power
+                # response (see rfi_simulator.beam); common to every
+                # antenna, so it lands in the visibility as the power
+                # response itself once both antennas' factors multiply.
+                beam_amplitude = np.sqrt(self._beam_power[i_src]).astype(np.complex64)
+                phase = phase * beam_amplitude[np.newaxis, :]
             data += phase[:, np.newaxis, :, np.newaxis] * spectrum[np.newaxis]
 
         if self.noise_std > 0.0:
@@ -1198,6 +1302,7 @@ class VoltageSimulator:
             clip_fraction=clip_fraction,
             quant_scale=quant_scale,
             channelizer=self.channelizer,
+            beam_response=self.beam_response(),
         )
 
     def _add_spectral_lines(self, data: np.ndarray, rng: np.random.Generator) -> np.ndarray:
@@ -1241,6 +1346,23 @@ class VoltageSimulator:
             data += unit * scale[np.newaxis, np.newaxis, :, np.newaxis]
             masks[i_line] = line.mask(self.freq_hz, n_time)
         return masks
+
+    def beam_response(self) -> np.ndarray | None:
+        """Per-source, per-channel primary-beam power response -- ground truth.
+
+        Returns
+        -------
+        numpy.ndarray or None
+            Float64 array of shape ``(n_sources, n_chan)`` -- see
+            `VoltageBlock.beam_response` -- or ``None`` if no
+            `primary_beam` is attached, so a run with no beam still
+            carries the correct ("nothing was attenuated") truth rather
+            than an all-ones array standing in for "not applicable".
+            Constant across blocks, like `rfi_coupling`, since a source's
+            offset from the pointing center does not change (see
+            `rfi_simulator.sky`).
+        """
+        return None if self._beam_power is None else self._beam_power.copy()
 
     def rfi_coupling(self) -> np.ndarray:
         """Per-antenna coupling of every interference source -- ground truth.
