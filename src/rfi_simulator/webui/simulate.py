@@ -38,7 +38,7 @@ from typing import Annotated, Any, Literal
 
 import numpy as np
 from astropy.time import Time
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rfi_simulator import (
     ADSBTransponder,
@@ -741,7 +741,17 @@ class LognormalCoupling(BaseModel):
     seed: int = Field(default=0, ge=0, le=2**31 - 1)
 
 
-CouplingSpec = list[float] | LognormalCoupling
+def _check_finite_floats(values: list[float]) -> list[float]:
+    """Reject NaN/inf, the same way the antenna-position validator does."""
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("values must all be finite numbers")
+    return values
+
+
+FiniteFloatList = Annotated[list[float], AfterValidator(_check_finite_floats)]
+"""A `list[float]` that has already been checked for NaN/inf."""
+
+CouplingSpec = FiniteFloatList | LognormalCoupling
 """An explicit per-antenna amplitude vector, or a lognormal draw."""
 
 
@@ -770,8 +780,8 @@ class FullPolarization(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     type: Literal["full"] = "full"
-    jones_re: list[float] = Field(min_length=2, max_length=2)
-    jones_im: list[float] = Field(default=[0.0, 0.0], min_length=2, max_length=2)
+    jones_re: FiniteFloatList = Field(min_length=2, max_length=2)
+    jones_im: FiniteFloatList = Field(default=[0.0, 0.0], min_length=2, max_length=2)
     fraction: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
@@ -1194,15 +1204,22 @@ class InstrumentParams(BaseModel):
     subband_scatter_db: float = Field(default=0.0, ge=0.0, le=10.0)
     n_subbands: int = Field(default=1, ge=1, le=64)
 
-    def build(self, n_antennas: int, seed: int) -> InstrumentModel:
+    def build(self, n_antennas: int, rng: np.random.Generator) -> InstrumentModel:
         """The library model this describes.
 
         `freq_hz` is deliberately omitted: leaving `band_hz` unset makes
         the ripple/slope/subband reference band default to whatever grid
         `InstrumentModel.gains` is later evaluated on, which is exactly
         the simulated band here -- see `InstrumentModel.from_params`.
+
+        `rng` must already be independent of any other model's generator
+        (see `build_simulator`'s seed derivation) -- passing the same
+        seed both here and to `CalibrationErrorParams.build` would draw
+        the same standard-normal vector for the gain scatter and the
+        calibration phase error, perfectly correlating two effects the
+        rest of the simulator treats as independent.
         """
-        return InstrumentModel.from_params(n_antennas, seed=seed, **self.model_dump())
+        return InstrumentModel.from_params(n_antennas, rng=rng, **self.model_dump())
 
 
 class CalibrationErrorParams(BaseModel):
@@ -1214,9 +1231,13 @@ class CalibrationErrorParams(BaseModel):
     delay_error_ns_rms: float = Field(default=0.0, ge=0.0, le=10.0)
     amplitude_error_db_rms: float = Field(default=0.0, ge=0.0, le=10.0)
 
-    def build(self, n_antennas: int, seed: int) -> CalibrationErrors:
-        """The library model this describes."""
-        return CalibrationErrors.from_params(n_antennas, seed=seed, **self.model_dump())
+    def build(self, n_antennas: int, rng: np.random.Generator) -> CalibrationErrors:
+        """The library model this describes.
+
+        `rng` must already be independent of any other model's generator
+        -- see `InstrumentParams.build`.
+        """
+        return CalibrationErrors.from_params(n_antennas, rng=rng, **self.model_dump())
 
 
 class ChannelizerParams(BaseModel):
@@ -1432,6 +1453,31 @@ def _round_grid(values: np.ndarray, decimals: int) -> list[list[float]]:
 # ----------------------------------------------------------------------
 # The run
 # ----------------------------------------------------------------------
+def _feature_seed_sequences(seed: int) -> tuple[np.random.SeedSequence, np.random.SeedSequence]:
+    """Independent seed sequences for the instrument model and calibration errors.
+
+    Both `InstrumentModel.from_params` and `CalibrationErrors.from_params`
+    accept a raw `seed` and, given one, do the same thing internally:
+    build `SeedSequence(seed)` and spawn a fixed number of children in a
+    fixed order for their own effects. `SeedSequence.spawn`'s first child
+    depends only on the seed, not on how many children are requested, so
+    handing both models the same `request.sim.seed` directly would give
+    `InstrumentModel`'s gain-scatter draw and `CalibrationErrors`'s phase
+    error draw the *same* underlying standard-normal vector -- perfectly
+    correlating two effects the rest of the simulator treats as
+    independent. Spawning two children from one root here, and passing
+    each through `rng=` instead of `seed=`, keeps the run fully
+    reproducible from `sim.seed` alone while decorrelating the two
+    models. (`VoltageSimulator`'s own `rng` -- see `build_simulator` --
+    draws entropy from the generator before building its internal seed
+    sequence, a different code path, so it does not re-collide with
+    either of these despite starting from the same `sim.seed`.)
+    """
+    root = np.random.SeedSequence(seed)
+    instrument_seq, calibration_seq = root.spawn(2)
+    return instrument_seq, calibration_seq
+
+
 def build_simulator(request: SimulateRequest) -> VoltageSimulator:
     """Assemble the library objects a request describes.
 
@@ -1476,11 +1522,16 @@ def build_simulator(request: SimulateRequest) -> VoltageSimulator:
     # there is no separate seed field per feature, so switching one on
     # never disturbs another, and re-running with the same seed is still
     # byte-identical (the same guarantee `sim.seed` already gives the sky,
-    # noise and RFI draws).
+    # noise and RFI draws). Instrument and calibration errors additionally
+    # go through `_feature_seed_sequences` rather than the raw seed, so
+    # that the two models -- which both spawn children from a seed
+    # sequence the same way -- do not draw the same underlying random
+    # vector for two supposedly-independent effects.
+    instrument_seq, _ = _feature_seed_sequences(request.sim.seed)
     instrument = (
         None
         if request.instrument is None
-        else request.instrument.build(n_antennas, request.sim.seed)
+        else request.instrument.build(n_antennas, np.random.default_rng(instrument_seq))
     )
     channelizer = None if request.channelizer is None else request.channelizer.build()
     primary_beam = None if request.primary_beam is None else request.primary_beam.build()
@@ -1662,10 +1713,13 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
         simulator = build_simulator(request)
         pol = int(pol) if simulator.n_pol > 1 else 0
         reducer = _WaterfallReducer(simulator, pol=pol)
+        _, calibration_seq = _feature_seed_sequences(request.sim.seed)
         calibration_errors = (
             None
             if request.calibration_errors is None
-            else request.calibration_errors.build(simulator.n_antennas, request.sim.seed)
+            else request.calibration_errors.build(
+                simulator.n_antennas, np.random.default_rng(calibration_seq)
+            )
         )
         visibilities = correlate(reducer.stream(), calibration_errors=calibration_errors)
         reduced = reducer.reduced()

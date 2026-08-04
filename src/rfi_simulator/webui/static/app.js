@@ -841,8 +841,10 @@
       default: false, section: "Calibration errors" },
     { name: "phase_error_deg_rms", label: "Phase error", kind: "number", unit: "deg", factor: 1,
       min: 0, max: 180, step: 0.5, default: 5.0 },
+    // max matches CalibrationErrorParams.delay_error_ns_rms's `le` bound in
+    // simulate.py -- keep the two in sync if either changes.
     { name: "delay_error_ns_rms", label: "Delay error", kind: "number", unit: "ns", factor: 1,
-      min: 0, max: 1000, step: 0.5, default: 0.0 },
+      min: 0, max: 10, step: 0.1, default: 0.0 },
     { name: "amplitude_error_db_rms", label: "Amplitude error", kind: "number", unit: "dB", factor: 1,
       min: 0, max: 10, step: 0.05, default: 0.0 },
 

@@ -656,6 +656,33 @@ def test_trailing_state_matches_the_state_apply_returns():
     assert np.allclose(pfb.trailing_state(data), state, atol=1e-5)
 
 
+def test_trailing_state_zero_pads_a_block_shorter_than_the_filter():
+    """A block with fewer than `n_taps - 1` samples pads its missing history with zeros.
+
+    `PFBChannelizer.trailing_state` documents this explicitly: the missing
+    rows come out as zeros rather than reaching back into an earlier block,
+    because `trailing_state` only ever sees the one block it is given.
+    """
+    pfb = PFBChannelizer(n_taps=5)
+    n_history = pfb.n_taps - 1
+    rng = np.random.default_rng(2)
+    n_time = n_history - 2
+    assert n_time > 0
+    data = (
+        rng.standard_normal((3, 16, n_time)) + 1j * rng.standard_normal((3, 16, n_time))
+    ).astype(np.complex64)
+
+    state = pfb.trailing_state(data)
+
+    assert state.shape == (3, n_history, 16)
+    # The oldest rows -- the ones that would have come from history this
+    # short block does not have -- are exactly zero; only the last
+    # `n_time` rows carry the block's own (ifft-transformed) content.
+    n_missing = n_history - n_time
+    assert np.array_equal(state[:, :n_missing, :], np.zeros((3, n_missing, 16)))
+    assert np.any(state[:, n_missing:, :] != 0.0)
+
+
 # ----------------------------------------------------------------------
 # Carriers at arbitrary frequencies
 # ----------------------------------------------------------------------
@@ -777,6 +804,70 @@ def test_leaky_filterbank_widens_the_ground_truth_labels(default_array, start_ti
     block = sim.block(0)
     occupied = block.rfi_mask[0].any(axis=1)
     assert occupied[target - 1] and occupied[target] and occupied[target + 1]
+
+
+def test_off_center_carrier_carries_polarization_under_dual_pol(default_array, start_time):
+    """`add_offset_carrier` (the sub-channel path) must also mix polarizations.
+
+    Every other offset-carrier test above runs single-polarization; this is
+    the one exercise of that code path with ``n_pol=2``, a channelizer
+    attached, and a polarized source away from a channel center -- the
+    combination `add_offset_carrier`'s ``per_pol`` mixing is for.
+    """
+    options = dict(n_chan=32, n_time_per_block=512, n_blocks=1, n_pol=2)
+    phase_center = zenith_phase_center(default_array, start_time, duration_s=1.0)
+    probe = VoltageSimulator(
+        default_array,
+        phase_center,
+        start_time,
+        [],
+        noise_std=0.0,
+        rng=np.random.default_rng(5),
+        **options,
+    )
+    target = probe.n_chan // 2
+    freq_hz = probe.freq_hz[target] + OFFSET_CHANNELS * probe.chan_width_hz
+    angle_deg = 30.0
+    carrier = NarrowbandTransmitter(
+        enu_from_horizontal(45.0, 5.0, 3000.0),
+        freq_hz,
+        0.0,
+        100.0,
+        waveform="constant_envelope",
+        polarization={"type": "linear", "angle_deg": angle_deg},
+        name="carrier",
+    )
+    sim = VoltageSimulator(
+        default_array,
+        phase_center,
+        start_time,
+        [],
+        rfi_sources=[carrier],
+        noise_std=0.0,
+        rng=np.random.default_rng(5),
+        channelizer=PFBChannelizer(),
+        **options,
+    )
+    block = sim.block(0)
+
+    # Shape: the polarization axis survives `contribution`'s `squeeze_pol`
+    # (a no-op for n_pol=2) all the way through `add_offset_carrier`.
+    assert block.pol_data.shape == (sim.n_antennas, 2, sim.n_chan, block.n_time)
+
+    # A fully linearly polarized source shares one waveform realization
+    # between receptors (see `resolve_polarization`), scaled only by the
+    # Jones vector's real components (cos a, sin a) here -- so the power
+    # ratio between receptors is exactly cos^2(a) / sin^2(a), independent
+    # of which channels the leaked power lands in.
+    power_per_pol = np.mean(np.abs(block.pol_data.astype(np.complex128)) ** 2, axis=(0, 2, 3))
+    measured_ratio = power_per_pol[0] / power_per_pol[1]
+    expected_ratio = np.cos(np.deg2rad(angle_deg)) ** 2 / np.sin(np.deg2rad(angle_deg)) ** 2
+    assert measured_ratio == pytest.approx(expected_ratio, rel=1e-3)
+
+    # The occupancy mask has no polarization axis and must still show the
+    # carrier leaking into both channels it straddles.
+    occupied = block.rfi_mask[0].any(axis=1)
+    assert occupied[target] and occupied[target + 1]
 
 
 # ----------------------------------------------------------------------

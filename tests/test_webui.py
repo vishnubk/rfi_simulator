@@ -596,6 +596,80 @@ def test_calibration_errors_rejects_a_negative_rms(client):
     assert response.status_code == 422
 
 
+def test_instrument_and_calibration_errors_do_not_share_a_random_draw(client):
+    """The gain-scatter and calibration-phase draws must be independent, not the same vector.
+
+    Regression test for a same-seed collision: `InstrumentModel.from_params`
+    and `CalibrationErrors.from_params` each spawn children from
+    `SeedSequence(seed)` in a fixed order, and `SeedSequence.spawn`'s first
+    child depends only on the seed -- so handing both models the same raw
+    `sim.seed` used to make the per-antenna gain scatter (dB) and the
+    per-antenna phase error draw the exact same standard-normal vector,
+    just rescaled. With enough antennas that would show up as a
+    near-perfect correlation between the two, standardized, vectors;
+    `build_simulator`/`run_simulation` now derive independent children
+    instead (see `_feature_seed_sequences`), so the correlation must not be
+    extreme in either direction.
+    """
+    n_antennas = MAX_ANTENNAS
+    rng = np.random.default_rng(0)
+    positions = [
+        [east, north, 0.0]
+        for east, north in rng.uniform(-200.0, 200.0, size=(n_antennas, 2)).tolist()
+    ]
+
+    body = make_request()
+    body["antennas"] = positions
+    body["instrument"] = {"gain_scatter_db": 3.0}
+    body["calibration_errors"] = {"phase_error_deg_rms": 20.0}
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 200, response.text
+
+    from rfi_simulator.webui.simulate import (
+        CalibrationErrorParams,
+        InstrumentParams,
+        _feature_seed_sequences,
+    )
+
+    seed = body["sim"]["seed"]
+    instrument_seq, calibration_seq = _feature_seed_sequences(seed)
+    instrument = InstrumentParams(gain_scatter_db=3.0).build(
+        n_antennas, np.random.default_rng(instrument_seq)
+    )
+    calibration = CalibrationErrorParams(phase_error_deg_rms=20.0).build(
+        n_antennas, np.random.default_rng(calibration_seq)
+    )
+
+    gain_db = 20.0 * np.log10(np.abs(instrument.scalar_gains))
+    phase_rad = calibration.phase_error_rad
+
+    gain_z = (gain_db - gain_db.mean()) / gain_db.std()
+    phase_z = (phase_rad - phase_rad.mean()) / phase_rad.std()
+    correlation = float(np.corrcoef(gain_z, phase_z)[0, 1])
+    # Before the fix this was exactly +/-1.0 (the same underlying draw,
+    # just rescaled by different loc/scale arguments); after it, two
+    # independent normal draws of 40 samples correlate weakly at worst.
+    assert abs(correlation) < 0.5, f"gain scatter and phase error correlate at {correlation}"
+
+
+def test_the_same_seed_reproduces_the_full_response_with_every_realism_feature_on(client):
+    """Reproducibility must survive deriving independent per-feature seeds."""
+    body = make_request()
+    body["instrument"] = {"gain_scatter_db": 2.0, "phase_offsets": "uniform"}
+    body["calibration_errors"] = {"phase_error_deg_rms": 15.0, "delay_error_ns_rms": 1.0}
+    body["sim"]["seed"] = 999
+
+    first = client.post("/api/simulate", json=body)
+    second = client.post("/api/simulate", json=body)
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    first_payload, second_payload = first.json(), second.json()
+    # `wall_time_s` is a measurement, not a draw from the seed, and is
+    # never expected to repeat exactly; everything else must.
+    del first_payload["wall_time_s"], second_payload["wall_time_s"]
+    assert first_payload == second_payload
+
+
 def test_primary_beam_attenuates_an_offset_source(client):
     """A source away from the pointing centre must lose flux under a beam."""
     off = client.post("/api/simulate", json=make_request()).json()
@@ -702,6 +776,43 @@ def test_an_explicit_coupling_vector_must_match_the_antenna_count(client):
     body = make_request([{"type": "tower", "coupling": [1.0, 1.0]}])  # array has more antennas
     response = client.post("/api/simulate", json=body)
     assert response.status_code == 422
+
+
+def test_a_non_finite_explicit_coupling_vector_is_refused(client):
+    """An explicit coupling vector is only reachable via the API, but must still be checked.
+
+    Sent as raw text, same reason as `test_a_non_finite_antenna_position_is_refused`:
+    ``NaN`` is not valid JSON, but a hand-built request can still contain it.
+    """
+    n_antennas = len(default_array().antenna_positions_enu_m)
+    body = make_request([{"type": "tower", "coupling": [float("nan")] * n_antennas}])
+    response = client.post(
+        "/api/simulate",
+        content=json.dumps(body),
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert "finite" in response.text
+
+
+@pytest.mark.parametrize("field", ["jones_re", "jones_im"])
+def test_a_non_finite_full_polarization_jones_component_is_refused(client, field):
+    body = make_request(
+        [
+            {
+                "type": "tower",
+                "polarization": {"type": "full", "jones_re": [1.0, 0.0], "jones_im": [0.0, 0.0]},
+            }
+        ]
+    )
+    body["rfi_sources"][0]["polarization"][field] = [float("nan"), 0.0]
+    response = client.post(
+        "/api/simulate",
+        content=json.dumps(body),
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert "finite" in response.text
 
 
 def test_a_periodic_envelope_replaces_the_duty_cycle(client):
