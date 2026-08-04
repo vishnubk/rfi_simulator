@@ -27,11 +27,9 @@ of that: with no channelizer attached, the simulator produces exactly the
 bytes it always did.
 """
 
-import hashlib
-
 import numpy as np
 import pytest
-from conftest import zenith_phase_center
+from conftest import assert_bit_reference, zenith_phase_center
 
 from rfi_simulator import (
     OCCUPANCY_THRESHOLD,
@@ -131,14 +129,27 @@ def reference_simulator(array, start_time, **kwargs):
 
 
 def test_no_channelizer_reproduces_the_recorded_bytes(default_array, start_time):
-    """The default path is bit-for-bit what it was before the model existed."""
-    sim = reference_simulator(default_array, start_time)
-    assert sim.channelizer is None
-    for index, expected in enumerate(REFERENCE_DIGESTS):
-        data = np.ascontiguousarray(sim.block(index).data)
-        assert hashlib.sha256(data.tobytes()).hexdigest() == expected, (
-            f"block {index} changed; the perfect-channelizer output is a contract"
-        )
+    """The default path is bit-for-bit what it was before the model existed.
+
+    On the platform the reference digests were recorded on, this checks
+    the literal bytes; elsewhere (transcendentals and FFTs are not
+    bit-stable across numpy builds/BLAS/SIMD), it falls back to a
+    portable-but-still-meaningful pair of checks: the scene is
+    deterministic, and an explicit ``channelizer=None`` -- the alternative
+    spelling of "no channelizer" -- produces the same bytes as omitting
+    the keyword.
+    """
+
+    def build():
+        sim = reference_simulator(default_array, start_time)
+        assert sim.channelizer is None
+        return [sim.block(index).data for index in range(len(REFERENCE_DIGESTS))]
+
+    def build_explicit_none():
+        sim = reference_simulator(default_array, start_time, channelizer=None)
+        return [sim.block(index).data for index in range(len(REFERENCE_DIGESTS))]
+
+    assert_bit_reference(build, REFERENCE_DIGESTS, alt_rebuild=build_explicit_none)
 
 
 def test_no_channelizer_leaves_the_block_untouched(default_array, start_time):

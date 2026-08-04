@@ -7,11 +7,9 @@ acceptance test: an off-centre source's *recovered image flux* must equal
 its catalog flux times the beam's power response at that offset.
 """
 
-import hashlib
-
 import numpy as np
 import pytest
-from conftest import zenith_phase_center
+from conftest import assert_bit_reference, zenith_phase_center
 from test_channelizer import REFERENCE_DIGESTS
 from test_channelizer import reference_simulator as channelizer_reference_simulator
 
@@ -182,12 +180,22 @@ def test_no_primary_beam_reproduces_the_channelizer_reference_bytes(default_arra
     `VoltageSimulator.__init__` perturbed anything about the existing
     synthesis path, this would fail exactly like the channelizer test it
     reuses.
+
+    See `assert_bit_reference` for why this is strict only on the platform
+    the reference digests were recorded on, and falls back to a
+    determinism + alternative-spelling check elsewhere.
     """
-    sim = channelizer_reference_simulator(default_array, start_time)
-    assert sim.primary_beam is None
-    for index, expected in enumerate(REFERENCE_DIGESTS):
-        data = np.ascontiguousarray(sim.block(index).data)
-        assert hashlib.sha256(data.tobytes()).hexdigest() == expected
+
+    def build():
+        sim = channelizer_reference_simulator(default_array, start_time)
+        assert sim.primary_beam is None
+        return [sim.block(index).data for index in range(len(REFERENCE_DIGESTS))]
+
+    def build_explicit_none():
+        sim = channelizer_reference_simulator(default_array, start_time, primary_beam=None)
+        return [sim.block(index).data for index in range(len(REFERENCE_DIGESTS))]
+
+    assert_bit_reference(build, REFERENCE_DIGESTS, alt_rebuild=build_explicit_none)
 
 
 def test_no_primary_beam_leaves_beam_response_none(default_array, start_time):
