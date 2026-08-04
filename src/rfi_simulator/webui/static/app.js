@@ -89,10 +89,13 @@
     antennas: [],
     skySources: [],
     rfiSources: [],
+    spectralLines: [],
     sim: {},
+    realism: {},
     result: null,
     running: false,
     waterfallAntenna: 0,
+    waterfallPol: 0,
     maskVisible: [],
     hatch: false,
     notices: [],
@@ -532,6 +535,176 @@
     })[0];
   }
 
+  // A spectral line is ground truth labelled "celestial", not "rfi" (see
+  // rfi_simulator.sky.SpectralLineForeground); its card follows the same
+  // pattern as a sky source's, just with its own field list and colour.
+  function renderLineCards() {
+    var host = $("line-cards");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    $("line-empty").hidden = state.spectralLines.length > 0;
+
+    state.spectralLines.forEach(function (source, index) {
+      var card = el("div", "card");
+      var head = el("div", "card-head");
+      var swatch = el("span", "card-swatch");
+      swatch.style.background = SKY_MARKER;
+      head.appendChild(swatch);
+      head.appendChild(el("span", "card-kind", "Spectral line"));
+      var name = el("input", "input card-name");
+      name.value = source.name;
+      name.setAttribute("aria-label", "Spectral line name");
+      name.addEventListener("change", function () { source.name = name.value; });
+      head.appendChild(name);
+      var remove = el("button", "card-remove", "×");
+      remove.type = "button";
+      remove.setAttribute("aria-label", "Remove this spectral line");
+      remove.addEventListener("click", function () {
+        state.spectralLines.splice(index, 1);
+        renderLineCards();
+      });
+      head.appendChild(remove);
+      card.appendChild(head);
+
+      var body = el("div", "card-body");
+      var grid = el("div", "field-grid");
+      state.defaults.spectral_line.fields.forEach(function (descriptor) {
+        grid.appendChild(buildField(descriptor, source));
+      });
+      body.appendChild(grid);
+      card.appendChild(body);
+      host.appendChild(card);
+    });
+  }
+
+  function newSpectralLine() {
+    var values = Object.assign({}, state.defaults.spectral_line.defaults);
+    values.name = "hi_line " + (state.spectralLines.length + 1);
+    return values;
+  }
+
+  // A handful of nested-object request fields (`coupling`, `polarization`,
+  // `envelope`, `arrival`) have no scalar field of their own to describe
+  // with a `buildField` descriptor -- see simulate.py's comment on
+  // `_WAVEFORM_FIELD`. This builds a small row of hand-written controls
+  // for them instead, writing straight into the source object; `run()`'s
+  // request serialization already forwards every property a source has,
+  // so nothing else has to change to send what this writes.
+  function extraNumber(value, step, min, max, title) {
+    var input = el("input", "input input-small");
+    input.type = "number";
+    input.step = step;
+    input.min = min;
+    input.max = max;
+    input.title = title;
+    input.value = value;
+    return input;
+  }
+
+  function extraToggle(text, checked) {
+    var label = el("label", "checkline");
+    var box = el("input");
+    box.type = "checkbox";
+    box.checked = checked;
+    label.appendChild(box);
+    label.appendChild(document.createTextNode(" " + text));
+    return { label: label, box: box };
+  }
+
+  function buildRfiExtras(source) {
+    var row = el("div", "card-extras");
+
+    var coupling = extraToggle("coupling scatter", Boolean(source.coupling));
+    var couplingSigma = extraNumber(
+      source.coupling ? source.coupling.sigma_db : 3.0, 0.5, 0, 60,
+      "Per-antenna lognormal coupling scatter, dB"
+    );
+    couplingSigma.hidden = !source.coupling;
+    function syncCoupling() {
+      source.coupling = coupling.box.checked
+        ? { type: "lognormal", sigma_db: parseFloat(couplingSigma.value) || 0, seed: Math.round(state.sim.seed) }
+        : null;
+      couplingSigma.hidden = !coupling.box.checked;
+    }
+    coupling.box.addEventListener("change", syncCoupling);
+    couplingSigma.addEventListener("change", syncCoupling);
+    row.appendChild(coupling.label);
+    row.appendChild(couplingSigma);
+
+    var polarized = extraToggle("polarized", Boolean(source.polarization));
+    var polAngle = extraNumber(
+      source.polarization ? source.polarization.angle_deg : 45.0, 1, -360, 360,
+      "Linear polarization angle, degrees, first receptor towards the second"
+    );
+    polAngle.hidden = !source.polarization;
+    function syncPolarization() {
+      source.polarization = polarized.box.checked
+        ? { type: "linear", angle_deg: parseFloat(polAngle.value) || 0 }
+        : null;
+      polAngle.hidden = !polarized.box.checked;
+    }
+    polarized.box.addEventListener("change", syncPolarization);
+    polAngle.addEventListener("change", syncPolarization);
+    row.appendChild(polarized.label);
+    row.appendChild(polAngle);
+
+    if (source.type === "tower" || source.type === "comb") {
+      var envelope = extraToggle("clocked on/off", Boolean(source.envelope));
+      var envPeriod = extraNumber(
+        source.envelope ? source.envelope.period_s * 1000 : 20.0, 1, 0.1, 1e5, "Envelope period, ms"
+      );
+      var envDuty = extraNumber(
+        source.envelope ? source.envelope.duty : 0.5, 0.05, 0, 1, "Envelope duty (on-fraction)"
+      );
+      envPeriod.hidden = envDuty.hidden = !source.envelope;
+      function syncEnvelope() {
+        source.envelope = envelope.box.checked
+          ? {
+            type: "periodic",
+            period_s: (parseFloat(envPeriod.value) || 20.0) / 1000,
+            duty: parseFloat(envDuty.value) || 0.5
+          }
+          : null;
+        envPeriod.hidden = envDuty.hidden = !envelope.box.checked;
+      }
+      envelope.box.addEventListener("change", syncEnvelope);
+      envPeriod.addEventListener("change", syncEnvelope);
+      envDuty.addEventListener("change", syncEnvelope);
+      row.appendChild(envelope.label);
+      row.appendChild(envPeriod);
+      row.appendChild(envDuty);
+    }
+
+    if (source.type === "impulsive") {
+      var periodic = typeof source.arrival === "object" && source.arrival !== null;
+      var arrival = extraToggle("periodic arrivals (not Poisson)", periodic);
+      var arrRate = extraNumber(
+        periodic ? source.arrival.rate_hz : 100.0, 10, 0, 1e5, "Arrival rate, events/s"
+      );
+      var arrJitter = extraNumber(
+        periodic ? source.arrival.jitter_s * 1000 : 0.5, 0.1, 0, 1e4, "Arrival jitter, ms"
+      );
+      arrRate.hidden = arrJitter.hidden = !periodic;
+      function syncArrival() {
+        source.arrival = arrival.box.checked
+          ? {
+            type: "periodic",
+            rate_hz: parseFloat(arrRate.value) || 100.0,
+            jitter_s: (parseFloat(arrJitter.value) || 0) / 1000
+          }
+          : "poisson";
+        arrRate.hidden = arrJitter.hidden = !arrival.box.checked;
+      }
+      arrival.box.addEventListener("change", syncArrival);
+      arrRate.addEventListener("change", syncArrival);
+      arrJitter.addEventListener("change", syncArrival);
+      row.appendChild(arrival.label);
+      row.appendChild(arrRate);
+      row.appendChild(arrJitter);
+    }
+
+    return row;
+  }
+
   function renderRfiCards() {
     var host = $("rfi-cards");
     while (host.firstChild) { host.removeChild(host.firstChild); }
@@ -573,6 +746,7 @@
       });
       body.appendChild(grid);
       card.appendChild(body);
+      card.appendChild(buildRfiExtras(source));
       host.appendChild(card);
     });
   }
@@ -623,6 +797,80 @@
       + sim.start_time_utc + " UTC";
   }
 
+  // The realism panel's fields have no server-side schema of their own
+  // (see simulate.py -- these groups are Optional request fields, on only
+  // when their `*_enabled` toggle is checked): the list below is this
+  // file's own field descriptors, the same pattern `renderSimFields`
+  // already uses for the observation fields. Each entry's `section` opens
+  // a new labelled subgroup within the one field-grid.
+  var REALISM_FIELDS = [
+    { name: "n_pol", label: "Polarizations", kind: "choice", default: "1",
+      options: [{ value: "1", label: "1 (single)" }, { value: "2", label: "2 (dual, XX/YY)" }],
+      section: "Polarization" },
+
+    { name: "instrument_enabled", label: "Per-antenna gain/bandpass realism", kind: "toggle",
+      default: false, section: "Instrument" },
+    { name: "gain_scatter_db", label: "Gain scatter", kind: "number", unit: "dB", factor: 1,
+      min: 0, max: 10, step: 0.05, default: 0.4 },
+    { name: "phase_offsets", label: "Phase offsets", kind: "choice", default: "zero",
+      options: [{ value: "zero", label: "zero (calibrated)" }, { value: "uniform", label: "uniform (uncalibrated)" }] },
+    { name: "bandpass_ripple_db", label: "Bandpass ripple", kind: "number", unit: "dB", factor: 1,
+      min: 0, max: 5, step: 0.01, default: 0.05 },
+    { name: "band_slope_db", label: "Band slope", kind: "number", unit: "dB", factor: 1,
+      min: 0, max: 10, step: 0.05, default: 0.0 },
+    { name: "subband_scatter_db", label: "Subband scatter", kind: "number", unit: "dB", factor: 1,
+      min: 0, max: 10, step: 0.05, default: 0.0 },
+    { name: "n_subbands", label: "Subbands", kind: "number", factor: 1,
+      min: 1, max: 64, step: 1, default: 1 },
+
+    { name: "quantization_enabled", label: "4-bit quantization (int4)", kind: "toggle",
+      default: false, section: "Quantization" },
+    { name: "quant_target_counts", label: "Target rms", kind: "number", unit: "counts", factor: 1,
+      min: 0.1, max: 20, step: 0.01, default: 1.33 },
+
+    { name: "channelizer_enabled", label: "Polyphase filterbank channelizer", kind: "toggle",
+      default: false, section: "Channelizer" },
+    { name: "n_taps", label: "Taps", kind: "number", factor: 1, min: 1, max: 32, step: 1, default: 4 },
+    { name: "window", label: "Window", kind: "choice", default: "hamming",
+      options: [{ value: "hann", label: "hann" }, { value: "hamming", label: "hamming" },
+        { value: "blackman", label: "blackman" }] },
+    { name: "sinc_bandwidth", label: "Sinc bandwidth", kind: "number", factor: 1,
+      min: 0.1, max: 8, step: 0.01, default: 1.025 },
+
+    { name: "calibration_enabled", label: "Residual calibration errors", kind: "toggle",
+      default: false, section: "Calibration errors" },
+    { name: "phase_error_deg_rms", label: "Phase error", kind: "number", unit: "deg", factor: 1,
+      min: 0, max: 180, step: 0.5, default: 5.0 },
+    { name: "delay_error_ns_rms", label: "Delay error", kind: "number", unit: "ns", factor: 1,
+      min: 0, max: 1000, step: 0.5, default: 0.0 },
+    { name: "amplitude_error_db_rms", label: "Amplitude error", kind: "number", unit: "dB", factor: 1,
+      min: 0, max: 10, step: 0.05, default: 0.0 },
+
+    { name: "beam_enabled", label: "Primary beam attenuation", kind: "toggle",
+      default: false, section: "Primary beam" },
+    { name: "beam_type", label: "Beam shape", kind: "choice", default: "gaussian",
+      options: [{ value: "gaussian", label: "Gaussian" }, { value: "airy", label: "Airy" }] },
+    { name: "dish_diameter_m", label: "Dish diameter", kind: "number", unit: "m", factor: 1,
+      min: 0.1, max: 1000, step: 0.1, default: 4.5 }
+  ];
+
+  function renderRealismFields() {
+    var host = $("realism-fields");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    REALISM_FIELDS.forEach(function (descriptor) {
+      if (descriptor.section) {
+        host.appendChild(el("div", "subgroup-label", descriptor.section));
+      }
+      host.appendChild(buildField(descriptor, state.realism));
+    });
+  }
+
+  function defaultRealism() {
+    var values = {};
+    REALISM_FIELDS.forEach(function (descriptor) { values[descriptor.name] = descriptor.default; });
+    return values;
+  }
+
   function newSkySource() {
     var values = Object.assign({}, state.defaults.sky_source.defaults);
     values.name = "source " + (state.skySources.length + 1);
@@ -637,6 +885,12 @@
       return source.type === typeName;
     }).length;
     if (same > 0) { values.name += " " + (same + 1); }
+    // Extras with no scalar field of their own (see buildRfiExtras): off
+    // by default, exactly as the library's own defaults are.
+    values.coupling = null;
+    values.polarization = null;
+    if (typeName === "tower" || typeName === "comb") { values.envelope = null; }
+    if (typeName === "impulsive") { values.arrival = "poisson"; }
     return values;
   }
 
@@ -660,6 +914,7 @@
   }
 
   function buildRequest() {
+    var realism = state.realism;
     return {
       antennas: state.antennas.map(function (antenna) {
         return [antenna[0], antenna[1], antenna[2] || 0];
@@ -675,13 +930,47 @@
         });
         return payload;
       }),
+      spectral_lines: state.spectralLines.map(function (source) {
+        return {
+          name: source.name,
+          center_freq_hz: source.center_freq_hz,
+          fwhm_hz: source.fwhm_hz,
+          line_flux_jy: source.line_flux_jy
+        };
+      }),
       sim: {
         n_chan: Math.round(state.sim.n_chan),
         n_blocks: Math.round(state.sim.n_blocks),
         center_freq_hz: state.sim.center_freq_hz,
         noise_std: state.sim.noise_std,
         seed: Math.round(state.sim.seed)
-      }
+      },
+      n_pol: Number(realism.n_pol) === 2 ? 2 : 1,
+      instrument: realism.instrument_enabled ? {
+        gain_scatter_db: realism.gain_scatter_db,
+        phase_offsets: realism.phase_offsets,
+        bandpass_ripple_db: realism.bandpass_ripple_db,
+        band_slope_db: realism.band_slope_db,
+        subband_scatter_db: realism.subband_scatter_db,
+        n_subbands: Math.round(realism.n_subbands)
+      } : null,
+      calibration_errors: realism.calibration_enabled ? {
+        phase_error_deg_rms: realism.phase_error_deg_rms,
+        delay_error_ns_rms: realism.delay_error_ns_rms,
+        amplitude_error_db_rms: realism.amplitude_error_db_rms
+      } : null,
+      channelizer: realism.channelizer_enabled ? {
+        n_taps: Math.round(realism.n_taps),
+        window: realism.window,
+        sinc_bandwidth: realism.sinc_bandwidth
+      } : null,
+      primary_beam: realism.beam_enabled ? {
+        type: realism.beam_type,
+        dish_diameter_m: realism.dish_diameter_m
+      } : null,
+      quantization: realism.quantization_enabled ? {
+        quant_target_counts: realism.quant_target_counts
+      } : null
     };
   }
 
@@ -694,7 +983,7 @@
     $("run-status").textContent = "running…";
     $("waterfall-sweep").hidden = state.result === null;
 
-    request("/api/simulate", {
+    request("/api/simulate?pol=" + state.waterfallPol, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(buildRequest())
@@ -704,6 +993,9 @@
       state.waterfallAntenna = clamp(
         state.waterfallAntenna, 0, result.waterfall.antennas.length - 1
       );
+      var dualPol = result.observation.n_pol === 2;
+      $("waterfall-pol").hidden = !dualPol;
+      $("waterfall-pol-label").hidden = !dualPol;
       result.warnings.forEach(function (message) { showNotice("note", message); });
       $("run-status").textContent =
         "done in " + fmt(result.wall_time_s, 2) + " s";
@@ -1209,11 +1501,29 @@
       renderSkyCards();
     });
 
+    $("add-line").addEventListener("click", function () {
+      if (state.spectralLines.length >= state.defaults.limits.max_spectral_lines) {
+        showNotice("error", "That is the most spectral lines one run takes ("
+          + state.defaults.limits.max_spectral_lines + ").");
+        return;
+      }
+      state.spectralLines.push(newSpectralLine());
+      renderLineCards();
+    });
+
     $("run").addEventListener("click", run);
 
     $("waterfall-antenna").addEventListener("change", function (event) {
       state.waterfallAntenna = Number(event.target.value);
       renderWaterfall();
+    });
+
+    // Which receptor the waterfall shows is a server-side reduction (see
+    // simulate.py's `pol` query param), not a client-side redraw, so
+    // changing it re-runs the observation rather than just repainting.
+    $("waterfall-pol").addEventListener("change", function (event) {
+      state.waterfallPol = Number(event.target.value);
+      run();
     });
 
     $("hatch-toggle").addEventListener("change", function (event) {
@@ -1248,6 +1558,8 @@
       };
       state.skySources = [newSkySource()];
       state.rfiSources = [];
+      state.spectralLines = [];
+      state.realism = defaultRealism();
 
       renderSiteMeta();
       bindSitePlan();
@@ -1255,7 +1567,9 @@
       renderSitePlan();
       renderSkyCards();
       renderRfiCards();
+      renderLineCards();
       renderSimFields();
+      renderRealismFields();
       renderMaskToggles();
       run();
     }).catch(function (error) {

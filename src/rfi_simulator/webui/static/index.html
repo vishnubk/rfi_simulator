@@ -92,10 +92,26 @@
 
       <div class="group">
         <div class="group-head">
+          <h3 class="group-title">Spectral lines (celestial, not RFI)</h3>
+          <button type="button" class="button button-small" id="add-line">Add line</button>
+        </div>
+        <div id="line-cards" class="card-stack"></div>
+        <p class="empty-note" id="line-empty" hidden>No spectral lines in this run.</p>
+      </div>
+
+      <div class="group">
+        <div class="group-head">
           <h3 class="group-title">Observation</h3>
         </div>
         <div class="field-grid" id="sim-fields"></div>
         <p class="hint mono" id="sim-summary"></p>
+      </div>
+
+      <div class="group">
+        <details id="realism-details">
+          <summary class="group-title">Instrument &amp; realism</summary>
+          <div class="field-grid realism-grid" id="realism-fields"></div>
+        </details>
       </div>
     </div>
 
@@ -124,6 +140,12 @@
         <div class="display-controls">
           <label class="field-label" for="waterfall-antenna">Antenna</label>
           <select id="waterfall-antenna" class="input input-dark input-small"></select>
+          <span class="control-sep" aria-hidden="true"></span>
+          <label class="field-label" for="waterfall-pol" id="waterfall-pol-label" hidden>Pol</label>
+          <select id="waterfall-pol" class="input input-dark input-small" hidden>
+            <option value="0">0</option>
+            <option value="1">1</option>
+          </select>
           <span class="control-sep" aria-hidden="true"></span>
           <span class="field-label">Ground truth</span>
           <div class="mask-toggles" id="mask-toggles"></div>

@@ -50,6 +50,7 @@ RFI_SOURCE_CASES = {
     "impulsive": {"type": "impulsive"},
     "satellite": {"type": "satellite"},
     "aircraft": {"type": "aircraft"},
+    "comb": {"type": "comb"},
 }
 
 
@@ -476,3 +477,290 @@ def test_the_defaults_payload_is_importable_without_http():
     payload = defaults_payload()
     assert payload["sim"]["n_chan"] >= 4
     assert payload["array"]["antennas"]
+
+
+# ----------------------------------------------------------------------
+# Realism features added since the UI was built: instrument, quantization,
+# channelizer, dual polarization, calibration errors, primary beam, and the
+# per-source coupling/polarization/envelope/arrival/comb extras. Each group
+# gets an on/off round trip (on must differ from off, both must be 200) and
+# a bad-value case (422/400, never a 500 traceback); one request turns
+# everything on at once.
+# ----------------------------------------------------------------------
+def test_instrument_realism_changes_the_result(client):
+    """A gain-scattered, uncalibrated array must not image like an ideal one."""
+    off = client.post("/api/simulate", json=make_request()).json()
+    body = make_request()
+    body["instrument"] = {"gain_scatter_db": 3.0, "phase_offsets": "uniform"}
+    on = client.post("/api/simulate", json=body)
+    assert on.status_code == 200, on.text
+    on = on.json()
+    assert on["image"]["peak"]["value_jy"] != off["image"]["peak"]["value_jy"]
+
+
+def test_instrument_rejects_a_negative_scatter(client):
+    """A library `ValueError` (or pydantic's own bound) reaches the user, not a crash."""
+    body = make_request()
+    body["instrument"] = {"gain_scatter_db": -1.0}
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 422
+
+
+def test_quantization_changes_the_result(client):
+    """4-bit quantization must leave a visible trace in the waterfall."""
+    off = client.post("/api/simulate", json=make_request()).json()
+    body = make_request()
+    body["quantization"] = {"quant_target_counts": 1.33}
+    on = client.post("/api/simulate", json=body)
+    assert on.status_code == 200, on.text
+    on = on.json()
+    assert on["waterfall"]["antennas"] != off["waterfall"]["antennas"]
+
+
+def test_quantization_rejects_a_non_positive_scale(client):
+    body = make_request()
+    body["quantization"] = {"quant_scale": 0.0}
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 422
+
+
+def test_channelizer_changes_the_result(client):
+    """A polyphase filterbank must colour the waterfall differently from the ideal one."""
+    off = client.post("/api/simulate", json=make_request()).json()
+    body = make_request()
+    body["channelizer"] = {"n_taps": 8, "window": "blackman", "sinc_bandwidth": 1.1}
+    on = client.post("/api/simulate", json=body)
+    assert on.status_code == 200, on.text
+    on = on.json()
+    assert on["waterfall"]["antennas"] != off["waterfall"]["antennas"]
+
+
+def test_channelizer_rejects_an_unknown_window(client):
+    body = make_request()
+    body["channelizer"] = {"window": "rectangular"}
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 422
+
+
+def test_dual_polarization_reports_both_receptors(client):
+    """n_pol=2 must show up in the observation summary, not silently collapse to 1."""
+    body = make_request()
+    body["n_pol"] = 2
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["observation"]["n_pol"] == 2
+    assert result["observation"]["pol_names"] == ["XX", "YY"]
+
+
+def test_the_pol_query_param_selects_the_waterfall_receptor(client):
+    """The two receptors of a polarized source must not draw identically."""
+    body = make_request(
+        [
+            {
+                "type": "tower",
+                "polarization": {"type": "linear", "angle_deg": 15.0},
+            }
+        ]
+    )
+    body["n_pol"] = 2
+    pol0 = client.post("/api/simulate?pol=0", json=body).json()
+    pol1 = client.post("/api/simulate?pol=1", json=body).json()
+    assert pol0["observation"]["waterfall_pol"] == 0
+    assert pol1["observation"]["waterfall_pol"] == 1
+    assert pol0["waterfall"]["antennas"] != pol1["waterfall"]["antennas"]
+
+
+def test_n_pol_rejects_an_unsupported_value(client):
+    body = make_request()
+    body["n_pol"] = 3
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 422
+
+
+def test_calibration_errors_reduce_the_imaged_flux(client):
+    """A residual phase error must lose coherence, not silently do nothing."""
+    off = client.post("/api/simulate", json=make_request()).json()
+    body = make_request()
+    body["calibration_errors"] = {"phase_error_deg_rms": 25.0}
+    on = client.post("/api/simulate", json=body)
+    assert on.status_code == 200, on.text
+    on = on.json()
+    assert on["image"]["peak"]["value_jy"] < off["image"]["peak"]["value_jy"]
+
+
+def test_calibration_errors_rejects_a_negative_rms(client):
+    body = make_request()
+    body["calibration_errors"] = {"delay_error_ns_rms": -1.0}
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 422
+
+
+def test_primary_beam_attenuates_an_offset_source(client):
+    """A source away from the pointing centre must lose flux under a beam."""
+    off = client.post("/api/simulate", json=make_request()).json()
+    body = make_request()
+    body["primary_beam"] = {"type": "gaussian", "dish_diameter_m": 4.5}
+    on = client.post("/api/simulate", json=body)
+    assert on.status_code == 200, on.text
+    on = on.json()
+    assert on["image"]["peak"]["value_jy"] < off["image"]["peak"]["value_jy"]
+
+
+def test_airy_beam_is_also_accepted(client):
+    body = make_request()
+    body["primary_beam"] = {"type": "airy", "dish_diameter_m": 4.5}
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 200, response.text
+
+
+def test_primary_beam_rejects_a_non_positive_dish(client):
+    body = make_request()
+    body["primary_beam"] = {"dish_diameter_m": 0.0}
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 422
+
+
+def test_a_spectral_line_is_labelled_celestial_not_rfi(client):
+    """A spectral line must occupy the band without being reported as an RFI source."""
+    off = client.post("/api/simulate", json=make_request()).json()
+    body = make_request()
+    body["spectral_lines"] = [
+        {"name": "hi", "center_freq_hz": 1405.0e6, "fwhm_hz": 2.0e4, "line_flux_jy": 50.0}
+    ]
+    on = client.post("/api/simulate", json=body)
+    assert on.status_code == 200, on.text
+    on = on.json()
+    assert on["sources"] == []  # the line is not an RFI source
+    assert on["waterfall"]["antennas"] != off["waterfall"]["antennas"]
+
+
+def test_a_spectral_line_rejects_a_non_positive_fwhm(client):
+    body = make_request()
+    body["spectral_lines"] = [{"fwhm_hz": 0.0}]
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 422
+
+
+def test_a_comb_transmitter_runs_and_reports_its_harmonics(client):
+    """The new source type must round-trip like every other one."""
+    body = make_request(
+        [
+            {
+                "type": "comb",
+                "fundamental_hz": 1.405e6,
+                "harmonic_numbers": [999, 1000, 1001],
+                "received_power_jy": 500.0,
+            }
+        ]
+    )
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert len(result["sources"]) == 1
+    assert result["sources"][0]["type"] == "comb"
+    assert result["sources"][0]["occupancy"] > 0.0
+
+
+def test_a_comb_transmitter_accepts_a_comma_separated_harmonics_string(client):
+    """The browser's text field sends a string; the API must parse it, not just a list."""
+    body = make_request(
+        [{"type": "comb", "fundamental_hz": 1.405e6, "harmonic_numbers": "999,1000,1001"}]
+    )
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 200, response.text
+
+
+def test_a_comb_transmitter_rejects_duplicate_harmonics(client):
+    body = make_request([{"type": "comb", "harmonic_numbers": [1, 1, 2]}])
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 422
+
+
+def test_impulsive_periodic_arrival_is_accepted(client):
+    """`arrival` replaces `rate_hz`; the library's own mutual exclusion still applies."""
+    body = make_request(
+        [{"type": "impulsive", "arrival": {"type": "periodic", "rate_hz": 50.0, "jitter_s": 1e-3}}]
+    )
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 200, response.text
+
+
+def test_coupling_and_polarization_extras_are_accepted_on_every_source_type(client):
+    """`coupling`/`polarization` are API-only extras -- every RFI type must accept them."""
+    extras = {
+        "coupling": {"type": "lognormal", "sigma_db": 6.0, "seed": 1},
+        "polarization": {"type": "linear", "angle_deg": 30.0},
+    }
+    for case, params in RFI_SOURCE_CASES.items():
+        body = make_request([dict(params, **extras)])
+        response = client.post("/api/simulate", json=body)
+        assert response.status_code == 200, f"{case}: {response.text}"
+
+
+def test_an_explicit_coupling_vector_must_match_the_antenna_count(client):
+    body = make_request([{"type": "tower", "coupling": [1.0, 1.0]}])  # array has more antennas
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 422
+
+
+def test_a_periodic_envelope_replaces_the_duty_cycle(client):
+    """Turning on the envelope must not collide with the (non-1.0) default duty cycle."""
+    body = make_request(
+        [
+            {
+                "type": "tower",
+                "envelope": {"type": "periodic", "period_s": 0.02, "duty": 0.5},
+            }
+        ]
+    )
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 200, response.text
+
+
+def test_everything_on_at_once_still_runs(client):
+    """The full combination of every new feature in one request must still succeed."""
+    body = make_request(
+        [
+            {
+                "type": "comb",
+                "fundamental_hz": 1.405e6,
+                "harmonic_numbers": [999, 1000, 1001],
+                "received_power_jy": 300.0,
+                "waveform": "constant_envelope",
+                "envelope": {"type": "periodic", "period_s": 0.02, "duty": 0.5},
+                "coupling": {"type": "lognormal", "sigma_db": 4.0, "seed": 2},
+                "polarization": {"type": "linear", "angle_deg": 10.0},
+            },
+            {
+                "type": "tower",
+                "coupling": [1.0] * len(default_array().antenna_positions_enu_m),
+            },
+        ]
+    )
+    body["spectral_lines"] = [
+        {"name": "hi", "center_freq_hz": 1405.0e6, "fwhm_hz": 2.0e4, "line_flux_jy": 5.0}
+    ]
+    body["n_pol"] = 2
+    body["instrument"] = {
+        "gain_scatter_db": 1.0,
+        "phase_offsets": "uniform",
+        "bandpass_ripple_db": 0.1,
+        "band_slope_db": 0.2,
+        "subband_scatter_db": 0.1,
+        "n_subbands": 4,
+    }
+    body["calibration_errors"] = {
+        "phase_error_deg_rms": 8.0,
+        "delay_error_ns_rms": 1.0,
+        "amplitude_error_db_rms": 0.3,
+    }
+    body["channelizer"] = {"n_taps": 8, "window": "blackman", "sinc_bandwidth": 1.1}
+    body["quantization"] = {"quant_target_counts": 2.0}
+    body["primary_beam"] = {"type": "airy", "dish_diameter_m": 4.5}
+
+    response = client.post("/api/simulate?pol=1", json=body)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["observation"]["n_pol"] == 2
+    assert len(result["sources"]) == 2

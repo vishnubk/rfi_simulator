@@ -21,7 +21,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -212,7 +212,10 @@ def create_app(host: str | None = None) -> FastAPI:
         return defaults_payload()
 
     @app.post("/api/simulate")
-    def post_simulate(request: SimulateRequest) -> Any:
+    def post_simulate(
+        request: SimulateRequest,
+        pol: int = Query(default=0, ge=0, le=1, description="Receptor the waterfall shows"),
+    ) -> Any:
         """Run one observation and return everything the page draws.
 
         A `ValueError` from the library -- a transmitter tuned outside the
@@ -223,10 +226,15 @@ def create_app(host: str | None = None) -> FastAPI:
         Runs queue behind `MAX_CONCURRENT_SIMULATIONS`: the request model
         bounds the memory of one run, and this is what keeps several
         arriving at once from multiplying that bound.
+
+        `pol` selects which receptor the waterfall display shows for a
+        dual-polarization run (``n_pol=2``); it is ignored (fixed to 0)
+        for a single-polarization one. The dirty image always images
+        Stokes I regardless of `pol` -- see `run_simulation`.
         """
         with _simulation_slots:
             try:
-                return run_simulation(request)
+                return run_simulation(request, pol=pol)
             except ValueError as exc:
                 return JSONResponse(
                     status_code=422,
