@@ -81,6 +81,7 @@ from rfi_simulator.rfi import (
     circular_normal,
     elevation_deg,
     enu_from_ecef_offset,
+    mix_polarizations,
     occupancy_mask,
     out_of_band_message,
 )
@@ -568,6 +569,10 @@ class SatelliteTransmitter(RFISource):
     coupling : None, array_like or mapping, optional
         Per-antenna linear amplitude coupling; see
         `rfi_simulator.rfi.resolve_coupling`. Default ``None`` (uniform).
+    polarization : None or mapping, optional
+        Polarization state of the emission; see
+        `rfi_simulator.rfi.resolve_polarization`. Default ``None``:
+        unpolarized, and ignored entirely by a single-polarization run.
     min_elevation_deg : float or astropy.units.Quantity, optional
         Elevation below which the satellite is treated as set: blocks
         whose mid-point elevation is under this contribute exactly zero
@@ -632,9 +637,10 @@ class SatelliteTransmitter(RFISource):
         apply_doppler: bool = True,
         min_elevation_deg=0.0,
         coupling=None,
+        polarization=None,
         name: str = "satellite",
     ) -> None:
-        super().__init__(name, coupling=coupling)
+        super().__init__(name, coupling=coupling, polarization=polarization)
         self.tle = tle if isinstance(tle, TwoLineElement) else TwoLineElement.from_string(tle)
         self.carrier_freq_hz = float(_to_value(carrier_freq_hz, u.Hz))
         self.received_power_jy = float(_to_value(received_power_jy, u.Jy))
@@ -741,8 +747,9 @@ class SatelliteTransmitter(RFISource):
         Returns
         -------
         voltages : numpy.ndarray
-            Complex64 ``(n_antennas, n_chan, n_time)`` contribution in
-            root-Jy.
+            Complex64 ``(n_antennas, n_chan, n_time)`` -- or
+            ``(n_antennas, n_pol, n_chan, n_time)`` when ``ctx.n_pol >
+            1`` -- contribution in root-Jy.
         mask : numpy.ndarray
             Boolean ``(n_chan, n_time)`` occupancy labels. Constant in
             time within a block, since the emission is continuous; it is
@@ -773,7 +780,7 @@ class SatelliteTransmitter(RFISource):
             # Below the horizon: the Earth is in the way. Silent, and
             # labelled silent -- not an error, and not a faint signal.
             return (
-                np.zeros((ctx.n_antennas, ctx.n_chan, ctx.n_time), dtype=np.complex64),
+                ctx.squeeze_pol(np.zeros(ctx.pol_shape(ctx.n_chan, ctx.n_time), np.complex64)),
                 np.zeros((ctx.n_chan, ctx.n_time), dtype=bool),
             )
 
@@ -810,18 +817,21 @@ class SatelliteTransmitter(RFISource):
             # Footprint misses every channel (e.g. Doppler pushed the carrier
             # into a gap at the band edge): silent, like the horizon cut.
             return (
-                np.zeros((ctx.n_antennas, ctx.n_chan, ctx.n_time), dtype=np.complex64),
+                ctx.squeeze_pol(np.zeros(ctx.pol_shape(ctx.n_chan, ctx.n_time), np.complex64)),
                 np.zeros((ctx.n_chan, ctx.n_time), dtype=bool),
             )
 
-        # One emitted waveform shared by every antenna, as for the sky.
-        waveform = circular_normal(ctx.rng, (n_occupied, ctx.n_time))
+        # One emitted waveform shared by every antenna, as for the sky; one
+        # realization per receptor only if the downlink is unpolarized.
+        mixing = self.pol_mixing(ctx.n_pol)
+        waveform = circular_normal(ctx.rng, (mixing.shape[1], n_occupied, ctx.n_time))
         waveform *= np.sqrt(envelope[occupied, 0]).astype(np.float32)[:, np.newaxis]
+        per_pol = mix_polarizations(mixing, waveform)  # (n_pol, n_occupied, n_time)
 
         phasors = self.coupled_phasors(
             position_enu_m, ctx.antenna_positions_enu_m, ctx.freq_hz[occupied]
         )
-        voltages = np.zeros((ctx.n_antennas, ctx.n_chan, ctx.n_time), dtype=np.complex64)
-        voltages[:, occupied, :] = phasors[:, :, np.newaxis] * waveform[np.newaxis, :, :]
+        voltages = np.zeros(ctx.pol_shape(ctx.n_chan, ctx.n_time), dtype=np.complex64)
+        voltages[:, :, occupied, :] = phasors[:, np.newaxis, :, np.newaxis] * per_pol[np.newaxis]
 
-        return voltages, occupancy_mask(envelope)
+        return ctx.squeeze_pol(voltages), occupancy_mask(envelope)

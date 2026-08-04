@@ -80,6 +80,31 @@ and `RFISource.coupling_amplitudes` is the ground truth for it.
 Coupling and the occupancy mask are deliberately **separate** ground
 truths; see the labelling convention below.
 
+Polarization
+------------
+A terrestrial transmitter emits in a definite polarization state: an
+antenna on a mast is a physical structure with an orientation, and the two
+receptors of a dual-polarization feed see its signal with a fixed
+amplitude ratio and a fixed relative phase. Sky and receiver noise have no
+such property -- they are unpolarized, i.e. statistically independent
+between the receptors. That asymmetry is one of the strongest
+discriminants a real flagging algorithm has, and it is the reason this
+package models polarization at all.
+
+Every source therefore accepts a ``polarization``: ``None`` (the default)
+for unpolarized, or a mapping describing a linear angle, an explicit Jones
+pair, or either of those at a partial polarization fraction.
+`resolve_polarization` turns it into the mixing matrix the synthesis uses,
+and `RFISource.polarization_amplitudes` is the ground truth for it,
+carried on blocks as
+`rfi_simulator.voltages.VoltageBlock.rfi_polarization`. Like the coupling,
+it is a separate ground truth from the occupancy mask, and for the same
+reason: the mask says *when and where* a transmitter was emitting, which
+does not depend on which receptor is listening, while the polarization
+amplitudes say *how loudly each receptor heard it*. The state is a no-op
+in a single-polarization run, where there is no second receptor to be
+asymmetric with respect to.
+
 Waveform statistics
 -------------------
 The default modulation here is band-limited Gaussian noise, which is right
@@ -182,12 +207,14 @@ from astropy.coordinates import EarthLocation
 from astropy.time import Time
 
 from rfi_simulator.array_config import ArrayConfig, _to_value
+from rfi_simulator.channelizer import PFBChannelizer, ideal_channel_weights
 from rfi_simulator.delays import SPEED_OF_LIGHT_M_S, earth_location, enu_unit_vector
 
 __all__ = [
     "COUPLING_TYPES",
     "MIN_SEPARATION_WAVELENGTHS",
     "OCCUPANCY_THRESHOLD",
+    "POLARIZATION_TYPES",
     "WAVEFORMS",
     "BlockContext",
     "CombTransmitter",
@@ -203,12 +230,15 @@ __all__ = [
     "enu_from_horizontal",
     "enu_rotation_matrix",
     "elevation_deg",
+    "mix_polarizations",
+    "mixing_amplitudes",
     "near_field_phasors",
     "occupancy_mask",
     "out_of_band_message",
     "path_delays_s",
     "path_lengths_m",
     "resolve_coupling",
+    "resolve_polarization",
     "spreading_amplitudes",
 ]
 
@@ -230,6 +260,10 @@ MIN_SEPARATION_WAVELENGTHS = 10.0
 """float: Transmitter-to-antenna separation, in wavelengths at the band
 center, below which `near_field_phasors` warns that the ``1/r`` amplitude
 model has stopped being meaningful."""
+
+POLARIZATION_TYPES = ("unpolarized", "linear", "full")
+"""tuple of str: Accepted ``type`` values of a polarization specification
+dictionary. See `resolve_polarization`."""
 
 
 def elevation_deg(position_enu_m) -> float:
@@ -608,6 +642,21 @@ class BlockContext:
     rng : numpy.random.Generator
         Generator for this ``(block, source)`` pair. Independent of the
         sky and receiver-noise streams, and of every other source.
+    channelizer : PFBChannelizer, optional
+        The filterbank the simulator will run the finished block through
+        (`rfi_simulator.channelizer`), or ``None`` (the default) for the
+        perfect-channelizer assumption. Sources emit into the *ideal*
+        channelized representation either way; the field is here so that a
+        source whose emission is not aligned to a channel center can spread
+        it correctly instead of snapping it -- see
+        `NarrowbandTransmitter`.
+    n_pol : int, optional
+        Number of receptors the block carries, 1 (the default) or 2. A
+        source must emit ``(n_antennas, n_chan, n_time)`` voltages when
+        this is 1 and ``(n_antennas, n_pol, n_chan, n_time)`` when it is
+        greater -- `pol_shape` and `squeeze_pol` build and unbuild that
+        shape, and `RFISource.pol_mixing` supplies the mixing matrix that
+        turns waveform realizations into per-receptor streams.
     """
 
     index: int
@@ -622,11 +671,55 @@ class BlockContext:
     phase_center_s_hat_enu: np.ndarray
     phase_center_delays_s: np.ndarray
     rng: np.random.Generator
+    channelizer: PFBChannelizer | None = None
+    n_pol: int = 1
+
+    def __post_init__(self) -> None:
+        self.n_pol = int(self.n_pol)
+        if self.n_pol not in (1, 2):
+            raise ValueError(f"n_pol must be 1 or 2, got {self.n_pol}")
 
     @property
     def n_antennas(self) -> int:
         """int: Number of antennas."""
         return self.antenna_positions_enu_m.shape[0]
+
+    def pol_shape(self, *trailing: int) -> tuple[int, ...]:
+        """Voltage-array shape with this block's polarization axis in place.
+
+        Parameters
+        ----------
+        *trailing : int
+            Axis lengths after the polarization axis, e.g.
+            ``ctx.n_chan, ctx.n_time``.
+
+        Returns
+        -------
+        tuple of int
+            ``(n_antennas, n_pol, *trailing)``. Sources always allocate
+            with the polarization axis present and drop it on the way out
+            with `squeeze_pol`, so there is one code path rather than two.
+        """
+        return (self.n_antennas, self.n_pol, *trailing)
+
+    def squeeze_pol(self, voltages: np.ndarray) -> np.ndarray:
+        """Drop a length-one polarization axis from a source's voltages.
+
+        Parameters
+        ----------
+        voltages : numpy.ndarray
+            Array of shape ``(n_antennas, n_pol, ...)``.
+
+        Returns
+        -------
+        numpy.ndarray
+            A view without the polarization axis when ``n_pol == 1``,
+            which is the shape a single-polarization block expects, and
+            `voltages` itself otherwise.
+        """
+        if self.n_pol == 1:
+            return voltages.reshape((voltages.shape[0], *voltages.shape[2:]))
+        return voltages
 
     @property
     def n_chan(self) -> int:
@@ -669,6 +762,8 @@ class BlockContext:
             phase_center_s_hat_enu=self.phase_center_s_hat_enu,
             phase_center_delays_s=self.phase_center_delays_s,
             rng=rng,
+            channelizer=self.channelizer,
+            n_pol=self.n_pol,
         )
 
 
@@ -812,6 +907,264 @@ def resolve_coupling(coupling, n_antennas: int) -> np.ndarray:
 
 
 # ----------------------------------------------------------------------
+# Polarization state
+# ----------------------------------------------------------------------
+def _normalize_polarization(polarization) -> dict | None:
+    """Validate a polarization specification without resolving it.
+
+    Parameters
+    ----------
+    polarization : None or mapping
+        The value a source was constructed with. See `resolve_polarization`
+        for the accepted forms.
+
+    Returns
+    -------
+    None or dict
+        ``None`` for an unpolarized source (both the default ``None`` and
+        an explicit ``{"type": "unpolarized"}`` normalize to it, so the
+        unpolarized case has exactly one internal representation); a
+        validated plain dict otherwise, with ``fraction`` filled in and
+        ``jones`` stored as a 2-element complex128 array.
+
+    Raises
+    ------
+    ValueError
+        If the mapping has an unknown ``type`` or unexpected keys, if
+        ``angle_deg`` or a ``jones`` entry is non-finite, if ``jones`` is
+        not a length-2 sequence or has zero norm, or if ``fraction`` is
+        outside ``[0, 1]``.
+    """
+    if polarization is None:
+        return None
+    if not isinstance(polarization, dict):
+        raise ValueError(
+            "polarization must be None or a mapping, got "
+            f"{type(polarization).__name__}. Use {{'type': 'linear', 'angle_deg': ...}} "
+            "for a linearly polarized transmitter."
+        )
+
+    spec = dict(polarization)
+    kind = spec.pop("type", None)
+    if kind not in POLARIZATION_TYPES:
+        raise ValueError(f"polarization type must be one of {POLARIZATION_TYPES}, got {kind!r}")
+
+    if kind == "unpolarized":
+        if spec:
+            raise ValueError(
+                f"unexpected keys in the polarization specification: {sorted(spec)}. An "
+                "unpolarized source has no state to describe."
+            )
+        return None
+
+    fraction = float(spec.pop("fraction", 1.0))
+    if not np.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+        raise ValueError(f"polarization fraction must be finite and in [0, 1], got {fraction}")
+
+    if kind == "linear":
+        angle_deg = float(_to_value(spec.pop("angle_deg", 0.0), u.deg))
+        if spec:
+            raise ValueError(f"unexpected keys in the polarization specification: {sorted(spec)}")
+        if not np.isfinite(angle_deg):
+            raise ValueError(f"polarization angle_deg must be finite, got {angle_deg}")
+        return {"type": "linear", "angle_deg": angle_deg, "fraction": fraction}
+
+    jones = np.asarray(spec.pop("jones", ()), dtype=np.complex128).ravel()
+    if spec:
+        raise ValueError(f"unexpected keys in the polarization specification: {sorted(spec)}")
+    if jones.size != 2:
+        raise ValueError(
+            f"polarization jones must be a length-2 complex sequence, got {jones.size} entries"
+        )
+    if not np.all(np.isfinite(jones)):
+        raise ValueError("polarization jones contains non-finite values")
+    norm = float(np.sqrt(np.sum(np.abs(jones) ** 2)))
+    if norm == 0.0:
+        raise ValueError("polarization jones must not be all zero")
+    return {"type": "full", "jones": jones / norm, "fraction": fraction}
+
+
+def resolve_polarization(polarization, n_pol: int) -> np.ndarray:
+    r"""Per-polarization mixing matrix for a polarization specification.
+
+    A source emits one signal; a dual-polarization receiver sees it as two
+    voltage streams. This returns the linear map from ``K`` independent,
+    unit-power waveform realizations to the ``n_pol`` received streams::
+
+        v_p(f, t) = sum_k  M[p, k] * w_k(f, t),
+
+    so a *fully polarized* source needs one realization (``K = 1``, both
+    feeds see the same waveform with a fixed amplitude ratio and a fixed
+    relative phase) and an *unpolarized* one needs two (``K = 2``, the
+    feeds see statistically independent waveforms of equal power).
+
+    Parameters
+    ----------
+    polarization : None or mapping
+        One of:
+
+        * ``None`` (or ``{"type": "unpolarized"}``) -- unpolarized: each
+          receptor gets its own independent realization of the same
+          spectrum, uncorrelated between the two. This is the historical
+          behavior and the default.
+        * ``{"type": "linear", "angle_deg": a}`` -- fully linearly
+          polarized at ``a`` degrees measured from the first receptor
+          towards the second, i.e. a Jones vector ``(cos a, sin a)``. At
+          0 deg all the power lands in the first receptor, at 90 deg all
+          of it in the second, at 45 deg the two split evenly *and stay
+          perfectly correlated* -- which is what separates it from the
+          unpolarized case.
+        * ``{"type": "full", "jones": [c_x, c_y]}`` -- an explicit complex
+          Jones pair, covering circular and elliptical states. It is
+          normalized to unit norm: the pair sets the *state*, never the
+          total power (see Notes).
+        * either of the last two with ``"fraction": p`` -- partially
+          polarized, a fraction ``p`` of the power in the coherent state
+          and ``1 - p`` unpolarized. ``p = 1`` (the default) is fully
+          polarized; ``p = 0`` reduces exactly to the unpolarized case.
+    n_pol : int
+        Number of receptors, 1 or 2.
+
+    Returns
+    -------
+    numpy.ndarray
+        Complex128 array of shape ``(n_pol, K)``. For ``n_pol == 1`` this
+        is always ``[[1]]``: a single-receptor run has no second feed to
+        compare against, so polarization is not modelled and the source
+        delivers exactly its `received_power_jy`, bit-for-bit as before
+        this option existed.
+
+    Raises
+    ------
+    ValueError
+        If `n_pol` is not 1 or 2, or if the specification is invalid (see
+        `_normalize_polarization`).
+
+    Notes
+    -----
+    **Power convention.** Each receptor is calibrated in Stokes-I janskys:
+    an unpolarized source of received power ``P`` gives ``XX = YY = P``
+    and Stokes ``I = (XX + YY) / 2 = P``. The mixing matrix is normalized
+    so that ``sum_pk |M[p, k]|**2 == n_pol`` for *every* polarization
+    state, which makes ``I = P`` regardless of the state: a fully
+    polarized source redistributes its power between the receptors
+    (``XX = 2P cos^2 a``, ``YY = 2P sin^2 a`` for the linear case) instead
+    of gaining or losing any. A source's ``received_power_jy`` therefore
+    always means the same physical thing, and a polarized run and an
+    unpolarized run of the same configuration put the same total power on
+    the array.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> resolve_polarization(None, 2)
+    array([[1.+0.j, 0.+0.j],
+           [0.+0.j, 1.+0.j]])
+    >>> mix = resolve_polarization({"type": "linear", "angle_deg": 0.0}, 2)
+    >>> mix.shape                       # one shared realization
+    (2, 1)
+    >>> np.round(np.abs(mix[:, 0]) ** 2, 12)   # all the power in receptor 0
+    array([2., 0.])
+    """
+    n_pol = int(n_pol)
+    if n_pol not in (1, 2):
+        raise ValueError(f"n_pol must be 1 or 2, got {n_pol}")
+
+    spec = _normalize_polarization(polarization)
+    if n_pol == 1 or spec is None:
+        return np.eye(n_pol, dtype=np.complex128)
+
+    if spec["type"] == "linear":
+        angle_rad = np.deg2rad(spec["angle_deg"])
+        jones = np.array([np.cos(angle_rad), np.sin(angle_rad)], dtype=np.complex128)
+    else:
+        jones = np.asarray(spec["jones"], dtype=np.complex128)
+
+    fraction = spec["fraction"]
+    if fraction == 0.0:
+        return np.eye(n_pol, dtype=np.complex128)
+    coherent = np.sqrt(2.0 * fraction) * jones[:, np.newaxis]  # (n_pol, 1)
+    if fraction == 1.0:
+        return coherent
+    # Partially polarized: the coherent column plus one independent
+    # column per receptor carrying the unpolarized remainder, so the
+    # per-receptor power is 2 p |c_p|**2 + (1 - p) and Stokes I is 1 for
+    # any fraction.
+    return np.concatenate([coherent, np.sqrt(1.0 - fraction) * np.eye(n_pol)], axis=1)
+
+
+def mixing_amplitudes(mixing: np.ndarray) -> np.ndarray:
+    """Per-receptor amplitude factors of a polarization mixing matrix.
+
+    Parameters
+    ----------
+    mixing : numpy.ndarray
+        Shape ``(n_pol, K)`` matrix from `resolve_polarization`.
+
+    Returns
+    -------
+    numpy.ndarray
+        Complex128 array of shape ``(n_pol,)``. For a fully polarized
+        source (``K == 1``) this is the Jones column itself, so its
+        **phase** carries the fixed relative phase between the receptors.
+        Otherwise -- unpolarized or partially polarized, where no single
+        relative phase exists -- it is the real, non-negative root of the
+        receptor's total power factor. Either way ``|a_p|**2`` is the
+        factor the source's received power is multiplied by in receptor
+        ``p``, which is the ground truth
+        `RFISource.polarization_amplitudes` publishes.
+    """
+    mixing = np.asarray(mixing, dtype=np.complex128)
+    if mixing.shape[1] == 1:
+        return mixing[:, 0].copy()
+    return np.sqrt(np.sum(np.abs(mixing) ** 2, axis=1)).astype(np.complex128)
+
+
+def mix_polarizations(mixing: np.ndarray, waveform: np.ndarray) -> np.ndarray:
+    """Combine independent waveform realizations into per-receptor streams.
+
+    Parameters
+    ----------
+    mixing : numpy.ndarray
+        Shape ``(n_pol, K)`` matrix from `resolve_polarization`.
+    waveform : numpy.ndarray
+        Complex64 array of shape ``(K, ...)``: ``K`` statistically
+        independent, identically distributed realizations of the emitted
+        signal, already scaled by the source's power envelope.
+
+    Returns
+    -------
+    numpy.ndarray
+        Complex64 array of shape ``(n_pol, ...)``.
+
+    Notes
+    -----
+    The ``K == 1`` case is a plain elementwise product rather than a
+    matrix product, which keeps the arithmetic in complex64 and makes the
+    single-polarization path (``mixing == [[1]]``) bit-for-bit identical
+    to multiplying by nothing at all.
+    """
+    mixing = np.asarray(mixing, dtype=np.complex128)
+    waveform = np.asarray(waveform)
+    n_pol, n_draws = mixing.shape
+    if n_draws != waveform.shape[0]:
+        raise ValueError(
+            f"mixing matrix expects {n_draws} waveform realizations, got {waveform.shape[0]}"
+        )
+    trailing = (1,) * (waveform.ndim - 1)
+    if n_draws == 1:
+        factors = mixing[:, 0].astype(np.complex64).reshape((n_pol, *trailing))
+        return factors * waveform[0]
+    out = np.zeros((n_pol, *waveform.shape[1:]), dtype=np.complex64)
+    for i_pol in range(n_pol):
+        for i_draw in range(n_draws):
+            factor = mixing[i_pol, i_draw]
+            if factor != 0.0:
+                out[i_pol] += np.complex64(factor) * waveform[i_draw]
+    return out
+
+
+# ----------------------------------------------------------------------
 # Source interface
 # ----------------------------------------------------------------------
 class RFISource(ABC):
@@ -832,6 +1185,11 @@ class RFISource(ABC):
         near-field geometry (see `resolve_coupling` and the module
         docstring). Default ``None``: uniform coupling, which is a
         bit-for-bit no-op.
+    polarization : None or mapping, optional
+        Polarization state of the emission (see `resolve_polarization`).
+        Default ``None``: unpolarized, i.e. an independent realization per
+        receptor, which is the historical behavior. Ignored entirely by a
+        single-polarization run.
 
     Attributes
     ----------
@@ -840,6 +1198,10 @@ class RFISource(ABC):
     coupling : None, numpy.ndarray or dict
         The validated coupling specification, as given. Use
         `coupling_amplitudes` for the resolved vector.
+    polarization : None or dict
+        The validated polarization specification; ``None`` for
+        unpolarized. Use `polarization_amplitudes` for the resolved
+        per-receptor factors and `pol_mixing` for the synthesis matrix.
 
     Notes
     -----
@@ -862,10 +1224,64 @@ class RFISource(ABC):
     works, but silently ignores `coupling`; use `coupled_phasors`.
     """
 
-    def __init__(self, name: str, *, coupling=None) -> None:
+    def __init__(self, name: str, *, coupling=None, polarization=None) -> None:
         self.name = str(name)
         self.coupling = _normalize_coupling(coupling)
+        self.polarization = _normalize_polarization(polarization)
         self._coupling_cache: dict[int, np.ndarray] = {}
+        self._pol_mixing_cache: dict[int, np.ndarray] = {}
+
+    def pol_mixing(self, n_pol: int) -> np.ndarray:
+        """This source's resolved polarization mixing matrix.
+
+        Parameters
+        ----------
+        n_pol : int
+            Number of receptors, 1 or 2.
+
+        Returns
+        -------
+        numpy.ndarray
+            Read-only complex128 array of shape ``(n_pol, K)``; see
+            `resolve_polarization`. ``K`` is the number of independent
+            waveform realizations the source must draw for this block --
+            one for a fully polarized emission, `n_pol` for an unpolarized
+            one.
+
+        Notes
+        -----
+        Resolved once per receptor count and cached: the polarization
+        state is a fixed property of the transmitter, not a per-block
+        draw.
+        """
+        n_pol = int(n_pol)
+        cached = self._pol_mixing_cache.get(n_pol)
+        if cached is None:
+            cached = resolve_polarization(self.polarization, n_pol)
+            cached.setflags(write=False)
+            self._pol_mixing_cache[n_pol] = cached
+        return cached
+
+    def polarization_amplitudes(self, n_pol: int) -> np.ndarray:
+        """This source's resolved per-receptor amplitudes -- ground truth.
+
+        Parameters
+        ----------
+        n_pol : int
+            Number of receptors, 1 or 2.
+
+        Returns
+        -------
+        numpy.ndarray
+            Complex128 array of shape ``(n_pol,)``: the amplitude factor
+            each receptor received this source with, so its power
+            contribution scales as ``|a_p|**2`` (see `mixing_amplitudes`).
+            Exactly ``[1]`` for a single-polarization run, and exactly
+            ones for an unpolarized source -- the deliberate mirror of
+            `coupling_amplitudes`, which is all ones for uniform coupling
+            rather than ``None``.
+        """
+        return mixing_amplitudes(self.pol_mixing(n_pol))
 
     def coupling_amplitudes(self, n_antennas: int) -> np.ndarray:
         """This source's resolved per-antenna coupling -- ground truth.
@@ -942,11 +1358,16 @@ class RFISource(ABC):
         -------
         voltages : numpy.ndarray
             Complex64 array of shape ``(n_antennas, n_chan, n_time)`` in
-            root-Jy, to be *added* to the sky-plus-noise voltages.
+            root-Jy -- or ``(n_antennas, n_pol, n_chan, n_time)`` when
+            ``ctx.n_pol > 1`` -- to be *added* to the sky-plus-noise
+            voltages.
         mask : numpy.ndarray
             Boolean array of shape ``(n_chan, n_time)``, True where this
             source occupies the cell (see the module docstring for the
-            threshold convention).
+            threshold convention). There is **no** polarization axis: a
+            transmitter occupies a channel whichever receptor sees more of
+            it, and the per-receptor amplitudes are published separately by
+            `polarization_amplitudes`.
         """
 
     def __repr__(self) -> str:
@@ -1262,6 +1683,10 @@ class _NarrowbandDevice(RFISource):
         Source label.
     coupling : None, array_like or mapping, optional
         Per-antenna coupling; see `resolve_coupling`.
+    polarization : None or mapping, optional
+        Polarization state of the emission; see
+        `resolve_polarization`. Default ``None``:
+        unpolarized, and ignored entirely by a single-polarization run.
     waveform : {"gaussian", "constant_envelope"}, optional
         Modulation of the emission. Default ``"gaussian"``.
     duty_cycle : float, optional
@@ -1286,12 +1711,13 @@ class _NarrowbandDevice(RFISource):
         name: str,
         *,
         coupling=None,
+        polarization=None,
         waveform: str = "gaussian",
         duty_cycle: float = 1.0,
         frame_duration_s=0.01,
         envelope=None,
     ) -> None:
-        super().__init__(name, coupling=coupling)
+        super().__init__(name, coupling=coupling, polarization=polarization)
         self.waveform = str(waveform)
         self.duty_cycle = float(duty_cycle)
         self.frame_duration_s = float(_to_value(frame_duration_s, u.s))
@@ -1393,7 +1819,9 @@ class _NarrowbandDevice(RFISource):
             return max(int(ctx.n_time), 1)
         return max(int(round(ctx.chan_width_hz / bandwidth_hz)), 1)
 
-    def draw_waveform(self, ctx: BlockContext, n_channels: int, bandwidth_hz: float) -> np.ndarray:
+    def draw_waveform(
+        self, ctx: BlockContext, n_channels: int, bandwidth_hz: float, n_draws: int = 1
+    ) -> np.ndarray:
         """Unit-power modulation samples for `n_channels` occupied channels.
 
         Parameters
@@ -1405,20 +1833,33 @@ class _NarrowbandDevice(RFISource):
         bandwidth_hz : float
             Occupied bandwidth, Hz -- only used to set the symbol rate of
             the constant-envelope waveform.
+        n_draws : int, optional
+            Number of statistically independent realizations to draw,
+            default 1. An unpolarized source needs one per receptor (see
+            `resolve_polarization`); a polarized one needs a single
+            realization however many receptors there are.
 
         Returns
         -------
         numpy.ndarray
-            Complex64 array of shape ``(n_channels, ctx.n_time)`` with
-            ``E|z|**2 == 1``.
+            Complex64 array of shape ``(n_draws, n_channels, ctx.n_time)``
+            with ``E|z|**2 == 1``.
+
+        Notes
+        -----
+        The leading axis is a *shape prefix*, not a reordering: drawing
+        ``(1, n_channels, n_time)`` consumes the generator in exactly the
+        same order as drawing ``(n_channels, n_time)`` did before there
+        was a polarization axis, so a single-receptor run is unchanged
+        bit-for-bit.
         """
         if self.waveform == "constant_envelope":
             return constant_envelope(
                 ctx.rng,
-                (n_channels, ctx.n_time),
+                (n_draws, n_channels, ctx.n_time),
                 self.symbol_length_samples(ctx, bandwidth_hz),
             )
-        return circular_normal(ctx.rng, (n_channels, ctx.n_time))
+        return circular_normal(ctx.rng, (n_draws, n_channels, ctx.n_time))
 
     def add_emission(
         self,
@@ -1434,7 +1875,8 @@ class _NarrowbandDevice(RFISource):
         Parameters
         ----------
         out : numpy.ndarray
-            Complex64 ``(n_antennas, n_chan, n_time)`` array to add into.
+            Complex64 ``(n_antennas, n_pol, n_chan, n_time)`` array to add
+            into.
         ctx : BlockContext
             Block context.
         phasors : numpy.ndarray
@@ -1454,11 +1896,112 @@ class _NarrowbandDevice(RFISource):
         it is one emitted signal, and the per-antenna differences are
         entirely in `phasors`. That is what keeps the emission coherent
         across the array, and therefore visible in the visibilities rather
-        than only in the autocorrelations.
+        than only in the autocorrelations. The polarization mixing is the
+        one place a *second* realization can appear, and it too is shared
+        by every antenna: an unpolarized transmitter is incoherent between
+        the receptors, not between the antennas.
         """
-        waveform = self.draw_waveform(ctx, int(occupied.sum()), bandwidth_hz)
+        mixing = self.pol_mixing(ctx.n_pol)
+        waveform = self.draw_waveform(ctx, int(occupied.sum()), bandwidth_hz, mixing.shape[1])
         waveform *= np.sqrt(envelope_jy[occupied], dtype=np.float64).astype(np.float32)
-        out[:, occupied, :] += phasors[:, :, np.newaxis] * waveform[np.newaxis, :, :]
+        per_pol = mix_polarizations(mixing, waveform)  # (n_pol, n_occupied, n_time)
+        out[:, :, occupied, :] += phasors[:, np.newaxis, :, np.newaxis] * per_pol[np.newaxis]
+
+    def add_offset_carrier(
+        self,
+        out: np.ndarray,
+        ctx: BlockContext,
+        phasors: np.ndarray,
+        center_freq_hz: float,
+        power_jy: np.ndarray,
+        bandwidth_hz: float,
+    ) -> np.ndarray:
+        r"""Add a carrier at an arbitrary frequency, in place, and label it.
+
+        The channel-snapping of `add_emission` is a consequence of the
+        perfect-channelizer assumption: with ideal brick-wall channels a
+        carrier is either inside a channel or outside it. A real filterbank
+        has no such edge, and a carrier between two channel centers appears
+        in both. This method is the sub-channel-resolution alternative,
+        used when the simulator has a `rfi_simulator.channelizer` attached.
+
+        Parameters
+        ----------
+        out : numpy.ndarray
+            Complex64 ``(n_antennas, n_chan, n_time)`` array to add into.
+        ctx : BlockContext
+            Block context; ``ctx.channelizer`` must not be ``None``.
+        phasors : numpy.ndarray
+            Complex64 ``(n_antennas, 1)`` per-antenna gains evaluated at
+            the carrier frequency, from `offset_phasors`. One phase per
+            antenna, not one per channel: the emission is monochromatic,
+            so its geometric delay is a single phase at ``center_freq_hz``.
+            A per-channel phase ramp would be a *cyclic time shift* of the
+            reconstructed wideband stream and would smear the carrier
+            across the band.
+        center_freq_hz : float
+            Carrier frequency, Hz -- continuous, not snapped to a channel.
+        power_jy : numpy.ndarray
+            Float64 ``(n_time,)`` total received power at the array origin,
+            summed over channels, for each sample: the on/off pattern
+            already applied.
+        bandwidth_hz : float
+            Occupied bandwidth, Hz, used only to set the symbol rate of a
+            constant-envelope waveform.
+
+        Returns
+        -------
+        numpy.ndarray
+            Float64 ``(n_chan, n_time)`` mean-power envelope of what was
+            added, in Jy: ``power_jy`` distributed over the channels by
+            ``abs(H(delta_k))**2``, the filterbank's channel response at
+            each channel's offset from the carrier. This is the truth the
+            occupancy mask must come from -- it is the power distribution
+            the data will actually have once the block is channelized.
+
+        Notes
+        -----
+        The *synthesis* weights are not the response ``H`` but the
+        perfect-channelizer weights of `ideal_channel_weights`, because
+        what is being built here is the ideal channelized representation of
+        the carrier -- the filterbank is applied afterwards, once, to the
+        whole block, and turns those weights into ``H`` by itself. Writing
+        ``H`` here instead would apply the channel response twice.
+
+        The weights span the whole band rather than a few channels around
+        the carrier: the Dirichlet kernel falls off only as ``1/offset``,
+        so truncating it would leave a spurious ``1/offset`` skirt across
+        the band, at a level that matters for a strong transmitter. One
+        emitted waveform is shared by every channel and every antenna --
+        it is a single carrier -- with the per-channel weights and the
+        per-antenna phasors applied on top.
+        """
+        channelizer = ctx.channelizer
+        if channelizer is None:  # pragma: no cover - guarded by the caller
+            raise ValueError("add_offset_carrier needs ctx.channelizer")
+
+        offsets = (center_freq_hz - ctx.freq_hz) / ctx.chan_width_hz  # (n_chan,)
+        weights = ideal_channel_weights(offsets, ctx.n_chan).astype(np.complex64)
+
+        # A carrier that misses the channel-center grid by `fraction` of a
+        # channel beats against the post-channelization sample rate at
+        # exactly that rate -- one turn of phase every 1/fraction samples.
+        nearest = int(np.argmin(np.abs(offsets)))
+        fraction = float(offsets[nearest])
+        samples = np.arange(ctx.n_time, dtype=np.float64)
+        beat = np.exp(2j * np.pi * fraction * samples).astype(np.complex64)
+
+        mixing = self.pol_mixing(ctx.n_pol)
+        waveform = self.draw_waveform(ctx, 1, bandwidth_hz, mixing.shape[1])[:, 0] * beat
+        waveform *= np.sqrt(power_jy, dtype=np.float64).astype(np.float32)
+        per_pol = mix_polarizations(mixing, waveform)  # (n_pol, n_time)
+
+        out += (phasors * weights[np.newaxis, :])[:, np.newaxis, :, np.newaxis] * per_pol[
+            np.newaxis, :, np.newaxis, :
+        ]
+        response = np.abs(channelizer.channel_response(offsets, ctx.n_chan)) ** 2
+        response /= response.sum()
+        return response[:, np.newaxis] * power_jy[np.newaxis, :]
 
 
 # ----------------------------------------------------------------------
@@ -1514,6 +2057,10 @@ class NarrowbandTransmitter(_NarrowbandDevice):
     coupling : None, array_like or mapping, optional
         Per-antenna linear amplitude coupling; see `resolve_coupling`.
         Default ``None`` (uniform).
+    polarization : None or mapping, optional
+        Polarization state of the emission; see
+        `resolve_polarization`. Default ``None``:
+        unpolarized, and ignored entirely by a single-polarization run.
     name : str, optional
         Label for the source. Default ``"narrowband"``.
 
@@ -1528,12 +2075,23 @@ class NarrowbandTransmitter(_NarrowbandDevice):
 
     Notes
     -----
-    The emission is confined to the occupied channels *exactly*: this
-    package assumes a perfect channelizer, so there is no spectral
-    leakage into neighbouring channels. Real polyphase filter banks leak,
-    and an excision algorithm tuned on this simulator will be optimistic
-    about how sharply interference is confined until a filter-bank model
-    is added.
+    With no filterbank attached to the simulator the emission is confined
+    to the occupied channels *exactly* -- the perfect-channelizer
+    assumption -- and `center_freq_hz` is effectively quantized to the
+    channel grid, because a carrier lands wholly in its nearest channel.
+    An excision algorithm tuned on such data will be optimistic about how
+    sharply interference is confined.
+
+    Attach a `rfi_simulator.channelizer.PFBChannelizer` to the simulator
+    and `center_freq_hz` becomes continuous for emissions narrower than a
+    channel: the carrier is placed at its true frequency, appears in
+    several channels weighted by the filterbank's channel response, beats
+    against the sample rate at its sub-channel offset, and is labelled
+    occupied in every channel that receives more than
+    `OCCUPANCY_THRESHOLD` of its peak power. Emissions *wider* than a
+    channel still snap their edges to the channel grid; the filterbank
+    then smears those edges by its own response, which is the dominant
+    effect, but the sub-channel position of the band edge is not modelled.
 
     The transmitter is always visible: it is specified by an ENU position
     with an implied line of sight, and **no terrain shadowing, horizon cut
@@ -1568,11 +2126,13 @@ class NarrowbandTransmitter(_NarrowbandDevice):
         envelope=None,
         waveform: str = "gaussian",
         coupling=None,
+        polarization=None,
         name: str = "narrowband",
     ) -> None:
         super().__init__(
             name,
             coupling=coupling,
+            polarization=polarization,
             waveform=waveform,
             duty_cycle=duty_cycle,
             frame_duration_s=frame_duration_s,
@@ -1626,10 +2186,12 @@ class NarrowbandTransmitter(_NarrowbandDevice):
         Returns
         -------
         voltages : numpy.ndarray
-            Complex64 ``(n_antennas, n_chan, n_time)`` contribution in
-            root-Jy.
+            Complex64 ``(n_antennas, n_chan, n_time)`` -- or
+            ``(n_antennas, n_pol, n_chan, n_time)`` when ``ctx.n_pol >
+            1`` -- contribution in root-Jy.
         mask : numpy.ndarray
-            Boolean ``(n_chan, n_time)`` occupancy labels.
+            Boolean ``(n_chan, n_time)`` occupancy labels -- no
+            polarization axis; see `RFISource.contribution`.
 
         Raises
         ------
@@ -1649,6 +2211,24 @@ class NarrowbandTransmitter(_NarrowbandDevice):
             )
 
         on = self.on_frames(ctx)
+        voltages = np.zeros(ctx.pol_shape(ctx.n_chan, ctx.n_time), dtype=np.complex64)
+
+        if ctx.channelizer is not None and self.bandwidth_hz < ctx.chan_width_hz:
+            # Sub-channel emission with a filterbank attached: place it at
+            # its true frequency instead of snapping it to a channel
+            # center. The same generator draw as the snapped path (one
+            # channel's worth of waveform), so switching the filterbank on
+            # does not shift this source's realization.
+            power_jy = np.where(on, self.received_power_jy, 0.0)
+            envelope = self.add_offset_carrier(
+                voltages,
+                ctx,
+                self.offset_phasors(ctx),
+                self.center_freq_hz,
+                power_jy,
+                self.bandwidth_hz,
+            )
+            return ctx.squeeze_pol(voltages), occupancy_mask(envelope)
 
         envelope = np.zeros((ctx.n_chan, ctx.n_time), dtype=np.float64)
         power_per_channel_jy = self.received_power_jy / n_occupied
@@ -1659,10 +2239,32 @@ class NarrowbandTransmitter(_NarrowbandDevice):
         phasors = self.coupled_phasors(
             self.position_enu_m, ctx.antenna_positions_enu_m, ctx.freq_hz[occupied]
         )
-        voltages = np.zeros((ctx.n_antennas, ctx.n_chan, ctx.n_time), dtype=np.complex64)
         self.add_emission(voltages, ctx, phasors, occupied, envelope, self.bandwidth_hz)
 
-        return voltages, occupancy_mask(envelope)
+        return ctx.squeeze_pol(voltages), occupancy_mask(envelope)
+
+    def offset_phasors(self, ctx: BlockContext) -> np.ndarray:
+        """Per-antenna gain and phase at the carrier frequency itself.
+
+        Parameters
+        ----------
+        ctx : BlockContext
+            Block context.
+
+        Returns
+        -------
+        numpy.ndarray
+            Complex64 ``(n_antennas, 1)`` array from
+            `RFISource.coupled_phasors`, evaluated at `center_freq_hz`
+            rather than at the channel centers -- see
+            `_NarrowbandDevice.add_offset_carrier` for why a monochromatic
+            emission takes one phase and not a per-channel ramp.
+        """
+        return self.coupled_phasors(
+            self.position_enu_m,
+            ctx.antenna_positions_enu_m,
+            np.array([self.center_freq_hz], dtype=np.float64),
+        )
 
 
 class ImpulsiveBroadband(RFISource):
@@ -1725,6 +2327,10 @@ class ImpulsiveBroadband(RFISource):
     coupling : None, array_like or mapping, optional
         Per-antenna linear amplitude coupling; see `resolve_coupling`.
         Default ``None`` (uniform).
+    polarization : None or mapping, optional
+        Polarization state of the emission; see
+        `resolve_polarization`. Default ``None``:
+        unpolarized, and ignored entirely by a single-polarization run.
     name : str, optional
         Label for the source. Default ``"impulsive"``.
 
@@ -1771,9 +2377,10 @@ class ImpulsiveBroadband(RFISource):
         max_power_ratio: float = 30.0,
         pulse_width_samples: int = 1,
         coupling=None,
+        polarization=None,
         name: str = "impulsive",
     ) -> None:
-        super().__init__(name, coupling=coupling)
+        super().__init__(name, coupling=coupling, polarization=polarization)
         self.arrival = _normalize_arrival(arrival)
         if self.arrival == "poisson":
             if rate_hz is None:
@@ -1907,8 +2514,9 @@ class ImpulsiveBroadband(RFISource):
         Returns
         -------
         voltages : numpy.ndarray
-            Complex64 ``(n_antennas, n_chan, n_time)`` contribution in
-            root-Jy.
+            Complex64 ``(n_antennas, n_chan, n_time)`` -- or
+            ``(n_antennas, n_pol, n_chan, n_time)`` when ``ctx.n_pol >
+            1`` -- contribution in root-Jy.
         mask : numpy.ndarray
             Boolean ``(n_chan, n_time)`` occupancy labels. Every channel
             of an event sample is flagged, since the emission is flat
@@ -1925,19 +2533,21 @@ class ImpulsiveBroadband(RFISource):
         envelope = np.broadcast_to(per_sample_jy[np.newaxis, :], (ctx.n_chan, ctx.n_time))
         mask = occupancy_mask(envelope)
 
-        voltages = np.zeros((ctx.n_antennas, ctx.n_chan, ctx.n_time), dtype=np.complex64)
+        voltages = np.zeros(ctx.pol_shape(ctx.n_chan, ctx.n_time), dtype=np.complex64)
         active = np.flatnonzero(per_sample_jy > 0.0)
         if active.size == 0:
-            return voltages, mask
+            return ctx.squeeze_pol(voltages), mask
 
-        waveform = circular_normal(ctx.rng, (ctx.n_chan, active.size))
+        mixing = self.pol_mixing(ctx.n_pol)
+        waveform = circular_normal(ctx.rng, (mixing.shape[1], ctx.n_chan, active.size))
         waveform *= np.sqrt(per_sample_jy[active]).astype(np.float32)[np.newaxis, :]
+        per_pol = mix_polarizations(mixing, waveform)  # (n_pol, n_chan, n_active)
 
         phasors = self.coupled_phasors(
             self.position_enu_m, ctx.antenna_positions_enu_m, ctx.freq_hz
         )
-        voltages[:, :, active] = phasors[:, :, np.newaxis] * waveform[np.newaxis, :, :]
-        return voltages, mask
+        voltages[:, :, :, active] = phasors[:, np.newaxis, :, np.newaxis] * per_pol[np.newaxis]
+        return ctx.squeeze_pol(voltages), mask
 
 
 class CombTransmitter(_NarrowbandDevice):
@@ -1990,6 +2600,10 @@ class CombTransmitter(_NarrowbandDevice):
     coupling : None, array_like or mapping, optional
         Per-antenna linear amplitude coupling of the device, shared by
         every harmonic; see `resolve_coupling`. Default ``None``.
+    polarization : None or mapping, optional
+        Polarization state of the emission; see
+        `resolve_polarization`. Default ``None``:
+        unpolarized, and ignored entirely by a single-polarization run.
     name : str, optional
         Label for the device. Default ``"comb"``.
 
@@ -2040,11 +2654,13 @@ class CombTransmitter(_NarrowbandDevice):
         envelope=None,
         waveform: str = "gaussian",
         coupling=None,
+        polarization=None,
         name: str = "comb",
     ) -> None:
         super().__init__(
             name,
             coupling=coupling,
+            polarization=polarization,
             waveform=waveform,
             duty_cycle=duty_cycle,
             frame_duration_s=frame_duration_s,
@@ -2257,8 +2873,10 @@ class CombTransmitter(_NarrowbandDevice):
         Returns
         -------
         voltages : numpy.ndarray
-            Complex64 ``(n_antennas, n_chan, n_time)`` contribution in
-            root-Jy, summed over the in-band harmonics.
+            Complex64 ``(n_antennas, n_chan, n_time)`` -- or
+            ``(n_antennas, n_pol, n_chan, n_time)`` when ``ctx.n_pol >
+            1`` -- contribution in root-Jy,
+            summed over the in-band harmonics.
         mask : numpy.ndarray
             Boolean ``(n_chan, n_time)`` occupancy labels of the device as
             a whole, i.e. the union over its harmonics. `harmonic_masks`
@@ -2300,7 +2918,7 @@ class CombTransmitter(_NarrowbandDevice):
         phasors = self.coupled_phasors(
             self.position_enu_m, ctx.antenna_positions_enu_m, ctx.freq_hz
         )
-        voltages = np.zeros((ctx.n_antennas, ctx.n_chan, ctx.n_time), dtype=np.complex64)
+        voltages = np.zeros(ctx.pol_shape(ctx.n_chan, ctx.n_time), dtype=np.complex64)
         for i_harmonic in np.flatnonzero(in_band):
             channels = occupied[i_harmonic]
             self.add_emission(
@@ -2312,4 +2930,4 @@ class CombTransmitter(_NarrowbandDevice):
                 self.bandwidth_hz,
             )
 
-        return voltages, occupancy_mask(envelopes.sum(axis=0))
+        return ctx.squeeze_pol(voltages), occupancy_mask(envelopes.sum(axis=0))

@@ -38,16 +38,23 @@ from typing import Annotated, Any, Literal
 
 import numpy as np
 from astropy.time import Time
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rfi_simulator import (
     ADSBTransponder,
+    AiryBeam,
     ArrayConfig,
+    CalibrationErrors,
+    CombTransmitter,
+    GaussianBeam,
     ImpulsiveBroadband,
+    InstrumentModel,
     NarrowbandTransmitter,
+    PFBChannelizer,
     PointSource,
     RFISource,
     SatelliteTransmitter,
+    SpectralLineForeground,
     TwoLineElement,
     VoltageSimulator,
     correlate,
@@ -56,8 +63,13 @@ from rfi_simulator import (
     uvw_wavelengths,
 )
 from rfi_simulator.binning import bin_any, bin_mean
+from rfi_simulator.channelizer import (
+    DEFAULT_N_TAPS,
+    DEFAULT_SINC_BANDWIDTH,
+    DEFAULT_WINDOW,
+)
 from rfi_simulator.delays import earth_location, zenith_coord
-from rfi_simulator.voltages import DEFAULT_CHAN_WIDTH_HZ
+from rfi_simulator.voltages import DEFAULT_CHAN_WIDTH_HZ, DEFAULT_QUANT_TARGET_COUNTS
 
 __all__ = [
     "DEFAULT_CENTER_FREQ_HZ",
@@ -106,6 +118,7 @@ MAX_N_CHAN = 512
 MAX_N_BLOCKS = 32
 MAX_SKY_SOURCES = 8
 MAX_RFI_SOURCES = 6
+MAX_SPECTRAL_LINES = 4
 
 MAX_COORDINATE_M = 1.0e6
 """float: Largest antenna coordinate accepted, metres.
@@ -332,6 +345,27 @@ SKY_SOURCE_FIELDS = [
     _num("flux_jy", "Flux density", 5.0, minimum=0.0, maximum=1.0e4, step=0.5, unit="Jy"),
 ]
 
+# `waveform` is a real scalar field on `TowerParams`/`CombParams`, so it is
+# safe to describe with an ordinary field descriptor (see RFI_TYPES) --
+# unlike `coupling`, `polarization`, `envelope` and `arrival`, which are
+# nested objects and so are not: the schema-driven card form only knows
+# how to build one control per scalar field (`buildField` in app.js), and
+# every RFI type's `defaults` dict must round-trip through the request
+# model unchanged (see `test_schema_defaults_are_accepted_by_the_request_
+# models`). Those four stay API-only, reachable directly through
+# `/api/simulate`; app.js adds small hand-written controls for them next
+# to the schema-driven fields instead of describing them here.
+_WAVEFORM_FIELD = _choice(
+    "waveform",
+    "Waveform",
+    "gaussian",
+    [
+        {"value": "gaussian", "label": "Band-limited noise (gaussian)"},
+        {"value": "constant_envelope", "label": "Constant-envelope carrier"},
+    ],
+    help_text="Constant-envelope is what a spectral-kurtosis detector keys on.",
+)
+
 _TOWER_FIELDS = [
     _num(
         "azimuth_deg",
@@ -403,6 +437,7 @@ _TOWER_FIELDS = [
         maximum=10.0,
         step=1.0,
     ),
+    _WAVEFORM_FIELD,
 ]
 
 _IMPULSIVE_FIELDS = [
@@ -574,6 +609,70 @@ _AIRCRAFT_FIELDS = [
     ),
 ]
 
+_COMB_FIELDS = [
+    _num("azimuth_deg", "Bearing", 200.0, unit="deg", minimum=0.0, maximum=360.0, step=1.0),
+    _num("elevation_deg", "Elevation", 2.0, unit="deg", minimum=-5.0, maximum=90.0, step=0.1),
+    _num(
+        "distance_m",
+        "Range",
+        3000.0,
+        unit="km",
+        factor=1000.0,
+        minimum=10.0,
+        maximum=5.0e5,
+        step=0.1,
+    ),
+    _num(
+        "fundamental_hz",
+        "Fundamental frequency",
+        1.405e6,
+        unit="MHz",
+        factor=MHZ,
+        minimum=1.0e3,
+        maximum=1.0e10,
+        step=0.000001,
+        help_text="May sit far below the simulated band; only in-band harmonics show up.",
+    ),
+    _text(
+        "harmonic_numbers",
+        "Harmonics (comma-separated)",
+        "999,1000,1001",
+        help_text="Which multiples of the fundamental the device emits, e.g. '999,1000,1001'.",
+    ),
+    _num(
+        "received_power_jy",
+        "Received power per harmonic",
+        200.0,
+        unit="Jy",
+        minimum=0.0,
+        maximum=1.0e9,
+        step=10.0,
+    ),
+    _num(
+        "bandwidth_hz",
+        "Bandwidth per harmonic",
+        0.0,
+        unit="kHz",
+        factor=KHZ,
+        minimum=0.0,
+        maximum=1.0e9,
+        step=1.0,
+        help_text="0 (default) makes every harmonic a pure line, one channel wide.",
+    ),
+    _num("duty_cycle", "Duty cycle", 1.0, minimum=0.0, maximum=1.0, step=0.05),
+    _num(
+        "frame_duration_s",
+        "Frame length",
+        0.01,
+        unit="ms",
+        factor=1.0e-3,
+        minimum=1.0e-5,
+        maximum=10.0,
+        step=1.0,
+    ),
+    _WAVEFORM_FIELD,
+]
+
 RFI_TYPES = [
     {
         "type": "tower",
@@ -606,12 +705,147 @@ RFI_TYPES = [
         ),
         "fields": _AIRCRAFT_FIELDS,
     },
+    {
+        "type": "comb",
+        "label": "Harmonic comb",
+        "summary": (
+            "One device -- a switching supply, a broken shield -- emitting several "
+            "harmonics of one fundamental, sharing a position and an on/off pattern."
+        ),
+        "fields": _COMB_FIELDS,
+    },
 ]
 
 
 def _schema_defaults(fields: list[dict[str, Any]]) -> dict[str, Any]:
     """The default value of every field, keyed by field name."""
     return {field["name"]: field["default"] for field in fields}
+
+
+# ----------------------------------------------------------------------
+# Shared realism specifications: coupling, polarization, envelope, arrival
+# ----------------------------------------------------------------------
+# These mirror the dict-shaped specifications `rfi_simulator.rfi` accepts
+# (`resolve_coupling`, `resolve_polarization`, `_normalize_envelope`,
+# `_normalize_arrival`). Pydantic gives them proper field-level validation
+# at the API boundary; `.build()`/the module-level `_build_*` helpers turn
+# a validated model back into the plain dict or list the library expects,
+# so the library's own validation still has the last word.
+class LognormalCoupling(BaseModel):
+    """A per-antenna coupling scatter, drawn lognormal in dB of power."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["lognormal"] = "lognormal"
+    sigma_db: float = Field(default=3.0, ge=0.0, le=60.0)
+    seed: int = Field(default=0, ge=0, le=2**31 - 1)
+
+
+def _check_finite_floats(values: list[float]) -> list[float]:
+    """Reject NaN/inf, the same way the antenna-position validator does."""
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("values must all be finite numbers")
+    return values
+
+
+FiniteFloatList = Annotated[list[float], AfterValidator(_check_finite_floats)]
+"""A `list[float]` that has already been checked for NaN/inf."""
+
+CouplingSpec = FiniteFloatList | LognormalCoupling
+"""An explicit per-antenna amplitude vector, or a lognormal draw."""
+
+
+def _build_coupling(coupling: CouplingSpec | None) -> Any:
+    """`coupling` as the plain value/dict `resolve_coupling` accepts."""
+    if coupling is None:
+        return None
+    if isinstance(coupling, LognormalCoupling):
+        return {"type": "lognormal", "sigma_db": coupling.sigma_db, "seed": coupling.seed}
+    return list(coupling)
+
+
+class LinearPolarization(BaseModel):
+    """Fully (or partially) linearly polarized emission."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["linear"] = "linear"
+    angle_deg: float = Field(default=45.0, ge=-360.0, le=360.0)
+    fraction: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+class FullPolarization(BaseModel):
+    """An explicit Jones-vector polarization state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["full"] = "full"
+    jones_re: FiniteFloatList = Field(min_length=2, max_length=2)
+    jones_im: FiniteFloatList = Field(default=[0.0, 0.0], min_length=2, max_length=2)
+    fraction: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+PolarizationSpec = Annotated[LinearPolarization | FullPolarization, Field(discriminator="type")]
+
+
+def _build_polarization(polarization: PolarizationSpec | None) -> dict[str, Any] | None:
+    """`polarization` as the plain dict `resolve_polarization` accepts."""
+    if polarization is None:
+        return None
+    if isinstance(polarization, LinearPolarization):
+        return {
+            "type": "linear",
+            "angle_deg": polarization.angle_deg,
+            "fraction": polarization.fraction,
+        }
+    jones = [
+        complex(polarization.jones_re[0], polarization.jones_im[0]),
+        complex(polarization.jones_re[1], polarization.jones_im[1]),
+    ]
+    return {"type": "full", "jones": jones, "fraction": polarization.fraction}
+
+
+class PeriodicEnvelope(BaseModel):
+    """A clocked on/off pattern, in place of i.i.d. duty-cycle frames."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["periodic"] = "periodic"
+    period_s: float = Field(gt=0.0, le=100.0)
+    duty: float = Field(default=1.0, ge=0.0, le=1.0)
+    phase: float = Field(default=0.0, ge=-1.0e6, le=1.0e6)
+
+
+def _build_envelope(envelope: PeriodicEnvelope | None) -> dict[str, Any] | None:
+    """`envelope` as the plain dict `_normalize_envelope` accepts."""
+    if envelope is None:
+        return None
+    return {
+        "type": "periodic",
+        "period_s": envelope.period_s,
+        "duty": envelope.duty,
+        "phase": envelope.phase,
+    }
+
+
+class PeriodicArrival(BaseModel):
+    """A regular, jittered pulse train for `ImpulsiveBroadband`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["periodic"] = "periodic"
+    rate_hz: float = Field(gt=0.0, le=1.0e5)
+    jitter_s: float = Field(default=0.0, ge=0.0, le=10.0)
+
+
+ArrivalSpec = Literal["poisson"] | PeriodicArrival
+
+
+def _build_arrival(arrival: ArrivalSpec) -> Any:
+    """`arrival` as the plain string/dict `_normalize_arrival` accepts."""
+    if arrival == "poisson":
+        return "poisson"
+    return {"type": "periodic", "rate_hz": arrival.rate_hz, "jitter_s": arrival.jitter_s}
 
 
 # ----------------------------------------------------------------------
@@ -649,9 +883,20 @@ class TowerParams(BaseModel):
     received_power_jy: float = Field(default=500.0, ge=0.0, le=1.0e9)
     duty_cycle: float = Field(default=0.5, ge=0.0, le=1.0)
     frame_duration_s: float = Field(default=0.01, gt=0.0, le=10.0)
+    waveform: Literal["gaussian", "constant_envelope"] = "gaussian"
+    envelope: PeriodicEnvelope | None = None
+    coupling: CouplingSpec | None = None
+    polarization: PolarizationSpec | None = None
 
     def build(self) -> RFISource:
-        """The library source this describes."""
+        """The library source this describes.
+
+        `envelope` and `duty_cycle` are mutually exclusive in the library
+        (see `NarrowbandTransmitter`): when an envelope is given, this
+        passes `duty_cycle=1.0` regardless of the request's own value, so
+        the form's duty-cycle field never has to be reset by hand to turn
+        the periodic envelope on.
+        """
         return NarrowbandTransmitter(
             position_enu_m=enu_from_horizontal(
                 self.azimuth_deg, self.elevation_deg, self.distance_m
@@ -659,8 +904,12 @@ class TowerParams(BaseModel):
             center_freq_hz=self.center_freq_hz,
             bandwidth_hz=self.bandwidth_hz,
             received_power_jy=self.received_power_jy,
-            duty_cycle=self.duty_cycle,
+            duty_cycle=1.0 if self.envelope is not None else self.duty_cycle,
             frame_duration_s=self.frame_duration_s,
+            envelope=_build_envelope(self.envelope),
+            waveform=self.waveform,
+            coupling=_build_coupling(self.coupling),
+            polarization=_build_polarization(self.polarization),
             name=self.name,
         )
 
@@ -680,18 +929,30 @@ class ImpulsiveParams(BaseModel):
     power_law_index: float = Field(default=2.0, gt=1.0, le=6.0)
     max_power_ratio: float = Field(default=30.0, ge=1.0, le=1.0e4)
     pulse_width_samples: int = Field(default=1, ge=1, le=64)
+    arrival: ArrivalSpec = "poisson"
+    coupling: CouplingSpec | None = None
+    polarization: PolarizationSpec | None = None
 
     def build(self) -> RFISource:
-        """The library source this describes."""
+        """The library source this describes.
+
+        `rate_hz` and a periodic `arrival` are mutually exclusive in the
+        library (see `ImpulsiveBroadband`): `rate_hz` is only forwarded
+        for the default Poisson arrivals, where the event rate has
+        nowhere else to live.
+        """
         return ImpulsiveBroadband(
-            rate_hz=self.rate_hz,
+            rate_hz=self.rate_hz if self.arrival == "poisson" else None,
             received_power_jy=self.received_power_jy,
+            arrival=_build_arrival(self.arrival),
             position_enu_m=enu_from_horizontal(
                 self.azimuth_deg, self.elevation_deg, self.distance_m
             ),
             power_law_index=self.power_law_index,
             max_power_ratio=self.max_power_ratio,
             pulse_width_samples=self.pulse_width_samples,
+            coupling=_build_coupling(self.coupling),
+            polarization=_build_polarization(self.polarization),
             name=self.name,
         )
 
@@ -711,6 +972,8 @@ class SatelliteParams(BaseModel):
     sideband_power_fraction: float = Field(default=0.5, ge=0.0, le=1.0)
     apply_doppler: bool = True
     min_elevation_deg: float = Field(default=0.0, ge=-90.0, le=90.0)
+    coupling: CouplingSpec | None = None
+    polarization: PolarizationSpec | None = None
 
     @model_validator(mode="after")
     def _check_elements(self) -> "SatelliteParams":
@@ -744,6 +1007,8 @@ class SatelliteParams(BaseModel):
             sideband_power_fraction=self.sideband_power_fraction,
             apply_doppler=self.apply_doppler,
             min_elevation_deg=self.min_elevation_deg,
+            coupling=_build_coupling(self.coupling),
+            polarization=_build_polarization(self.polarization),
             name=self.name,
         )
 
@@ -766,6 +1031,8 @@ class AircraftParams(BaseModel):
     message_rate_hz: float = Field(default=500.0, ge=0.0, le=1.0e5)
     pulse_width_samples: int = Field(default=1, ge=1, le=64)
     min_elevation_deg: float = Field(default=0.0, ge=-90.0, le=90.0)
+    coupling: CouplingSpec | None = None
+    polarization: PolarizationSpec | None = None
 
     def build(self) -> RFISource:
         """The library source this describes."""
@@ -778,14 +1045,243 @@ class AircraftParams(BaseModel):
             message_rate_hz=self.message_rate_hz,
             pulse_width_samples=self.pulse_width_samples,
             min_elevation_deg=self.min_elevation_deg,
+            coupling=_build_coupling(self.coupling),
+            polarization=_build_polarization(self.polarization),
+            name=self.name,
+        )
+
+
+class CombParams(BaseModel):
+    """One device emitting a comb of harmonics of a single fundamental."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["comb"] = "comb"
+    name: str = Field(default="comb", max_length=40)
+    azimuth_deg: float = Field(default=200.0, ge=0.0, le=360.0)
+    elevation_deg: float = Field(default=2.0, ge=-5.0, le=90.0)
+    distance_m: float = Field(default=3000.0, ge=10.0, le=5.0e5)
+    # 999/1000/1001 x 1.405 MHz sit at 1403.6/1405.0/1406.4 MHz -- inside
+    # the default ~3.9 MHz band around the default 1.405 GHz centre, so a
+    # freshly added comb source is visible without retuning anything.
+    fundamental_hz: float = Field(default=1.405e6, gt=0.0, le=1.0e10)
+    harmonic_numbers: list[int] = Field(default=[999, 1000, 1001], min_length=1, max_length=32)
+    received_power_jy: float = Field(default=200.0, ge=0.0, le=1.0e9)
+    bandwidth_hz: float = Field(default=0.0, ge=0.0, le=1.0e9)
+    duty_cycle: float = Field(default=1.0, ge=0.0, le=1.0)
+    frame_duration_s: float = Field(default=0.01, gt=0.0, le=10.0)
+    waveform: Literal["gaussian", "constant_envelope"] = "gaussian"
+    envelope: PeriodicEnvelope | None = None
+    coupling: CouplingSpec | None = None
+    polarization: PolarizationSpec | None = None
+
+    @field_validator("harmonic_numbers", mode="before")
+    @classmethod
+    def _parse_harmonics(cls, value: Any) -> Any:
+        """Accept the browser's comma-separated text field as well as a list.
+
+        The card form has one control per scalar field (see
+        `_COMB_FIELDS`'s ``harmonic_numbers`` text field), so the browser
+        sends ``"999,1000,1001"`` rather than a JSON array; a request
+        built directly against the API (as the tests do) can still send a
+        real list.
+        """
+        if isinstance(value, str):
+            parts = [part.strip() for part in value.split(",") if part.strip()]
+            try:
+                return [int(part) for part in parts]
+            except ValueError as exc:
+                raise ValueError(
+                    f"harmonic_numbers must be a comma-separated list of integers, got {value!r}"
+                ) from exc
+        return value
+
+    @field_validator("harmonic_numbers")
+    @classmethod
+    def _check_harmonics(cls, value: list[int]) -> list[int]:
+        if any(number < 1 for number in value):
+            raise ValueError(f"harmonic_numbers must all be >= 1, got {value}")
+        if len(set(value)) != len(value):
+            raise ValueError(f"harmonic_numbers must be unique, got {value}")
+        return value
+
+    def build(self) -> RFISource:
+        """The library source this describes. See `TowerParams.build`."""
+        return CombTransmitter(
+            position_enu_m=enu_from_horizontal(
+                self.azimuth_deg, self.elevation_deg, self.distance_m
+            ),
+            fundamental_hz=self.fundamental_hz,
+            harmonic_numbers=self.harmonic_numbers,
+            received_powers_jy=self.received_power_jy,
+            bandwidth_hz=self.bandwidth_hz,
+            duty_cycle=1.0 if self.envelope is not None else self.duty_cycle,
+            frame_duration_s=self.frame_duration_s,
+            envelope=_build_envelope(self.envelope),
+            waveform=self.waveform,
+            coupling=_build_coupling(self.coupling),
+            polarization=_build_polarization(self.polarization),
             name=self.name,
         )
 
 
 RFIParams = Annotated[
-    TowerParams | ImpulsiveParams | SatelliteParams | AircraftParams,
+    TowerParams | ImpulsiveParams | SatelliteParams | AircraftParams | CombParams,
     Field(discriminator="type"),
 ]
+
+
+SPECTRAL_LINE_FIELDS = [
+    _num(
+        "center_freq_hz",
+        "Line centre",
+        1420.4058e6,
+        unit="MHz",
+        factor=MHZ,
+        minimum=1.0e6,
+        maximum=1.0e11,
+        step=0.0001,
+        help_text="Default: the 21 cm neutral hydrogen line, rest frame.",
+    ),
+    _num(
+        "fwhm_hz",
+        "Line width (FWHM)",
+        20.0e3,
+        unit="kHz",
+        factor=KHZ,
+        minimum=1.0,
+        maximum=1.0e9,
+        step=1.0,
+    ),
+    _num(
+        "line_flux_jy",
+        "Peak-channel power",
+        1.0,
+        unit="Jy",
+        minimum=0.0,
+        maximum=1.0e6,
+        step=0.1,
+        help_text="Added per antenna, like noise_std^2, tapering as a Gaussian in frequency.",
+    ),
+]
+
+
+class SpectralLineParams(BaseModel):
+    """A celestial spectral line -- ground truth labelled "celestial", not "rfi"."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(default="hi_line", max_length=40)
+    center_freq_hz: float = Field(default=1420.4058e6, gt=0.0, le=1.0e11)
+    fwhm_hz: float = Field(default=20.0e3, gt=0.0, le=1.0e9)
+    line_flux_jy: float = Field(default=1.0, ge=0.0, le=1.0e6)
+
+    def build(self) -> SpectralLineForeground:
+        """The library foreground this describes."""
+        return SpectralLineForeground(
+            center_freq_hz=self.center_freq_hz,
+            fwhm_hz=self.fwhm_hz,
+            line_flux_jy=self.line_flux_jy,
+            name=self.name,
+        )
+
+
+class InstrumentParams(BaseModel):
+    """Per-antenna direction-independent gain realism (see `InstrumentModel`).
+
+    Field names match `InstrumentModel.from_params`'s keyword arguments
+    exactly, so `build` can forward them with a single ``model_dump()``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    gain_scatter_db: float = Field(default=0.4, ge=0.0, le=10.0)
+    phase_offsets: Literal["zero", "uniform"] = "zero"
+    bandpass_ripple_db: float = Field(default=0.05, ge=0.0, le=5.0)
+    bandpass_n_modes: int = Field(default=3, ge=1, le=16)
+    band_slope_db: float = Field(default=0.0, ge=0.0, le=10.0)
+    band_slope_n_modes: int = Field(default=2, ge=1, le=16)
+    subband_scatter_db: float = Field(default=0.0, ge=0.0, le=10.0)
+    n_subbands: int = Field(default=1, ge=1, le=64)
+
+    def build(self, n_antennas: int, rng: np.random.Generator) -> InstrumentModel:
+        """The library model this describes.
+
+        `freq_hz` is deliberately omitted: leaving `band_hz` unset makes
+        the ripple/slope/subband reference band default to whatever grid
+        `InstrumentModel.gains` is later evaluated on, which is exactly
+        the simulated band here -- see `InstrumentModel.from_params`.
+
+        `rng` must already be independent of any other model's generator
+        (see `build_simulator`'s seed derivation) -- passing the same
+        seed both here and to `CalibrationErrorParams.build` would draw
+        the same standard-normal vector for the gain scatter and the
+        calibration phase error, perfectly correlating two effects the
+        rest of the simulator treats as independent.
+        """
+        return InstrumentModel.from_params(n_antennas, rng=rng, **self.model_dump())
+
+
+class CalibrationErrorParams(BaseModel):
+    """Residual calibration error (see `CalibrationErrors`), applied at `correlate`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    phase_error_deg_rms: float = Field(default=5.0, ge=0.0, le=180.0)
+    delay_error_ns_rms: float = Field(default=0.0, ge=0.0, le=10.0)
+    amplitude_error_db_rms: float = Field(default=0.0, ge=0.0, le=10.0)
+
+    def build(self, n_antennas: int, rng: np.random.Generator) -> CalibrationErrors:
+        """The library model this describes.
+
+        `rng` must already be independent of any other model's generator
+        -- see `InstrumentParams.build`.
+        """
+        return CalibrationErrors.from_params(n_antennas, rng=rng, **self.model_dump())
+
+
+class ChannelizerParams(BaseModel):
+    """Polyphase-filterbank channel response (see `PFBChannelizer`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    n_taps: int = Field(default=DEFAULT_N_TAPS, ge=1, le=32)
+    window: Literal["hann", "hamming", "blackman"] = DEFAULT_WINDOW
+    sinc_bandwidth: float = Field(default=DEFAULT_SINC_BANDWIDTH, gt=0.0, le=8.0)
+
+    def build(self) -> PFBChannelizer:
+        """The library channelizer this describes."""
+        return PFBChannelizer(
+            n_taps=self.n_taps, window=self.window, sinc_bandwidth=self.sinc_bandwidth
+        )
+
+
+class PrimaryBeamParams(BaseModel):
+    """A primary beam attenuating celestial flux away from the pointing."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["gaussian", "airy"] = "gaussian"
+    dish_diameter_m: float = Field(default=4.5, gt=0.0, le=1000.0)
+
+    def build(self) -> GaussianBeam | AiryBeam:
+        """The library beam this describes."""
+        cls = GaussianBeam if self.type == "gaussian" else AiryBeam
+        return cls(dish_diameter_m=self.dish_diameter_m)
+
+
+class QuantizationParams(BaseModel):
+    """4-bit quantization of the synthesized voltages.
+
+    Presence of this object on the request (as opposed to ``None``) is
+    what turns quantization on: there is currently one supported mode,
+    ``"int4"``, so there is nothing else for a `type` field to select.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    quant_target_counts: float = Field(default=DEFAULT_QUANT_TARGET_COUNTS, gt=0.0, le=100.0)
+    quant_scale: float | None = Field(default=None, gt=0.0)
 
 
 class SimParams(BaseModel):
@@ -812,7 +1308,16 @@ class SimulateRequest(BaseModel):
     antennas: list[list[float]] = Field(default_factory=list, max_length=MAX_ANTENNAS)
     sky_sources: list[SkySource] = Field(default_factory=list, max_length=MAX_SKY_SOURCES)
     rfi_sources: list[RFIParams] = Field(default_factory=list, max_length=MAX_RFI_SOURCES)
+    spectral_lines: list[SpectralLineParams] = Field(
+        default_factory=list, max_length=MAX_SPECTRAL_LINES
+    )
     sim: SimParams = Field(default_factory=SimParams)
+    n_pol: Literal[1, 2] = 1
+    instrument: InstrumentParams | None = None
+    calibration_errors: CalibrationErrorParams | None = None
+    channelizer: ChannelizerParams | None = None
+    primary_beam: PrimaryBeamParams | None = None
+    quantization: QuantizationParams | None = None
 
     @field_validator("antennas")
     @classmethod
@@ -906,6 +1411,7 @@ def defaults_payload() -> dict[str, Any]:
             "max_n_blocks": MAX_N_BLOCKS,
             "max_sky_sources": MAX_SKY_SOURCES,
             "max_rfi_sources": MAX_RFI_SOURCES,
+            "max_spectral_lines": MAX_SPECTRAL_LINES,
             "max_total_samples": MAX_TOTAL_SAMPLES,
             "dynamic_range_db": DYNAMIC_RANGE_DB,
         },
@@ -913,6 +1419,11 @@ def defaults_payload() -> dict[str, Any]:
             "label": "Sky source",
             "fields": SKY_SOURCE_FIELDS,
             "defaults": _schema_defaults(SKY_SOURCE_FIELDS),
+        },
+        "spectral_line": {
+            "label": "Spectral line",
+            "fields": SPECTRAL_LINE_FIELDS,
+            "defaults": _schema_defaults(SPECTRAL_LINE_FIELDS),
         },
         "rfi_types": [
             dict(entry, defaults=_schema_defaults(entry["fields"])) for entry in RFI_TYPES
@@ -942,6 +1453,31 @@ def _round_grid(values: np.ndarray, decimals: int) -> list[list[float]]:
 # ----------------------------------------------------------------------
 # The run
 # ----------------------------------------------------------------------
+def _feature_seed_sequences(seed: int) -> tuple[np.random.SeedSequence, np.random.SeedSequence]:
+    """Independent seed sequences for the instrument model and calibration errors.
+
+    Both `InstrumentModel.from_params` and `CalibrationErrors.from_params`
+    accept a raw `seed` and, given one, do the same thing internally:
+    build `SeedSequence(seed)` and spawn a fixed number of children in a
+    fixed order for their own effects. `SeedSequence.spawn`'s first child
+    depends only on the seed, not on how many children are requested, so
+    handing both models the same `request.sim.seed` directly would give
+    `InstrumentModel`'s gain-scatter draw and `CalibrationErrors`'s phase
+    error draw the *same* underlying standard-normal vector -- perfectly
+    correlating two effects the rest of the simulator treats as
+    independent. Spawning two children from one root here, and passing
+    each through `rng=` instead of `seed=`, keeps the run fully
+    reproducible from `sim.seed` alone while decorrelating the two
+    models. (`VoltageSimulator`'s own `rng` -- see `build_simulator` --
+    draws entropy from the generator before building its internal seed
+    sequence, a different code path, so it does not re-collide with
+    either of these despite starting from the same `sim.seed`.)
+    """
+    root = np.random.SeedSequence(seed)
+    instrument_seq, calibration_seq = root.spawn(2)
+    return instrument_seq, calibration_seq
+
+
 def build_simulator(request: SimulateRequest) -> VoltageSimulator:
     """Assemble the library objects a request describes.
 
@@ -979,6 +1515,33 @@ def build_simulator(request: SimulateRequest) -> VoltageSimulator:
         for source in request.sky_sources
     ]
     rfi_sources = [source.build() for source in request.rfi_sources]
+    spectral_lines = [line.build() for line in request.spectral_lines]
+
+    n_antennas = len(request.antennas)
+    # All the realism models below are re-seeded from the run's own seed:
+    # there is no separate seed field per feature, so switching one on
+    # never disturbs another, and re-running with the same seed is still
+    # byte-identical (the same guarantee `sim.seed` already gives the sky,
+    # noise and RFI draws). Instrument and calibration errors additionally
+    # go through `_feature_seed_sequences` rather than the raw seed, so
+    # that the two models -- which both spawn children from a seed
+    # sequence the same way -- do not draw the same underlying random
+    # vector for two supposedly-independent effects.
+    instrument_seq, _ = _feature_seed_sequences(request.sim.seed)
+    instrument = (
+        None
+        if request.instrument is None
+        else request.instrument.build(n_antennas, np.random.default_rng(instrument_seq))
+    )
+    channelizer = None if request.channelizer is None else request.channelizer.build()
+    primary_beam = None if request.primary_beam is None else request.primary_beam.build()
+
+    quantization = None if request.quantization is None else "int4"
+    quant_kwargs: dict[str, Any] = {}
+    if request.quantization is not None:
+        quant_kwargs["quant_target_counts"] = request.quantization.quant_target_counts
+        if request.quantization.quant_scale is not None:
+            quant_kwargs["quant_scale"] = request.quantization.quant_scale
 
     return VoltageSimulator(
         array,
@@ -986,12 +1549,19 @@ def build_simulator(request: SimulateRequest) -> VoltageSimulator:
         start_time,
         sources,
         rfi_sources=rfi_sources,
+        spectral_lines=spectral_lines,
         center_freq_hz=request.sim.center_freq_hz,
         n_chan=request.sim.n_chan,
         n_time_per_block=N_TIME_PER_BLOCK,
         n_blocks=request.sim.n_blocks,
         noise_std=request.sim.noise_std,
+        n_pol=request.n_pol,
+        channelizer=channelizer,
+        instrument=instrument,
+        quantization=quantization,
+        primary_beam=primary_beam,
         rng=np.random.default_rng(request.sim.seed),
+        **quant_kwargs,
     )
 
 
@@ -1005,8 +1575,9 @@ class _WaterfallReducer:
     alive at a time rather than the whole observation's.
     """
 
-    def __init__(self, simulator: VoltageSimulator) -> None:
+    def __init__(self, simulator: VoltageSimulator, pol: int = 0) -> None:
         self._simulator = simulator
+        self._pol = pol
         self.chan_bins, self.time_bins_per_block = _waterfall_shape(
             simulator.n_antennas, simulator.n_chan, simulator.n_blocks
         )
@@ -1026,9 +1597,12 @@ class _WaterfallReducer:
             yield block
 
     def _absorb(self, block: Any) -> None:
-        power = (block.data.real.astype(np.float64) ** 2) + (
-            block.data.imag.astype(np.float64) ** 2
-        )
+        # `pol_data` always carries the polarization axis (length 1 for a
+        # single-polarization run), so selecting `self._pol` here works
+        # identically whether or not the simulator was built with n_pol=2;
+        # the waterfall always shows exactly one receptor.
+        data = block.pol_data[:, self._pol]
+        power = data.real.astype(np.float64) ** 2 + data.imag.astype(np.float64) ** 2
         power = bin_mean(power, axis=2, n_bins=self.time_bins_per_block)
         power = bin_mean(power, axis=1, n_bins=self.chan_bins)
         self._power_columns.append(power)
@@ -1100,13 +1674,20 @@ def _to_decibels(power: np.ndarray) -> tuple[np.ndarray, float, float, float]:
     return decibels, low, high, peak_db
 
 
-def run_simulation(request: SimulateRequest) -> dict[str, Any]:
+def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
     """Run one observation and reduce it to what a browser can draw.
 
     Parameters
     ----------
     request : SimulateRequest
         A validated request.
+    pol : int, optional
+        Which receptor the waterfall display shows, ``0`` or ``1``.
+        Meaningless (and harmless) for a single-polarization run, which
+        has only receptor ``0``. Default 0. The dirty image is unaffected
+        by this: it always images Stokes I (see `dirty_image`'s own
+        ``pol=None`` default), so a polarization comparison belongs in the
+        waterfall, not the image.
 
     Returns
     -------
@@ -1130,8 +1711,17 @@ def run_simulation(request: SimulateRequest) -> dict[str, Any]:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         simulator = build_simulator(request)
-        reducer = _WaterfallReducer(simulator)
-        visibilities = correlate(reducer.stream())
+        pol = int(pol) if simulator.n_pol > 1 else 0
+        reducer = _WaterfallReducer(simulator, pol=pol)
+        _, calibration_seq = _feature_seed_sequences(request.sim.seed)
+        calibration_errors = (
+            None
+            if request.calibration_errors is None
+            else request.calibration_errors.build(
+                simulator.n_antennas, np.random.default_rng(calibration_seq)
+            )
+        )
+        visibilities = correlate(reducer.stream(), calibration_errors=calibration_errors)
         reduced = reducer.reduced()
 
         channel_step = max(1, simulator.n_chan // IMAGE_MAX_CHANNELS)
@@ -1213,6 +1803,9 @@ def run_simulation(request: SimulateRequest) -> dict[str, Any]:
             "center_freq_hz": simulator.center_freq_hz,
             "start_time_utc": START_TIME_UTC,
             "seed": request.sim.seed,
+            "n_pol": simulator.n_pol,
+            "pol_names": list(visibilities.pol_names),
+            "waterfall_pol": pol,
         },
         "warnings": messages,
         "wall_time_s": round(wall_time_s, 3),

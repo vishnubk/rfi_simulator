@@ -228,6 +228,129 @@ def test_bandpass_is_smoother_with_fewer_modes():
     assert np.std(np.diff(few, axis=1)) < np.std(np.diff(many, axis=1))
 
 
+# ----------------------------------------------------------------------
+# Package F2: across-band sensitivity diversity
+# ----------------------------------------------------------------------
+def test_band_slope_and_subband_default_off_are_bit_identical():
+    """New F2 parameters at zero reproduce the pre-existing gains exactly."""
+    common = dict(seed=13, gain_scatter_db=0.5, bandpass_ripple_db=0.05, freq_hz=FREQ_HZ)
+    baseline = InstrumentModel.from_params(10, **common).gains(FREQ_HZ)
+    explicit_zero = InstrumentModel.from_params(
+        10, band_slope_db=0.0, subband_scatter_db=0.0, n_subbands=1, **common
+    ).gains(FREQ_HZ)
+    np.testing.assert_array_equal(baseline, explicit_zero)
+
+
+def test_band_slope_and_subband_are_off_by_default_and_need_no_seed():
+    model = InstrumentModel.from_params(4)
+    assert model.n_band_slope_modes == 0
+    assert model.n_subbands == 0
+    np.testing.assert_array_equal(model.band_slope_db(FREQ_HZ), np.zeros((4, FREQ_HZ.size)))
+    np.testing.assert_array_equal(model.subband_db(FREQ_HZ), np.zeros((4, FREQ_HZ.size)))
+
+
+def test_band_slope_and_subband_do_not_disturb_existing_effects():
+    """Switching on F2 leaves the amplitude/phase/ripple draws untouched."""
+    common = dict(seed=51, gain_scatter_db=0.4, phase_offsets="uniform", bandpass_ripple_db=0.05)
+    plain = InstrumentModel.from_params(8, freq_hz=FREQ_HZ, **common)
+    extended = InstrumentModel.from_params(
+        8, band_slope_db=0.6, subband_scatter_db=0.3, n_subbands=4, freq_hz=FREQ_HZ, **common
+    )
+    np.testing.assert_array_equal(plain.scalar_gains, extended.scalar_gains)
+    np.testing.assert_array_equal(plain.bandpass_db(FREQ_HZ), extended.bandpass_db(FREQ_HZ))
+    assert extended.n_band_slope_modes > 0
+    assert extended.n_subbands == 4
+
+
+def test_band_slope_rms_matches_the_configured_db():
+    slope_db = 0.8
+    model = InstrumentModel.from_params(
+        400, seed=71, band_slope_db=slope_db, band_slope_n_modes=2, freq_hz=FREQ_HZ
+    )
+    profile = model.band_slope_db(FREQ_HZ)
+    assert profile.shape == (400, FREQ_HZ.size)
+    assert np.std(profile) == pytest.approx(slope_db, rel=0.1)
+    # A low-order shape: at most a couple of sign changes across the band,
+    # unlike the many-wiggle bandpass ripple.
+    sign_changes = np.sum(np.diff(np.sign(profile[0])) != 0)
+    assert sign_changes <= 4
+
+
+def test_band_slope_composes_with_existing_ripple_and_gain_scatter():
+    """The gains ground truth reflects amplitude scatter, ripple and slope together."""
+    model = InstrumentModel.from_params(
+        300,
+        seed=23,
+        gain_scatter_db=0.3,
+        bandpass_ripple_db=0.05,
+        bandpass_n_modes=3,
+        band_slope_db=1.0,
+        band_slope_n_modes=2,
+        freq_hz=FREQ_HZ,
+    )
+    gains = model.gains(FREQ_HZ)
+    expected_db = (
+        model.amplitude_db[:, np.newaxis]
+        + model.bandpass_db(FREQ_HZ)
+        + model.band_slope_db(FREQ_HZ)
+    )
+    measured_db = 20.0 * np.log10(np.abs(gains))
+    np.testing.assert_allclose(measured_db, expected_db, atol=1e-9)
+
+
+def test_subband_offsets_have_the_requested_scatter():
+    scatter_db = 0.7
+    model = InstrumentModel.from_params(
+        500, seed=61, subband_scatter_db=scatter_db, n_subbands=6, freq_hz=FREQ_HZ
+    )
+    assert model.subband_offset_db.shape == (500, 6)
+    measured = np.std(model.subband_offset_db)
+    assert measured == pytest.approx(scatter_db, rel=0.1)
+
+
+def test_subband_boundaries_land_where_specified():
+    """Channels split evenly across n_subbands, in ascending frequency order."""
+    model = InstrumentModel.from_params(
+        4, seed=2, subband_scatter_db=0.5, n_subbands=4, freq_hz=FREQ_HZ
+    )
+    idx = model.subband_index(FREQ_HZ)
+    assert idx.min() == 0
+    assert idx.max() == 3
+    # Monotonic non-decreasing: subbands are contiguous chunks in
+    # ascending frequency, not scattered across the band.
+    assert np.all(np.diff(idx) >= 0)
+    # Roughly equal-sized chunks.
+    counts = np.bincount(idx, minlength=4)
+    assert counts.min() > 0.5 * counts.max()
+
+
+def test_subband_db_is_a_step_function_matching_the_offsets():
+    model = InstrumentModel.from_params(
+        3, seed=19, subband_scatter_db=0.6, n_subbands=3, freq_hz=FREQ_HZ
+    )
+    idx = model.subband_index(FREQ_HZ)
+    step = model.subband_db(FREQ_HZ)
+    for ant in range(3):
+        np.testing.assert_allclose(step[ant], model.subband_offset_db[ant, idx])
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"band_slope_db": -1.0}, "band_slope_db"),
+        ({"band_slope_n_modes": 0}, "band_slope_n_modes"),
+        ({"subband_scatter_db": -1.0}, "subband_scatter_db"),
+        ({"n_subbands": 0}, "n_subbands"),
+        ({"band_slope_db": 0.4, "seed": None}, "needs an rng or a seed"),
+    ],
+)
+def test_band_slope_and_subband_params_are_validated(kwargs, match):
+    options = dict(n_antennas=6, seed=4)
+    options.update(kwargs)
+    with pytest.raises(ValueError, match=match):
+        InstrumentModel.from_params(**options)
+
+
 def test_uniform_phase_offsets_cover_the_circle():
     model = InstrumentModel.from_params(4000, seed=8, phase_offsets="uniform")
     phase = model.phase_rad

@@ -13,7 +13,10 @@ The pipeline is four steps long::
 
 from rfi_simulator.aircraft import ADSB_FREQ_HZ, ADSBTransponder
 from rfi_simulator.array_config import ArrayConfig
+from rfi_simulator.beam import AiryBeam, GaussianBeam, PrimaryBeam
 from rfi_simulator.binning import bin_any, bin_mean, block_any
+from rfi_simulator.calibration import CalibrationErrors
+from rfi_simulator.channelizer import PFBChannelizer
 from rfi_simulator.correlator import Visibilities, baseline_index_pairs, correlate
 from rfi_simulator.delays import (
     SPEED_OF_LIGHT_M_S,
@@ -48,6 +51,7 @@ from rfi_simulator.rfi import (
     enu_from_horizontal,
     path_delays_s,
     resolve_coupling,
+    resolve_polarization,
 )
 from rfi_simulator.satellites import (
     SatelliteTransmitter,
@@ -70,13 +74,18 @@ __all__ = [
     "OCCUPANCY_THRESHOLD",
     "SPEED_OF_LIGHT_M_S",
     "ADSBTransponder",
+    "AiryBeam",
     "ArrayConfig",
     "BlockContext",
+    "CalibrationErrors",
     "CombTransmitter",
+    "GaussianBeam",
     "ImpulsiveBroadband",
     "InstrumentModel",
     "NarrowbandTransmitter",
+    "PFBChannelizer",
     "PointSource",
+    "PrimaryBeam",
     "RFISource",
     "SatelliteTransmitter",
     "SpectralLineForeground",
@@ -109,6 +118,7 @@ __all__ = [
     "radec_from_lm",
     "read_tle_file",
     "resolve_coupling",
+    "resolve_polarization",
     "source_unit_vectors_enu",
     "spectral_kurtosis_mask",
     "sumthreshold_mask",
