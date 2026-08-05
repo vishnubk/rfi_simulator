@@ -256,12 +256,19 @@
           <span class="display-sub mono" id="image-sub"></span>
         </figcaption>
         <p class="display-note">
-          The sky as this array reconstructs it, before any deconvolution. The circle
-          marks the brightest pixel.
+          The sky as this array reconstructs it, before any deconvolution. ◇ marks
+          where a simulated source truly is · + marks the brightest pixel (which,
+          with RFI present, may not be a source at all).
         </p>
         <div class="canvas-wrap">
           <canvas id="image-canvas"></canvas>
         </div>
+        <p class="hint mono" id="image-recovered"></p>
+        <p class="hint" id="image-outside" hidden></p>
+        <p class="hint" id="image-sidelobe-note" hidden>
+          Ripples around the sources are sidelobes — the imaging artefact of a
+          small array, not extra sources.
+        </p>
       </figure>
 
       <figure class="display" id="uv-display">

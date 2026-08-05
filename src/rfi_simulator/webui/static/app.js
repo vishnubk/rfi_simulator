@@ -28,6 +28,7 @@
   var MASK_RGB = "228, 87, 75";
   var MASK_ALPHA = 0.45;
   var SKY_MARKER = "#3e8fb0";
+  var TRUTH_MARKER = "#e8b339";
   var AXIS_STROKE = "#39404b";
   var GRID_STROKE = "#262c35";
   var AXIS_TEXT = "#9aa1ac";
@@ -2155,6 +2156,32 @@
       ctx.restore();
     });
 
+    // Markers: every simulated source's true (l, m), drawn as a labelled
+    // diamond distinct from the brightest-pixel crosshair below — with RFI
+    // present the brightest pixel is not always a real source.
+    (spec.truthMarkers || []).forEach(function (truth) {
+      var tx = plot.x + (truth.x - spec.xLow) / (spec.xHigh - spec.xLow) * plot.w;
+      var ty = plot.y + plot.h - (truth.y - spec.yLow) / (spec.yHigh - spec.yLow) * plot.h;
+      ctx.save();
+      ctx.strokeStyle = TRUTH_MARKER;
+      ctx.fillStyle = TRUTH_MARKER;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.moveTo(tx, ty - 7);
+      ctx.lineTo(tx + 7, ty);
+      ctx.lineTo(tx, ty + 7);
+      ctx.lineTo(tx - 7, ty);
+      ctx.closePath();
+      ctx.stroke();
+      if (truth.label) {
+        ctx.font = PLOT_FONT;
+        ctx.textAlign = "left";
+        ctx.textBaseline = "bottom";
+        ctx.fillText(truth.label, tx + 9, ty - 4);
+      }
+      ctx.restore();
+    });
+
     // Marker: the image's peak, in the sky-source colour.
     if (spec.marker) {
       var mx = plot.x + (spec.marker.x - spec.xLow) / (spec.xHigh - spec.xLow) * plot.w;
@@ -2276,11 +2303,27 @@
     return names.length ? "\nflagged: " + names.join(", ") : "";
   }
 
+  function nearestIndex(sortedValues, target) {
+    var best = 0;
+    var bestDist = Infinity;
+    for (var i = 0; i < sortedValues.length; i += 1) {
+      var dist = Math.abs(sortedValues[i] - target);
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = i;
+      }
+    }
+    return best;
+  }
+
   function renderImage() {
     var canvas = $("image-canvas");
     var result = state.result;
     if (!result) { return; }
     var image = result.image;
+    var skySources = result.sky_sources || [];
+    var inField = skySources.filter(function (source) { return source.in_field; });
+    var outside = skySources.filter(function (source) { return !source.in_field; });
 
     drawHeatmap(canvas, {
       values: image.values,
@@ -2297,15 +2340,38 @@
       yFormat: function (v) { return v.toFixed(3); },
       barFormat: function (v) { return v.toFixed(2); },
       marker: { x: image.peak.l, y: image.peak.m },
+      truthMarkers: inField.map(function (source) {
+        return { x: source.l, y: source.m, label: source.name };
+      }),
       readCell: function (row, col) {
         return "l " + image.l[col].toFixed(4) + "\nm " + image.m[row].toFixed(4)
           + "\n" + image.values[row][col].toFixed(3) + " Jy";
       }
     });
 
-    $("image-sub").textContent =
-      "peak " + image.peak.value_jy.toFixed(3) + " Jy at l "
+    var perSource = inField.map(function (source) {
+      var col = nearestIndex(image.l, source.l);
+      var row = nearestIndex(image.m, source.m);
+      var recovered = image.values[row][col];
+      return source.name + ": " + recovered.toFixed(2) + " Jy recovered (catalog "
+        + source.flux_jy.toFixed(2) + ")";
+    });
+    var peakLine = "brightest pixel: " + image.peak.value_jy.toFixed(3) + " Jy at l "
       + image.peak.l.toFixed(4) + ", m " + image.peak.m.toFixed(4);
+
+    $("image-sub").textContent = perSource.length ? perSource.join(" — ") : peakLine;
+    $("image-recovered").textContent = perSource.length ? peakLine : "";
+
+    var outsideNote = $("image-outside");
+    if (outside.length) {
+      outsideNote.textContent = "Outside the imaged field: "
+        + outside.map(function (source) { return source.name; }).join(", ") + ".";
+      outsideNote.hidden = false;
+    } else {
+      outsideNote.hidden = true;
+    }
+
+    $("image-sidelobe-note").hidden = skySources.length < 1;
   }
 
   function renderUv() {
