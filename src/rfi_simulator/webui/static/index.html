@@ -24,6 +24,9 @@
     <button type="button" class="navlink" id="tab-results" role="tab"
             aria-selected="false" aria-controls="view-results" tabindex="-1"
             data-tab="results">Results</button>
+    <button type="button" class="navlink" id="tab-observatory" role="tab"
+            aria-selected="false" aria-controls="view-observatory" tabindex="-1"
+            data-tab="observatory">Mock Observatory</button>
   </nav>
 
   <div class="topbar-right">
@@ -399,6 +402,150 @@
       </figure>
 
     </div>
+  </div>
+
+  <!-- =========================================== the mock observatory tab -->
+  <div class="tab-panel" id="view-observatory" role="tabpanel"
+       aria-labelledby="tab-observatory" tabindex="-1" hidden>
+
+    <!-- ------------------------------------------------------- the day -->
+    <section class="section" id="section-day" aria-labelledby="day-heading">
+      <div class="section-head">
+        <span class="section-number" aria-hidden="true">1</span>
+        <h2 class="section-title" id="day-heading">A day at the Mock Observatory</h2>
+      </div>
+      <p class="section-intro">
+        The array stares at the meridian at one declination and lets the sky drift
+        through — a transit telescope. Each frame is a fresh snapshot of your Setup
+        (the same antennas, the same interference) with the real radio sky laid in:
+        the Sun, Cas&nbsp;A, Cyg&nbsp;A, Tau&nbsp;A and Vir&nbsp;A, each drawn only
+        while it is genuinely inside the field.
+      </p>
+
+      <div class="obs-controls">
+        <div class="field">
+          <label class="field-label" for="day-dec">
+            Pointing declination <span class="field-unit">degrees</span>
+          </label>
+          <input class="input" type="number" id="day-dec" step="0.1" min="-90" max="90">
+          <div class="chip-row" id="day-dec-chips" role="group"
+               aria-label="Declination shortcuts"></div>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="day-date">Date <span class="field-unit">UTC</span></label>
+          <input class="input" type="date" id="day-date">
+          <p class="field-hint">The day runs from 00:00 to 24:00 UTC.</p>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="day-frames">Frames</label>
+          <input class="input" type="number" id="day-frames" step="1" min="1" max="288">
+          <p class="field-hint" id="day-cadence"></p>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="day-resolution">Detail</label>
+          <select class="input" id="day-resolution">
+            <option value="coarse">Coarse — 32 channels, one integration</option>
+            <option value="fine">Fine — your Setup's recording size</option>
+          </select>
+          <p class="field-hint" id="day-resolution-note"></p>
+        </div>
+
+        <div class="field field-wide">
+          <label class="toggle-label" for="day-carry">
+            <input type="checkbox" id="day-carry">
+            Carry my Setup sky sources
+          </label>
+          <p class="field-hint">
+            Off by default: your sources are placed as offsets from the pointing, so
+            carrying them makes them follow the telescope around all day, which no
+            real source does.
+          </p>
+        </div>
+      </div>
+
+      <div class="obs-run-row">
+        <button type="button" class="button button-run" id="day-build">Build the day</button>
+        <button type="button" class="button button-quiet" id="day-cancel" hidden>Stop</button>
+        <span class="status-cell status-info" id="day-status">nothing built yet</span>
+      </div>
+
+      <div class="progress" id="day-progress" hidden>
+        <div class="progress-fill" id="day-progress-fill"></div>
+      </div>
+
+      <div class="banner banner-error" id="day-error" hidden>
+        <span class="banner-kind">Fix</span>
+        <span id="day-error-text"></span>
+      </div>
+
+      <figure class="display" id="panel-movie">
+        <figcaption>
+          <span class="display-title">The day, one frame at a time</span>
+          <span class="display-sub mono" id="movie-scale"></span>
+        </figcaption>
+
+        <div class="movie-row">
+          <div class="canvas-wrap canvas-wrap-square">
+            <canvas id="movie-canvas" tabindex="0"
+                    aria-label="Dirty image of the current frame. Press space to play, arrow keys to step."></canvas>
+            <p class="display-empty" id="movie-empty">Press “Build the day” to fill this in.</p>
+          </div>
+        </div>
+
+        <div class="display-controls movie-controls">
+          <button type="button" class="button button-accent" id="movie-play" disabled>Play</button>
+          <button type="button" class="button button-small" id="movie-back" disabled>◀</button>
+          <button type="button" class="button button-small" id="movie-forward" disabled>▶</button>
+          <span class="display-sub mono" id="movie-counter"></span>
+        </div>
+
+        <!-- the signature element: 24 hours of this strip, in one band -->
+        <div class="timeline" id="timeline-wrap">
+          <svg id="timeline" role="application" tabindex="0"
+               aria-label="Twenty-four hours at this pointing. Click to jump to a time; arrow keys step through the day."></svg>
+          <p class="timeline-legend" id="timeline-legend"></p>
+        </div>
+
+        <p class="readout mono" id="movie-meta"></p>
+        <p class="muted-line">
+          Everything the telescope records here is either the sky you wanted or
+          something that got in the way.
+        </p>
+      </figure>
+    </section>
+
+    <!-- ---------------------------------------------------- the monitor -->
+    <section class="section" id="section-skynow" aria-labelledby="skynow-heading">
+      <div class="section-head">
+        <span class="section-number" aria-hidden="true">2</span>
+        <h2 class="section-title" id="skynow-heading">Sky now</h2>
+      </div>
+      <p class="section-intro">
+        What is actually over the site at this moment: ephemeris for the Sun, the Moon
+        and the four bright sources, propagated element sets for satellites, and live
+        transponder reports for aircraft within 100 nautical miles.
+      </p>
+
+      <div class="sky-layout">
+        <div class="sky-chart-wrap">
+          <svg id="sky-chart" role="img"
+               aria-label="Horizon chart: zenith at the centre, horizon at the rim."></svg>
+        </div>
+
+        <div class="sky-side">
+          <div class="layer-status" id="sky-layers"></div>
+          <p class="readout mono" id="sky-updated">not polled yet</p>
+          <div class="metric-wrap" id="sky-table"></div>
+          <p class="muted-line">
+            Everything on this chart is a potential interference source — or a calibrator.
+          </p>
+        </div>
+      </div>
+    </section>
+
   </div>
 
 </main>

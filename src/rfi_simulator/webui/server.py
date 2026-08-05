@@ -4,13 +4,18 @@
 what the tests use; `main` is the ``rfi-simulator-ui`` console entry
 point.
 
-The server binds to the loopback interface by default and deliberately
-never reaches the network itself -- neither on the server side nor in the
-page it serves: element sets are pasted in or taken from the bundled
-sample, every asset is served from this process, and the interactive API
-documentation, which would pull its viewer from a content delivery
-network, is switched off. The machine-readable schema stays at
+The server binds to the loopback interface by default. The page it serves
+never reaches the network: every asset comes from this process, and the
+interactive API documentation, which would pull its viewer from a content
+delivery network, is switched off. The machine-readable schema stays at
 ``/api/openapi.json``.
+
+The server reaches the network in exactly one place -- ``GET
+/api/sky/now``, whose live aircraft layer is fetched from a public
+aggregator with a hard timeout and degrades to an empty layer with a
+status when it cannot be reached (see `rfi_simulator.webui.skynow`).
+Nothing a simulation depends on is ever fetched: element sets are pasted
+in or taken from the bundle.
 """
 
 from __future__ import annotations
@@ -30,17 +35,27 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from rfi_simulator import __version__
+from rfi_simulator.webui.observatory import (
+    DayRequest,
+    cancel_day,
+    day_frame,
+    day_status,
+    start_day,
+    timeline_payload,
+)
 from rfi_simulator.webui.simulate import (
     ARRAY_DIR_ENV_VAR,
     FlagRequest,
     SimulateRequest,
     array_detail,
     array_summaries,
+    default_array,
     defaults_payload,
     pointing_payload,
     run_flaggers,
     run_simulation,
 )
+from rfi_simulator.webui.skynow import sky_now
 
 __all__ = ["create_app", "main"]
 
@@ -180,8 +195,12 @@ def create_app(host: str | None = None, array_dir: str | Path | None = None) -> 
     fastapi.FastAPI
         With ``GET /api/defaults``, ``GET /api/pointing``,
         ``GET /api/arrays``, ``GET /api/arrays/{array_id}``,
-        ``POST /api/simulate``, ``POST /api/flag``, and the page itself
-        at ``/``.
+        ``POST /api/simulate``, ``POST /api/flag``, the observatory day
+        (``POST /api/observatory/day``, ``GET /api/observatory/day/{id}``,
+        ``GET /api/observatory/day/{id}/frame/{i}``,
+        ``POST /api/observatory/day/{id}/cancel``,
+        ``GET /api/observatory/timeline``), the live monitor
+        (``GET /api/sky/now``), and the page itself at ``/``.
     """
     app = FastAPI(
         title="Interference simulator",
@@ -318,6 +337,113 @@ def create_app(host: str | None = None, array_dir: str | Path | None = None) -> 
                     status_code=422,
                     content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]},
                 )
+
+    @app.post("/api/observatory/day")
+    def post_observatory_day(request: DayRequest) -> Any:
+        """Start building a simulated day, and answer with its identifier.
+
+        The work happens in a process pool behind this call rather than in
+        it: a day is ninety-six independent simulations, which is minutes
+        of work, and no browser should hold a request open for that. The
+        page polls `get_observatory_day` and reads finished frames one at
+        a time.
+        """
+        try:
+            job_id = start_day(request)
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]},
+            )
+        return {"id": job_id, "total": request.n_frames, "state": "building"}
+
+    @app.get("/api/observatory/day/{job_id}")
+    def get_observatory_day(
+        job_id: str = PathParam(pattern=r"^[0-9a-f]{32}$"),
+    ) -> dict[str, Any]:
+        """How far the day has got, and every finished frame's metadata.
+
+        Deliberately without the images: this is polled once a second
+        while a day builds, and the images are what make a day large.
+        """
+        payload = day_status(job_id)
+        if payload is None:
+            raise HTTPException(
+                status_code=404,
+                detail="no such day: it may have finished over an hour ago and been dropped",
+            )
+        return payload
+
+    @app.get("/api/observatory/day/{job_id}/frame/{index}")
+    def get_observatory_frame(
+        job_id: str = PathParam(pattern=r"^[0-9a-f]{32}$"),
+        index: int = PathParam(ge=0, le=10_000),
+    ) -> dict[str, Any]:
+        """One frame's image and metadata."""
+        payload = day_frame(job_id, index)
+        if payload is None:
+            raise HTTPException(status_code=404, detail=f"no frame {index} in this day")
+        return payload
+
+    @app.post("/api/observatory/day/{job_id}/cancel")
+    def post_observatory_cancel(
+        job_id: str = PathParam(pattern=r"^[0-9a-f]{32}$"),
+    ) -> dict[str, Any]:
+        """Stop building. Frames already finished stay readable."""
+        payload = cancel_day(job_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="no such day")
+        return payload
+
+    @app.get("/api/observatory/timeline")
+    def get_observatory_timeline(
+        date: str = Query(max_length=32),
+        dec_deg: float = Query(ge=-90.0, le=90.0),
+        latitude_deg: float = Query(ge=-90.0, le=90.0),
+        longitude_deg: float = Query(ge=-360.0, le=360.0),
+        height_m: float = Query(default=0.0, ge=-500.0, le=1.0e4),
+        tle_text: str = Query(default="", max_length=4000),
+    ) -> Any:
+        """Everything the day's timeline band draws, for one date and strip.
+
+        Cheap enough to answer while the controls are still being edited:
+        no simulation happens here, only ephemeris and, when the setup has
+        a satellite, one propagation across the day.
+        """
+        try:
+            return timeline_payload(
+                date, dec_deg, latitude_deg, longitude_deg, height_m, tle_text=tle_text
+            )
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": [
+                        {"loc": ["query", "date"], "msg": str(exc), "type": "value_error"}
+                    ]
+                },
+            )
+
+    @app.get("/api/sky/now")
+    def get_sky_now(
+        latitude_deg: float | None = Query(default=None, ge=-90.0, le=90.0),
+        longitude_deg: float | None = Query(default=None, ge=-360.0, le=360.0),
+        height_m: float | None = Query(default=None, ge=-500.0, le=1.0e4),
+    ) -> dict[str, Any]:
+        """What is over the site at this instant.
+
+        This is the one endpoint in the server that reaches the network,
+        and it is the one endpoint that is allowed to fail in part: the
+        ephemeris layers are always there, and a layer whose source is
+        unreachable comes back empty with a status saying so rather than
+        taking the response down with it.
+        """
+        site = default_array()
+        return sky_now(
+            site.latitude_deg if latitude_deg is None else latitude_deg,
+            site.longitude_deg if longitude_deg is None else longitude_deg,
+            site.height_m if height_m is None else height_m,
+        )
 
     @app.get("/")
     def get_index() -> FileResponse:

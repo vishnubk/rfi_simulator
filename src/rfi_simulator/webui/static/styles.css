@@ -1364,9 +1364,154 @@ details.realism > summary { font-size: 13px; font-weight: 600; color: var(--ink)
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
 }
 
+/* ----------------------------------------------- the mock observatory */
+
+.obs-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px 16px;
+  margin-bottom: 14px;
+}
+
+/* Shortcut chips under the declination box. They are shortcuts, not modes:
+ * pressing one writes a number into the field above and nothing else, so
+ * none of them stays lit. */
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 5px;
+}
+.chip {
+  font: inherit;
+  font-size: 11.5px;
+  padding: 2px 9px;
+  border: 1px solid var(--edge);
+  border-radius: 11px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+.chip:hover { border-color: var(--amber-line); color: var(--ink); background: var(--amber-wash); }
+.chip[disabled] { opacity: 0.45; cursor: default; }
+.chip[disabled]:hover { border-color: var(--edge); background: var(--surface); color: var(--ink-soft); }
+
+/* A hint that has turned into a warning: same place, same size, one
+ * colour change, so it is read as the same sentence saying something
+ * stronger rather than as a new element appearing. */
+.field-hint-warn { color: var(--amber-line); }
+
+.obs-run-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.progress {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--hairline-strong);
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+.progress-fill {
+  height: 100%;
+  width: 0;
+  background: var(--action);
+  transition: width 0.2s linear;
+}
+
+.canvas-wrap-square {
+  min-height: 0;
+  aspect-ratio: 1 / 1;
+  max-width: 460px;
+  width: 100%;
+  margin: 0 auto;
+}
+.movie-row { display: flex; justify-content: center; }
+.movie-controls { align-items: center; }
+#movie-canvas:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
+
+/* --- the timeline: one band, twenty-four hours ------------------------ */
+.timeline { margin-top: 14px; }
+.timeline svg {
+  display: block;
+  width: 100%;
+  height: 92px;
+  cursor: crosshair;
+  border-radius: var(--radius);
+}
+.timeline svg:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+.timeline-legend {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+.tl-label {
+  fill: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+}
+.tl-marker-label {
+  fill: var(--amber-line);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+}
+.tl-marker { stroke: var(--amber-line); stroke-width: 1.2; }
+.tl-marker-faint { stroke: var(--info-line); stroke-width: 1; stroke-dasharray: 2 3; }
+.tl-satellite { stroke: #00cec9; stroke-width: 1.4; }
+.tl-playhead { stroke: var(--ink); stroke-width: 1.4; }
+.tl-playhead-head { fill: var(--ink); }
+.tl-frame-tick { stroke: rgba(255, 255, 255, 0.28); stroke-width: 1; }
+.tl-frame-tick-pending { stroke: rgba(255, 255, 255, 0.08); }
+.tl-rule { stroke: var(--edge); stroke-width: 1; }
+
+/* --- the live monitor ------------------------------------------------ */
+.sky-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 460px) minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+.sky-chart-wrap {
+  background: var(--console);
+  border-radius: var(--radius);
+  padding: 8px;
+}
+.sky-chart-wrap svg { display: block; width: 100%; height: auto; }
+.sky-side { min-width: 0; }
+.layer-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.sky-ring { fill: none; stroke: #39404b; stroke-width: 1; }
+.sky-ring-dashed { fill: none; stroke: #39404b; stroke-width: 1; stroke-dasharray: 3 4; }
+.sky-cardinal {
+  fill: #9aa1ac;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-anchor: middle;
+}
+.sky-tick { fill: #6c7480; font-family: var(--font-mono); font-size: 8.5px; }
+.sky-sun { fill: #fdcb6e; }
+.sky-moon { fill: #dfe3e8; }
+.sky-source { fill: #74b9ff; }
+.sky-satellite { fill: #00cec9; }
+.sky-aircraft { fill: none; stroke: #e17055; stroke-width: 1.2; }
+.sky-glyph-label {
+  fill: #9aa1ac;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+}
+
 /* --------------------------------------------------------- responsive */
 @media (max-width: 960px) {
   .array-layout { grid-template-columns: minmax(0, 1fr); }
+  .sky-layout { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* Narrow enough that the command bar wraps to two rows, so the section row
@@ -1383,4 +1528,8 @@ details.realism > summary { font-size: 13px; font-weight: 600; color: var(--ink)
 @media (prefers-reduced-motion: reduce) {
   .sweep { animation: none; background: rgba(253, 203, 110, 0.1); }
   .button:active { transform: none; }
+  /* The day's progress bar jumps rather than slides, and a finished day
+   * waits to be played rather than playing itself -- see `maybeAutoplay`
+   * in app.js, which reads the same preference. */
+  .progress-fill { transition: none; }
 }

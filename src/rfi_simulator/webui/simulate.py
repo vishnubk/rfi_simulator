@@ -2140,13 +2140,34 @@ def _feature_seed_sequences(seed: int) -> tuple[np.random.SeedSequence, np.rando
     return instrument_seq, calibration_seq
 
 
-def build_simulator(request: SimulateRequest) -> VoltageSimulator:
+def build_simulator(
+    request: SimulateRequest,
+    *,
+    start_time: Time | None = None,
+    phase_center: SkyCoord | None = None,
+    extra_sources: list[PointSource] | None = None,
+) -> VoltageSimulator:
     """Assemble the library objects a request describes.
 
     Parameters
     ----------
     request : SimulateRequest
         A validated request.
+    start_time : astropy.time.Time, optional
+        When the observation starts. Defaults to `START_TIME_UTC`, which
+        is what the single-run endpoint uses so that a run is reproducible
+        from its seed alone. The observatory day passes one instant per
+        frame instead.
+    phase_center : astropy.coordinates.SkyCoord, optional
+        Where the array points. Defaults to the zenith of the site at
+        `start_time`. The observatory day passes a meridian pointing at a
+        fixed declination, which is not the zenith unless that
+        declination is the site latitude.
+    extra_sources : list of PointSource, optional
+        Celestial sources to observe in addition to `request.sky_sources`,
+        already built at absolute coordinates. The observatory day passes
+        its catalogue this way, so that the catalogue never has to be
+        expressed as an offset from a pointing that moves.
 
     Returns
     -------
@@ -2169,10 +2190,13 @@ def build_simulator(request: SimulateRequest) -> VoltageSimulator:
         height_m=site.height_m if request.site is None else request.site.height_m,
         name=site.name,
     )
-    start_time = Time(START_TIME_UTC, scale="utc")
-    phase_center = zenith_coord(earth_location(array), start_time)
+    if start_time is None:
+        start_time = Time(START_TIME_UTC, scale="utc")
+    if phase_center is None:
+        phase_center = zenith_coord(earth_location(array), start_time)
 
     sources = [source.build(phase_center) for source in request.sky_sources]
+    sources.extend(extra_sources or ())
     rfi_sources = [source.build() for source in request.rfi_sources]
     spectral_lines = [line.build() for line in request.spectral_lines]
 

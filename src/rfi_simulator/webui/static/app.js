@@ -182,6 +182,8 @@
     flagRunning: false,
     flagError: false,     // keeps a refusal on screen until something changes
     notices: [],
+    obs: null,            // the mock observatory's day; see resetObservatory
+    sky: { data: null, timer: null, error: null },   // the live monitor
     history: [],          // last HISTORY_MAX completed runs, oldest first
     historyIndex: -1,     // which of them the result displays are showing
     elapsedTimer: null,
@@ -3556,9 +3558,994 @@
     fillMetricTable($("flagger-metrics"), headers, rows);
   }
 
-  /* ------------------------------------------- 10. tabs and navigation */
+  /* --------------------------------------- 10. the mock observatory */
 
-  /* Two tabs, Setup and Results, with the hash as the single source of
+  /* A simulated day of drift scanning, and a live horizon chart.
+   *
+   * The day is a background job on the server: this side posts the setup,
+   * polls for progress, and pulls each frame's little image as it lands.
+   * Three rules shape everything below.
+   *
+   * **One colour scale for the whole day.** Frames are drawn against the
+   * brightest pixel of the day so far, so a frame going bright means the
+   * sky went bright, not that the scale moved. The scale only ever grows,
+   * and the caption says what it is.
+   *
+   * **The timeline is the instrument.** Twenty-four hours of this strip in
+   * one band: night shaded from the real solar altitude, a mark where each
+   * catalogue source transits, ticks for satellite passes, and a playhead.
+   * Clicking it scrubs. Everything else on the tab stays quiet.
+   *
+   * **Motion is opt-in.** With `prefers-reduced-motion` set, a finished day
+   * never starts playing by itself -- but Play still plays, because the
+   * preference is about surprise, not about capability.
+   */
+
+  var DAY_FPS = 6;
+  var DAY_POLL_MS = 700;
+  var FRAME_FETCH_LIMIT = 6;   // frame images in flight at once
+  var SKY_POLL_MS = 10000;
+  var TIMELINE_DEBOUNCE_MS = 250;
+
+  // Named strips the declination box offers as one click each. Cygnus A's
+  // is a fixed catalogue declination; the Sun's moves with the date, so it
+  // is filled in from the timeline the server sends back.
+  var CYG_A_DEC_DEG = 40.734;
+
+  function reduceMotion() {
+    return Boolean(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+  }
+
+  function pad2(value) { return (value < 10 ? "0" : "") + value; }
+
+  // "2026-08-05T13:05:50.892" -> "13:05". The server speaks ISO UTC
+  // throughout and the page never converts to local time: a drift scan is
+  // indexed by sidereal time, and mixing in a local clock would invite the
+  // reader to compare two different days.
+  function utcClock(isot) {
+    if (!isot) { return "--:--"; }
+    return String(isot).slice(11, 16);
+  }
+
+  function fractionClock(fraction) {
+    var minutes = Math.round(clamp(fraction, 0, 1) * 1440);
+    return pad2(Math.floor(minutes / 60) % 24) + ":" + pad2(minutes % 60);
+  }
+
+  function todayUtc() {
+    var now = new Date();
+    return now.getUTCFullYear() + "-" + pad2(now.getUTCMonth() + 1) + "-" + pad2(now.getUTCDate());
+  }
+
+  function obsSite() {
+    return state.site || (state.defaults && state.defaults.array) || null;
+  }
+
+  // The element set of the setup's satellite source, if it has one, so the
+  // timeline can mark that satellite's passes through the strip.
+  function setupTleText() {
+    var satellite = state.rfiSources.filter(function (source) {
+      return source.type === "satellite";
+    })[0];
+    if (!satellite) { return ""; }
+    if (satellite.tle_source === "custom") { return satellite.tle_text || ""; }
+    return (state.defaults && state.defaults.sample_tle) || "";
+  }
+
+  function resetObservatory() {
+    var site = obsSite();
+    state.obs = {
+      dec_deg: site ? site.latitude_deg : 0,
+      date: todayUtc(),
+      frames: 96,
+      resolution: "coarse",
+      carry: false,
+      jobId: null,
+      total: 0,
+      done: 0,
+      failed: 0,
+      jobState: "idle",
+      meta: [],            // per-frame metadata, index-aligned
+      images: [],          // per-frame image grids, index-aligned, null until fetched
+      inFlight: 0,
+      cursor: 0,
+      playing: false,
+      scaleMax: null,
+      scaleSoft: null,
+      autoplayed: false,
+      fieldOfView: 0.04,
+      timeline: null,
+      timelineKey: "",
+      pollTimer: null,
+      playTimer: null,
+      timelineTimer: null,
+      error: null
+    };
+  }
+
+  /* --- controls ------------------------------------------------------ */
+
+  function renderDecChips() {
+    var host = $("day-dec-chips");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    var site = obsSite();
+    var sunDec = state.obs.timeline ? state.obs.timeline.sun.dec_deg : null;
+    var chips = [
+      ["Zenith strip", site ? site.latitude_deg : null],
+      ["Cyg A's strip", CYG_A_DEC_DEG],
+      ["Sun's strip today", sunDec]
+    ];
+    chips.forEach(function (entry) {
+      var value = entry[1];
+      var label = entry[0];
+      if (value !== null && value !== undefined) {
+        label += " (" + (value >= 0 ? "+" : "") + value.toFixed(1) + "°)";
+      }
+      var chip = el("button", "chip", label);
+      chip.type = "button";
+      if (value === null || value === undefined) {
+        chip.disabled = true;
+        chip.title = "Build or reload the timeline to learn where the Sun is on this date";
+      } else {
+        chip.addEventListener("click", function () {
+          state.obs.dec_deg = Number(value.toFixed(3));
+          $("day-dec").value = state.obs.dec_deg;
+          onDayControlsChanged();
+        });
+      }
+      host.appendChild(chip);
+    });
+  }
+
+  // Two hints that are really one physics statement: the sky drifts through
+  // the field in a fixed number of minutes, and a frame cadence coarser
+  // than that can miss a source entirely. Said in the place the user
+  // controls it, and marked as a warning only when it is actually true.
+  function renderCadenceHint() {
+    var obs = state.obs;
+    if (!obs) { return; }
+    var hint = $("day-cadence");
+    var minutesPerFrame = 1440 / Math.max(1, obs.frames);
+    var crossing = obs.timeline ? obs.timeline.field_crossing_minutes : null;
+    var text = obs.frames + " frames — one every " + minutesPerFrame.toFixed(0) + " min.";
+    hint.classList.remove("field-hint-warn");
+    if (crossing) {
+      text += " A source crosses this strip in " + crossing.toFixed(0) + " min.";
+      if (minutesPerFrame > crossing) {
+        text += " Raise the frames to " + Math.min(288, Math.ceil(1440 / crossing))
+          + " to be sure of catching one.";
+        hint.classList.add("field-hint-warn");
+      }
+    }
+    hint.textContent = text;
+  }
+
+  function renderResolutionNote() {
+    var note = $("day-resolution-note");
+    if (state.obs.resolution === "fine") {
+      note.textContent = "Every frame is a full run at " + state.sim.n_chan + " channels and "
+        + state.sim.n_blocks + " integrations — minutes, not seconds.";
+    } else {
+      note.textContent = "Fewer channels and one integration: noisier, same source positions.";
+    }
+  }
+
+  function renderDayControls() {
+    var obs = state.obs;
+    if (!obs) { return; }
+    $("day-dec").value = obs.dec_deg;
+    $("day-date").value = obs.date;
+    $("day-frames").value = obs.frames;
+    $("day-resolution").value = obs.resolution;
+    $("day-carry").checked = obs.carry;
+    renderDecChips();
+    renderCadenceHint();
+    renderResolutionNote();
+  }
+
+  function setDayStatus(kind, text) {
+    var cell = $("day-status");
+    cell.className = "status-cell status-" + kind;
+    cell.textContent = text;
+  }
+
+  function showDayError(text) {
+    state.obs.error = text || null;
+    $("day-error").hidden = !text;
+    if (text) { $("day-error-text").textContent = text; }
+  }
+
+  /* --- the timeline data --------------------------------------------- */
+
+  function timelineKey() {
+    var site = obsSite() || {};
+    return [state.obs.date, state.obs.dec_deg, site.latitude_deg, site.longitude_deg,
+      site.height_m, setupTleText().length].join("|");
+  }
+
+  function refreshTimeline() {
+    var site = obsSite();
+    if (!site || !state.obs) { return; }
+    var key = timelineKey();
+    if (key === state.obs.timelineKey) { return; }
+    state.obs.timelineKey = key;
+    var query = "?date=" + encodeURIComponent(state.obs.date)
+      + "&dec_deg=" + encodeURIComponent(state.obs.dec_deg)
+      + "&latitude_deg=" + encodeURIComponent(site.latitude_deg)
+      + "&longitude_deg=" + encodeURIComponent(site.longitude_deg)
+      + "&height_m=" + encodeURIComponent(site.height_m)
+      + "&tle_text=" + encodeURIComponent(setupTleText());
+    request("/api/observatory/timeline" + query).then(function (timeline) {
+      state.obs.timeline = timeline;
+      renderDecChips();
+      renderCadenceHint();
+      drawTimeline();
+    }).catch(function (error) {
+      state.obs.timelineKey = "";
+      showDayError("The timeline could not be worked out: " + error.message);
+    });
+  }
+
+  function scheduleTimeline() {
+    window.clearTimeout(state.obs.timelineTimer);
+    state.obs.timelineTimer = window.setTimeout(refreshTimeline, TIMELINE_DEBOUNCE_MS);
+  }
+
+  function onDayControlsChanged() {
+    renderDecChips();
+    renderCadenceHint();
+    renderResolutionNote();
+    scheduleTimeline();
+  }
+
+  /* --- building the day ---------------------------------------------- */
+
+  function stopDayTimers() {
+    window.clearTimeout(state.obs.pollTimer);
+    window.clearInterval(state.obs.playTimer);
+    state.obs.pollTimer = null;
+    state.obs.playTimer = null;
+  }
+
+  function buildDay() {
+    var obs = state.obs;
+    stopDayTimers();
+    obs.playing = false;
+    showDayError(null);
+    obs.jobId = null;
+    obs.meta = [];
+    obs.images = [];
+    obs.inFlight = 0;
+    obs.cursor = 0;
+    obs.done = 0;
+    obs.failed = 0;
+    obs.scaleMax = null;
+    obs.scaleSoft = null;
+    obs.autoplayed = false;
+    obs.total = obs.frames;
+    obs.jobState = "building";
+
+    $("day-build").disabled = true;
+    $("day-cancel").hidden = false;
+    $("day-progress").hidden = false;
+    setDayStatus("warn", "Building the day — 0 of " + obs.frames + " frames");
+    renderMovie();
+
+    request("/api/observatory/day", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        setup: buildRequest(),
+        date: obs.date,
+        pointing_dec_deg: obs.dec_deg,
+        n_frames: Math.round(obs.frames),
+        resolution: obs.resolution,
+        carry_setup_sources: Boolean(obs.carry)
+      })
+    }).then(function (started) {
+      obs.jobId = started.id;
+      obs.total = started.total;
+      pollDay();
+    }).catch(function (error) {
+      obs.jobState = "failed";
+      $("day-build").disabled = false;
+      $("day-cancel").hidden = true;
+      $("day-progress").hidden = true;
+      setDayStatus("error", "could not start");
+      showDayError(error.message);
+    });
+  }
+
+  // A finished day starts playing once there is something to play -- which
+  // is a moment after the job reports "done", because the frame images are
+  // still arriving. Never when the reader has asked for reduced motion,
+  // and never twice for the same day.
+  function maybeAutoplay() {
+    var obs = state.obs;
+    if (obs.autoplayed || obs.jobState !== "done" || obs.failed) { return; }
+    if (reduceMotion() || readyFrames() < 2) { return; }
+    obs.autoplayed = true;
+    setPlaying(true);
+  }
+
+  function cancelDay() {
+    if (!state.obs.jobId) { return; }
+    request("/api/observatory/day/" + state.obs.jobId + "/cancel", { method: "POST" })
+      .catch(function () { /* a day that is already gone needs no stopping */ });
+    setDayStatus("info", "stopping");
+  }
+
+  function pollDay() {
+    var obs = state.obs;
+    if (!obs.jobId) { return; }
+    request("/api/observatory/day/" + obs.jobId).then(function (status) {
+      if (obs.jobId !== status.id) { return; }
+      obs.total = status.total;
+      obs.done = status.done;
+      obs.failed = status.failed;
+      obs.jobState = status.state;
+      obs.meta = status.frames;
+      // The scale only ever grows, so a frame drawn early is not redrawn
+      // darker later on -- it is redrawn against a scale that has room for
+      // the brightest thing the day turned out to hold.
+      if (status.scale_max_jy !== null && status.scale_max_jy !== undefined) {
+        obs.scaleMax = Math.max(obs.scaleMax || 0, status.scale_max_jy);
+      }
+      obs.scaleSoft = status.scale_soft_jy || null;
+      if (obs.images.length !== obs.total) {
+        obs.images = new Array(obs.total);
+      }
+
+      $("day-progress-fill").style.width =
+        (obs.total ? (100 * obs.done / obs.total) : 0).toFixed(1) + "%";
+      fetchPendingFrames();
+      renderMovie();
+      drawTimeline();
+
+      if (status.state === "building") {
+        setDayStatus("warn", "Building the day — " + obs.done + " of " + obs.total + " frames");
+        obs.pollTimer = window.setTimeout(pollDay, DAY_POLL_MS);
+        return;
+      }
+
+      $("day-build").disabled = false;
+      $("day-cancel").hidden = true;
+      $("day-progress").hidden = true;
+      if (status.state === "failed") {
+        setDayStatus("error", "the day could not be built");
+        showDayError(status.error || "the frame pool stopped unexpectedly");
+      } else if (status.state === "cancelled" || status.state === "cancelling") {
+        setDayStatus("info", "Stopped — " + obs.done + " of " + obs.total + " frames built");
+      } else if (obs.failed) {
+        setDayStatus("warn", "Built with " + plural(obs.failed, "failed frame") + " — press play");
+      } else {
+        setDayStatus("ok", "Built — press play");
+      }
+      updateMovieControls();
+      maybeAutoplay();
+    }).catch(function (error) {
+      $("day-build").disabled = false;
+      $("day-cancel").hidden = true;
+      $("day-progress").hidden = true;
+      setDayStatus("error", "lost track of this day");
+      showDayError(error.message);
+    });
+  }
+
+  // Frame images are pulled one request each, a few at a time: the status
+  // poll is deliberately imageless, so this is where the pictures arrive.
+  function fetchPendingFrames() {
+    var obs = state.obs;
+    for (var index = 0; index < obs.total; index += 1) {
+      if (obs.inFlight >= FRAME_FETCH_LIMIT) { return; }
+      var meta = obs.meta[index];
+      if (!meta || meta.error || obs.images[index] !== undefined) { continue; }
+      obs.images[index] = null;             // claimed, not yet arrived
+      obs.inFlight += 1;
+      fetchFrame(obs.jobId, index);
+    }
+  }
+
+  function fetchFrame(jobId, index) {
+    request("/api/observatory/day/" + jobId + "/frame/" + index).then(function (frame) {
+      if (state.obs.jobId !== jobId) { return; }
+      state.obs.images[index] = frame.pending ? undefined : frame.image;
+      if (frame.field_of_view_rad) { state.obs.fieldOfView = frame.field_of_view_rad; }
+      if (index === state.obs.cursor) { renderMovie(); }
+      drawTimeline();
+    }).catch(function () {
+      if (state.obs.jobId === jobId) { state.obs.images[index] = undefined; }
+    }).then(function () {
+      state.obs.inFlight = Math.max(0, state.obs.inFlight - 1);
+      if (state.obs.jobId === jobId) {
+        fetchPendingFrames();
+        maybeAutoplay();
+      }
+    });
+  }
+
+  /* --- playback ------------------------------------------------------ */
+
+  function readyFrames() {
+    return state.obs.images.filter(function (image) { return Boolean(image); }).length;
+  }
+
+  function setPlaying(on) {
+    var obs = state.obs;
+    window.clearInterval(obs.playTimer);
+    obs.playing = Boolean(on) && readyFrames() > 1;
+    if (obs.playing) {
+      obs.playTimer = window.setInterval(function () { stepFrame(1); }, 1000 / DAY_FPS);
+    }
+    updateMovieControls();
+  }
+
+  function stepFrame(step) {
+    var obs = state.obs;
+    if (!obs.total) { return; }
+    // Skip past frames that failed or have not arrived, so playback never
+    // stalls on a hole; if nothing is ready, stop rather than spin.
+    for (var tried = 0; tried < obs.total; tried += 1) {
+      obs.cursor = ((obs.cursor + step) % obs.total + obs.total) % obs.total;
+      if (obs.images[obs.cursor]) { renderMovie(); return; }
+    }
+    setPlaying(false);
+  }
+
+  function goToFrame(index) {
+    state.obs.cursor = clamp(Math.round(index), 0, Math.max(0, state.obs.total - 1));
+    renderMovie();
+  }
+
+  function updateMovieControls() {
+    var ready = readyFrames();
+    var play = $("movie-play");
+    play.disabled = ready < 2;
+    play.textContent = state.obs.playing ? "Pause" : "Play";
+    play.setAttribute("aria-pressed", String(state.obs.playing));
+    $("movie-back").disabled = ready < 1;
+    $("movie-forward").disabled = ready < 1;
+  }
+
+  /* --- drawing the movie --------------------------------------------- */
+
+  /* One fixed brightness mapping for the whole day.
+   *
+   * A day of drift scanning spans six orders of magnitude: an empty field
+   * is a couple of millijanskys of noise, Cygnus A crossing it is fifteen
+   * hundred janskys. Linear, and either the source is the only thing you
+   * ever see or the noise saturates. So the day is drawn through an
+   * arcsinh stretch -- linear near zero, logarithmic far from it, the
+   * ordinary astronomical answer -- with its soft point at what a typical
+   * frame's brightest pixel actually is.
+   *
+   * It is still one mapping for the whole day, computed once from the
+   * finished frames: a frame that looks brighter *is* brighter. Only the
+   * spacing of the greys between the two ends is non-linear, and the
+   * caption says so.
+   */
+  function asinh(value) {
+    return Math.log(value + Math.sqrt(value * value + 1));
+  }
+
+  function dayStretch(image, soft, vmax) {
+    var top = asinh(vmax / soft) || 1;
+    return image.map(function (row) {
+      return row.map(function (value) {
+        return asinh(Math.max(value, 0) / soft) / top;
+      });
+    });
+  }
+
+  function lmAxis(nPix, fieldOfView) {
+    var axis = [];
+    for (var i = 0; i < nPix; i += 1) {
+      axis.push(nPix === 1 ? 0 : -0.5 * fieldOfView + fieldOfView * (i / (nPix - 1)));
+    }
+    return axis;
+  }
+
+  function renderMovie() {
+    var obs = state.obs;
+    if (!obs) { return; }
+    var image = obs.images[obs.cursor];
+    var meta = obs.meta[obs.cursor];
+    $("movie-empty").hidden = Boolean(image);
+    updateMovieControls();
+    drawTimeline();
+
+    if (!image) {
+      $("movie-counter").textContent = obs.total
+        ? "frame " + (obs.cursor + 1) + " of " + obs.total + " — not built yet"
+        : "";
+      $("movie-meta").textContent = meta && meta.error ? "This frame failed: " + meta.error : "";
+      $("movie-scale").textContent = "";
+      return;
+    }
+
+    var axis = lmAxis(image.length, obs.fieldOfView);
+    var vmax = obs.scaleMax || 1;
+    // The soft point only exists once a frame has finished; without one
+    // the day is drawn linearly, which is right for a day that is one
+    // frame long.
+    var soft = obs.scaleSoft;
+    var stretched = soft ? dayStretch(image, soft, vmax) : image;
+    var top = soft ? asinh(vmax / soft) || 1 : 1;
+    drawHeatmap($("movie-canvas"), {
+      values: stretched,
+      vmin: 0,
+      vmax: soft ? 1 : vmax,
+      xLow: axis[0],
+      xHigh: axis[axis.length - 1],
+      yLow: axis[0],
+      yHigh: axis[axis.length - 1],
+      xLabel: "l (direction cosine)",
+      yLabel: "m (direction cosine)",
+      barLabel: "Jy",
+      xFormat: function (v) { return v.toFixed(3); },
+      yFormat: function (v) { return v.toFixed(3); },
+      // The colour bar is labelled in janskys even though the values it
+      // was handed are stretched: its two ends are undone by the inverse
+      // of the stretch, so the reader sees the physical scale.
+      barFormat: function (v) {
+        var jy = soft ? soft * Math.sinh(v * top) : v;
+        return jy.toFixed(jy < 10 ? 3 : 0);
+      },
+      truthMarkers: (meta && meta.sources || []).map(function (source) {
+        return { x: source.l, y: source.m, label: source.name };
+      }),
+      readCell: function (row, col) {
+        return "l " + axis[col].toFixed(4) + "\nm " + axis[row].toFixed(4)
+          + "\n" + image[row][col].toFixed(3) + " Jy";
+      }
+    });
+
+    $("movie-scale").textContent = "scale 0 – " + vmax.toFixed(vmax < 10 ? 3 : 0)
+      + " Jy" + (soft ? ", arcsinh stretch" : "") + " (fixed for the day)";
+    $("movie-counter").textContent = "frame " + (obs.cursor + 1) + " of " + obs.total;
+
+    var parts = [];
+    if (meta) {
+      parts.push(utcClock(meta.utc) + " UTC");
+      parts.push("LST " + fractionClock(((meta.lst_deg % 360) + 360) % 360 / 360));
+      parts.push("pointing " + meta.ra_deg.toFixed(2) + "°, " + meta.dec_deg.toFixed(2) + "°");
+      if (meta.sources.length) {
+        parts.push(meta.sources.map(function (source) {
+          return source.name + " in field: " + source.flux_jy.toFixed(0) + " Jy";
+        }).join(" · "));
+      } else {
+        parts.push("empty field");
+      }
+    }
+    $("movie-meta").textContent = parts.join("   ");
+  }
+
+  /* --- drawing the timeline ------------------------------------------ */
+
+  // Night is shaded from the real solar altitude rather than from sunrise
+  // and sunset alone, so civil, nautical and astronomical twilight appear
+  // as the gradient they are. Above the horizon is the page's own day
+  // colour; 18 degrees below it is as dark as the band gets.
+  function nightColour(altitudeDeg) {
+    if (altitudeDeg > 0) { return "#eef1f6"; }
+    var depth = clamp(-altitudeDeg / 18, 0, 1);
+    var top = [222, 228, 236];
+    var bottom = [23, 26, 30];
+    return "rgb(" + top.map(function (value, i) {
+      return Math.round(value + (bottom[i] - value) * depth);
+    }).join(",") + ")";
+  }
+
+  function drawTimeline() {
+    var svg = $("timeline");
+    if (!state.obs) { return; }
+    var timeline = state.obs.timeline;
+    while (svg.firstChild) { svg.removeChild(svg.firstChild); }
+    var width = Math.max(320, Math.round(svg.getBoundingClientRect().width));
+    var height = 92;
+    svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+    if (!timeline) { return; }
+
+    var bandY = 24;
+    var bandH = 30;
+    var laneY = bandY + bandH;
+    var laneH = 16;
+
+    function x(fraction) { return clamp(fraction, 0, 1) * width; }
+
+    // The sky band: one thin rectangle per sample of the solar altitude.
+    var altitudes = timeline.sun.altitude_deg;
+    var fractions = timeline.sun.sample_fractions;
+    for (var i = 0; i < altitudes.length - 1; i += 1) {
+      var left = x(fractions[i]);
+      var right = x(fractions[i + 1]);
+      svg.appendChild(svgNode("rect", {
+        x: left, y: bandY, width: Math.max(1, right - left + 0.6), height: bandH,
+        fill: nightColour((altitudes[i] + altitudes[i + 1]) / 2)
+      }));
+    }
+    svg.appendChild(svgNode("rect", {
+      x: 0.5, y: bandY + 0.5, width: width - 1, height: bandH - 1,
+      fill: "none", class: "tl-rule"
+    }));
+
+    // Which frames exist: a hairline per built frame along the top of the
+    // band, so the band doubles as the progress bar it already is.
+    state.obs.meta.forEach(function (meta, index) {
+      if (!state.obs.total) { return; }
+      var at = x((index + 0.5) / state.obs.total);
+      svg.appendChild(svgNode("line", {
+        x1: at, y1: bandY + 1, x2: at, y2: bandY + 5,
+        class: meta && !meta.error ? "tl-frame-tick" : "tl-frame-tick-pending"
+      }));
+    });
+
+    // Sunrise and sunset: a small disc on the horizon line of the band.
+    function sunGlyph(fraction, rising) {
+      var at = x(fraction);
+      var group = svgNode("g", {});
+      group.appendChild(svgNode("circle", {
+        cx: at, cy: bandY + bandH / 2, r: 3.4, fill: "#fdcb6e",
+        stroke: "#d4a017", "stroke-width": 0.8
+      }));
+      group.appendChild(svgNode("line", {
+        x1: at - 6, y1: bandY + bandH / 2, x2: at + 6, y2: bandY + bandH / 2,
+        stroke: "#d4a017", "stroke-width": 0.8
+      }));
+      var label = svgNode("text", {
+        x: at, y: bandY - 4, class: "tl-label", "text-anchor": "middle"
+      });
+      label.textContent = (rising ? "sunrise " : "sunset ") + fractionClock(fraction);
+      group.appendChild(label);
+      svg.appendChild(group);
+    }
+    timeline.sun.sunrise.forEach(function (fraction) { sunGlyph(fraction, true); });
+    timeline.sun.sunset.forEach(function (fraction) { sunGlyph(fraction, false); });
+
+    // Satellite passes, as thin ticks in the lane under the band.
+    (timeline.satellite.passes || []).forEach(function (pass) {
+      svg.appendChild(svgNode("rect", {
+        x: x(pass.start), y: laneY + 1,
+        width: Math.max(1.4, x(pass.end) - x(pass.start)), height: laneH - 2,
+        fill: "#00cec9", opacity: 0.75
+      }));
+    });
+
+    // Calibrator transits. A source this strip never sees is drawn faint
+    // and dashed rather than left out: "never in this strip" is a fact
+    // about the declination the user chose, and hiding it hides the fix.
+    var placed = [];
+    timeline.sources.forEach(function (source) {
+      source.transits.forEach(function (fraction) {
+        var at = x(fraction);
+        svg.appendChild(svgNode("line", {
+          x1: at, y1: bandY, x2: at, y2: laneY + laneH,
+          class: source.in_field ? "tl-marker" : "tl-marker-faint"
+        }));
+        if (!source.in_field) { return; }
+        // Labels are dropped rather than overprinted when two transits
+        // land within a few pixels of each other.
+        var collides = placed.some(function (other) { return Math.abs(other - at) < 34; });
+        if (collides) { return; }
+        placed.push(at);
+        var label = svgNode("text", {
+          x: clamp(at, 16, width - 16), y: laneY + laneH + 11,
+          class: "tl-marker-label", "text-anchor": "middle"
+        });
+        label.textContent = source.name;
+        svg.appendChild(label);
+      });
+    });
+
+    // Hour rule.
+    for (var hour = 0; hour <= 24; hour += 3) {
+      var hx = x(hour / 24);
+      svg.appendChild(svgNode("line", {
+        x1: hx, y1: laneY + laneH, x2: hx, y2: laneY + laneH + 3, class: "tl-rule"
+      }));
+      var tick = svgNode("text", {
+        x: clamp(hx, 10, width - 10), y: height - 3, class: "tl-label", "text-anchor": "middle"
+      });
+      tick.textContent = pad2(hour % 24) + ":00";
+      svg.appendChild(tick);
+    }
+
+    // The playhead, only once there is a day to point into.
+    if (state.obs.total) {
+      // Kept a few pixels inside the band so the arrowhead at the top of
+      // the first and last frames is not half cut off by the edge.
+      var head = clamp(x((state.obs.cursor + 0.5) / state.obs.total), 5, width - 5);
+      svg.appendChild(svgNode("line", {
+        x1: head, y1: bandY - 2, x2: head, y2: laneY + laneH + 3, class: "tl-playhead"
+      }));
+      svg.appendChild(svgNode("path", {
+        d: "M " + (head - 4) + " " + (bandY - 8) + " L " + (head + 4) + " " + (bandY - 8)
+          + " L " + head + " " + (bandY - 2) + " Z",
+        class: "tl-playhead-head"
+      }));
+    }
+
+    var missing = timeline.sources.filter(function (source) { return !source.in_field; });
+    var legend = ["night shaded from the real solar altitude"];
+    if (missing.length) {
+      legend.push(missing.map(function (source) { return source.name; }).join(", ")
+        + ": never in this strip");
+    }
+    if (timeline.satellite.configured) {
+      var passes = (timeline.satellite.passes || []).length;
+      legend.push(timeline.satellite.note
+        || (passes === 1 ? "one satellite pass" : passes + " satellite passes")
+          + " through the field, in cyan");
+    }
+    $("timeline-legend").textContent = legend.join(" · ");
+  }
+
+  function scrubTimeline(event) {
+    if (!state.obs.total) { return; }
+    var svg = $("timeline");
+    var rect = svg.getBoundingClientRect();
+    var fraction = clamp((event.clientX - rect.left) / rect.width, 0, 1);
+    setPlaying(false);
+    goToFrame(Math.floor(fraction * state.obs.total));
+  }
+
+  /* --- the live monitor ---------------------------------------------- */
+
+  var SKY_RADIUS = 150;      // internal units; the SVG scales to its box
+  var AIRCRAFT_LABELS = 6;  // callsigns drawn, nearest first; the rest carry a tooltip
+
+  // Zenith at the centre, horizon at the rim, altitude linear in radius --
+  // the ordinary "stereographic-looking" horizon chart, which is really an
+  // equidistant projection. Azimuth runs North through East, matching the
+  // rest of the package.
+  function skyPoint(altitudeDeg, azimuthDeg) {
+    var radius = SKY_RADIUS * clamp((90 - altitudeDeg) / 90, 0, 1);
+    var angle = rad(azimuthDeg);
+    return [SKY_RADIUS + radius * Math.sin(angle), SKY_RADIUS - radius * Math.cos(angle)];
+  }
+
+  function drawSkyChart() {
+    var svg = $("sky-chart");
+    while (svg.firstChild) { svg.removeChild(svg.firstChild); }
+    var box = 2 * SKY_RADIUS + 34;
+    svg.setAttribute("viewBox", "-17 -17 " + box + " " + box);
+
+    [30, 60].forEach(function (altitude) {
+      svg.appendChild(svgNode("circle", {
+        cx: SKY_RADIUS, cy: SKY_RADIUS,
+        r: SKY_RADIUS * (90 - altitude) / 90, class: "sky-ring-dashed"
+      }));
+      var tick = svgNode("text", {
+        x: SKY_RADIUS + 3, y: SKY_RADIUS - SKY_RADIUS * (90 - altitude) / 90 - 2,
+        class: "sky-tick"
+      });
+      tick.textContent = altitude + "°";
+      svg.appendChild(tick);
+    });
+    svg.appendChild(svgNode("circle", {
+      cx: SKY_RADIUS, cy: SKY_RADIUS, r: SKY_RADIUS, class: "sky-ring"
+    }));
+
+    [["N", 0], ["E", 90], ["S", 180], ["W", 270]].forEach(function (entry) {
+      var point = skyPoint(-6, entry[1]);
+      var label = svgNode("text", { x: point[0], y: point[1] + 3.5, class: "sky-cardinal" });
+      label.textContent = entry[0];
+      svg.appendChild(label);
+    });
+
+    var sky = state.sky.data;
+    if (!sky) { return; }
+
+    function labelled(point, text, className) {
+      var label = svgNode("text", {
+        x: point[0] + 6, y: point[1] + 3, class: className || "sky-glyph-label"
+      });
+      label.textContent = text;
+      svg.appendChild(label);
+    }
+
+    // Aircraft first, so the ephemeris never hides behind traffic: a
+    // heading-rotated chevron with its callsign. Only the nearest few are
+    // labelled -- a busy corridor puts thirty of them along the rim, and
+    // thirty overlapping callsigns say less than none.
+    (sky.aircraft || []).forEach(function (aircraft, index) {
+      if (aircraft.altitude_deg <= 0) { return; }
+      var point = skyPoint(aircraft.altitude_deg, aircraft.azimuth_deg);
+      var heading = aircraft.heading_deg === null ? 0 : aircraft.heading_deg;
+      var glyph = svgNode("path", {
+        d: "M 0 -5 L 4 4 L 0 1.5 L -4 4 Z",
+        class: "sky-aircraft",
+        transform: "translate(" + point[0].toFixed(2) + "," + point[1].toFixed(2)
+          + ") rotate(" + heading.toFixed(1) + ")"
+      });
+      var title = svgNode("title", {});
+      title.textContent = (aircraft.callsign || aircraft.id) + " — "
+        + fmt(aircraft.altitude_deg) + "° up, " + fmt(aircraft.range_km) + " km away";
+      glyph.appendChild(title);
+      svg.appendChild(glyph);
+      if (aircraft.callsign && index < AIRCRAFT_LABELS) { labelled(point, aircraft.callsign); }
+    });
+
+    (sky.satellites || []).forEach(function (satellite) {
+      var point = skyPoint(satellite.altitude_deg, satellite.azimuth_deg);
+      svg.appendChild(svgNode("rect", {
+        x: point[0] - 2.5, y: point[1] - 2.5, width: 5, height: 5,
+        class: "sky-satellite", transform: "rotate(45 " + point[0] + " " + point[1] + ")"
+      }));
+      labelled(point, satellite.name);
+    });
+
+    (sky.sources || []).forEach(function (source) {
+      if (source.altitude_deg <= 0) { return; }
+      var point = skyPoint(source.altitude_deg, source.azimuth_deg);
+      svg.appendChild(svgNode("circle", {
+        cx: point[0], cy: point[1], r: 3, class: "sky-source"
+      }));
+      labelled(point, source.name);
+    });
+
+    if (sky.moon.up) {
+      var moon = skyPoint(sky.moon.altitude_deg, sky.moon.azimuth_deg);
+      svg.appendChild(svgNode("circle", { cx: moon[0], cy: moon[1], r: 4.5, class: "sky-moon" }));
+      labelled(moon, "Moon");
+    }
+    if (sky.sun.up) {
+      var sun = skyPoint(sky.sun.altitude_deg, sky.sun.azimuth_deg);
+      svg.appendChild(svgNode("circle", { cx: sun[0], cy: sun[1], r: 6, class: "sky-sun" }));
+      labelled(sun, "Sun");
+    }
+  }
+
+  function renderSkyLayers() {
+    var host = $("sky-layers");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    var sky = state.sky.data;
+    if (!sky) { return; }
+    Object.keys(sky.layers).forEach(function (name) {
+      var layer = sky.layers[name];
+      var cell = el("span", "status-cell status-" + (layer.status === "ok" ? "ok" : "warn"),
+        name + " — " + layer.note);
+      if (layer.detail) { cell.title = layer.detail; }
+      host.appendChild(cell);
+    });
+  }
+
+  function renderSkyTable() {
+    var sky = state.sky.data;
+    if (!sky) { return; }
+    var rows = [];
+    rows.push(["Sun", sky.sun.up ? fmt(sky.sun.altitude_deg) + "°" : "below horizon",
+      sky.sun.up ? fmt(sky.sun.azimuth_deg) + "°" : "—", fmt(sky.sun.flux_jy, 0) + " Jy"]);
+    rows.push(["Moon", sky.moon.up ? fmt(sky.moon.altitude_deg) + "°" : "below horizon",
+      sky.moon.up ? fmt(sky.moon.azimuth_deg) + "°" : "—", "—"]);
+    (sky.sources || []).forEach(function (source) {
+      rows.push([source.name,
+        source.up ? fmt(source.altitude_deg) + "°" : "below horizon",
+        source.up ? fmt(source.azimuth_deg) + "°" : "—",
+        fmt(source.flux_jy, 0) + " Jy"]);
+    });
+    fillMetricTable($("sky-table"), ["object", "altitude", "azimuth", "L-band flux"], rows);
+  }
+
+  function renderSkyNow() {
+    drawSkyChart();
+    renderSkyLayers();
+    renderSkyTable();
+    var sky = state.sky.data;
+    if (!sky) { return; }
+    $("sky-updated").textContent = "last updated " + utcClock(sky.utc) + " UTC · LST "
+      + fractionClock(sky.lst_deg / 360) + " · "
+      + (sky.aircraft || []).length + " aircraft, " + (sky.satellites || []).length + " satellites";
+  }
+
+  function skyVisible() {
+    return state.tab === "observatory" && document.visibilityState !== "hidden";
+  }
+
+  function pollSky() {
+    if (!skyVisible()) { return; }
+    var site = obsSite();
+    var query = site
+      ? "?latitude_deg=" + encodeURIComponent(site.latitude_deg)
+        + "&longitude_deg=" + encodeURIComponent(site.longitude_deg)
+        + "&height_m=" + encodeURIComponent(site.height_m)
+      : "";
+    request("/api/sky/now" + query).then(function (sky) {
+      state.sky.data = sky;
+      state.sky.error = null;
+      renderSkyNow();
+    }).catch(function (error) {
+      state.sky.error = error.message;
+      $("sky-updated").textContent = "the monitor could not be reached: " + error.message;
+    });
+  }
+
+  // Polling stops the moment the tab or the page goes out of sight: this
+  // is a live feed on somebody else's server, and a forgotten browser tab
+  // must not keep asking for it.
+  function syncSkyPolling() {
+    if (skyVisible()) {
+      if (!state.sky.timer) {
+        state.sky.timer = window.setInterval(pollSky, SKY_POLL_MS);
+      }
+      pollSky();
+      return;
+    }
+    window.clearInterval(state.sky.timer);
+    state.sky.timer = null;
+  }
+
+  /* --- binding -------------------------------------------------------- */
+
+  function bindObservatory() {
+    $("day-dec").addEventListener("change", function (event) {
+      var value = Number(event.target.value);
+      state.obs.dec_deg = isFinite(value) ? clamp(value, -90, 90) : state.obs.dec_deg;
+      event.target.value = state.obs.dec_deg;
+      onDayControlsChanged();
+    });
+    $("day-date").addEventListener("change", function (event) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(event.target.value)) {
+        event.target.value = state.obs.date;
+        return;
+      }
+      state.obs.date = event.target.value;
+      onDayControlsChanged();
+    });
+    $("day-frames").addEventListener("change", function (event) {
+      var value = Math.round(Number(event.target.value));
+      state.obs.frames = isFinite(value) ? clamp(value, 1, 288) : state.obs.frames;
+      event.target.value = state.obs.frames;
+      renderCadenceHint();
+    });
+    $("day-resolution").addEventListener("change", function (event) {
+      state.obs.resolution = event.target.value === "fine" ? "fine" : "coarse";
+      renderResolutionNote();
+    });
+    $("day-carry").addEventListener("change", function (event) {
+      state.obs.carry = event.target.checked;
+    });
+
+    $("day-build").addEventListener("click", buildDay);
+    $("day-cancel").addEventListener("click", cancelDay);
+
+    $("movie-play").addEventListener("click", function () { setPlaying(!state.obs.playing); });
+    $("movie-back").addEventListener("click", function () { setPlaying(false); stepFrame(-1); });
+    $("movie-forward").addEventListener("click", function () { setPlaying(false); stepFrame(1); });
+
+    $("movie-canvas").addEventListener("keydown", function (event) {
+      if (event.key === " " || event.key === "Spacebar") {
+        event.preventDefault();
+        setPlaying(!state.obs.playing);
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        setPlaying(false);
+        stepFrame(1);
+      } else if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        setPlaying(false);
+        stepFrame(-1);
+      }
+    });
+
+    var timeline = $("timeline");
+    timeline.addEventListener("click", scrubTimeline);
+    timeline.addEventListener("keydown", function (event) {
+      var step = event.key === "ArrowRight" ? 1 : (event.key === "ArrowLeft" ? -1 : 0);
+      if (!step) { return; }
+      event.preventDefault();
+      setPlaying(false);
+      stepFrame(step);
+    });
+
+    document.addEventListener("visibilitychange", syncSkyPolling);
+    bindTooltip($("movie-canvas"));
+  }
+
+  /* ------------------------------------------- 11. tabs and navigation */
+
+  /* Three tabs, Setup, Results and Mock Observatory, with the hash as the
+   * single source of
    * truth: a reload or a bookmark lands where it left off, and the back
    * button walks the tabs. The topbar's run controls sit outside both
    * panels, so a run can be started from either.
@@ -3567,7 +4554,7 @@
    * zero, so switching to Results redraws it rather than showing whatever
    * size it had when it was last visible.
    */
-  var TABS = ["setup", "results"];
+  var TABS = ["setup", "results", "observatory"];
 
   function tabFromHash() {
     var name = String(window.location.hash || "").replace("#", "");
@@ -3588,6 +4575,16 @@
     // The Setup sub-links are a table of contents for the Setup panel only.
     $("subnav").hidden = state.tab !== "setup";
     if (state.tab === "results") { renderResults(); }
+    if (state.tab === "observatory") {
+      renderDayControls();
+      refreshTimeline();
+      drawTimeline();
+      renderMovie();
+      renderSkyNow();
+    }
+    // The monitor only polls while it is the tab on screen; leaving stops
+    // it, coming back starts it and asks once immediately.
+    syncSkyPolling();
   }
 
   function goToTab(name) {
@@ -3887,6 +4884,10 @@
       pending = requestAnimationFrame(function () {
         pending = null;
         renderResults();
+        if (state.tab === "observatory") {
+          renderMovie();
+          drawTimeline();
+        }
       });
     });
   }
@@ -3895,6 +4896,9 @@
     request("/api/defaults").then(function (defaults) {
       state.defaults = defaults;
       resetToDefaults();
+      // Before `bindControls`, which routes to whichever tab the hash
+      // names -- possibly this one, whose renderers need `state.obs`.
+      resetObservatory();
 
       renderSiteMeta();
       renderPointingHint();
@@ -3903,6 +4907,14 @@
       renderAllForms();
       renderMaskToggles();
       renderFlaggerControls();
+
+      renderDayControls();
+      bindObservatory();
+      drawSkyChart();
+      if (state.tab === "observatory") {
+        refreshTimeline();
+        syncSkyPolling();
+      }
 
       // The layout catalogue is a convenience, not a prerequisite: a
       // server offering none still runs, with an empty picker.
