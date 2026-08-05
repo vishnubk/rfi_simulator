@@ -2,11 +2,11 @@
  * beyond this server's own two endpoints.
  *
  * Shape of the file:
- *   1. constants and small helpers          6. the run
- *   2. state                                7. console displays
- *   3. request wrapper                      8. tooltips
- *   4. site plan                            9. wiring and boot
- *   5. source and observation forms
+ *   1. constants and small helpers          6. scenario presets
+ *   2. state                                7. the run
+ *   3. request wrapper                      8. result displays
+ *   4. site plan                            9. tooltips
+ *   5. source and observation forms        10. wiring and boot
  *
  * Rule of the house: the browser never computes physics. Masks, images,
  * occupancy and warnings all arrive from the server as ground truth; this
@@ -281,8 +281,8 @@
     var n = state.antennas.length;
     var baselines = n * (n - 1) / 2;
     $("array-summary").textContent =
-      n + " antennas · " + baselines + " baselines · longest "
-      + fmt(longestBaseline(), 1) + " m";
+      n + " antennas make " + baselines + " baselines; the longest is "
+      + fmt(longestBaseline(), 1) + " m.";
   }
 
   function renderAntennaTable() {
@@ -428,21 +428,248 @@
 
   /* ----------------------------------------------------------- 5. forms */
 
+  /* Front-end wording, keyed by source kind and then by the API's own
+   * field name. The names are the contract with the server and are left
+   * alone; only what a reader sees is rewritten here, in plainer words
+   * and with one honest line about what the number does to the data.
+   * Anything missing falls back to the descriptor's own label and its
+   * `help` text (see simulate.py's field descriptors). */
+  var FIELD_COPY = {
+    sky: {
+      l: {
+        label: "Offset east of the pointing",
+        hint: "Direction cosine towards increasing right ascension; 0.01 is about 0.6°."
+      },
+      m: {
+        label: "Offset north of the pointing",
+        hint: "Direction cosine towards increasing declination. Zero and zero puts the"
+          + " source dead centre."
+      },
+      flux_jy: {
+        label: "Brightness",
+        hint: "How bright the source is. The dirty image should peak at this value,"
+          + " at the offsets above."
+      }
+    },
+    line: {
+      center_freq_hz: {
+        label: "Line centre frequency",
+        hint: "Rest frame. The default is the 21 cm hydrogen line at 1420.4 MHz, which"
+          + " sits outside the default band — move it inside the recorded band to see it."
+      },
+      fwhm_hz: {
+        label: "Line width",
+        hint: "Full width at half maximum of the Gaussian line profile."
+      },
+      line_flux_jy: {
+        label: "Peak-channel power",
+        hint: "Added to every antenna's own power, like receiver noise, tapering as a"
+          + " Gaussian in frequency."
+      }
+    },
+    tower: {
+      azimuth_deg: {
+        label: "Bearing from the array",
+        hint: "Compass bearing, north through east."
+      },
+      elevation_deg: {
+        label: "Elevation above the horizon",
+        hint: "Ground transmitters sit near 0°, so they enter through the far sidelobes."
+      },
+      distance_m: {
+        label: "Distance from the array",
+        hint: "Sets how much the delay to the transmitter differs between antennas."
+      },
+      center_freq_hz: {
+        label: "Transmit frequency",
+        hint: "Keep it inside the recorded band (printed under Recording settings) or"
+          + " nothing will show."
+      },
+      bandwidth_hz: {
+        label: "Bandwidth it occupies",
+        hint: "How wide a slice of the band it fills; 200 kHz is a few channels."
+      },
+      received_power_jy: {
+        label: "Received power",
+        hint: "How loud this transmitter is at the array while it is on; the default is"
+          + " far above the receiver noise and easy to see."
+      },
+      duty_cycle: {
+        label: "Fraction of the time it transmits",
+        hint: "0.5 gives the on/off stripes in the waterfall; 1 transmits continuously."
+      },
+      frame_duration_s: {
+        label: "Length of one on/off frame",
+        hint: "The period of the stripes in time."
+      },
+      waveform: {
+        label: "Signal shape",
+        hint: "Band-limited noise looks like a raised noise floor; a constant-envelope"
+          + " carrier is what a spectral-kurtosis detector keys on."
+      }
+    },
+    impulsive: {
+      rate_hz: {
+        label: "Bursts per second",
+        hint: "Average rate; arrival times are random (Poisson) unless you change it below."
+      },
+      received_power_jy: {
+        label: "Power of the faintest burst",
+        hint: "Brighter bursts follow a power law up to the ratio set below."
+      },
+      azimuth_deg: { label: "Bearing from the array", hint: "Compass bearing, north through east." },
+      elevation_deg: {
+        label: "Elevation above the horizon",
+        hint: "Sparking hardware is usually on the ground, so near 0°."
+      },
+      distance_m: {
+        label: "Distance from the array",
+        hint: "Sets how much the delay differs between antennas."
+      },
+      power_law_index: {
+        label: "Brightness power-law index",
+        hint: "Larger means proportionally more faint bursts and fewer bright ones."
+      },
+      max_power_ratio: {
+        label: "Brightest burst / faintest burst",
+        hint: "The dynamic range of the burst population."
+      },
+      pulse_width_samples: {
+        label: "Burst length",
+        hint: "In voltage samples; 1 is a single spike smeared across the whole band."
+      }
+    },
+    satellite: {
+      tle_source: {
+        label: "Where the orbit comes from",
+        hint: "Nothing is fetched from the network: use the bundled object or paste"
+          + " your own element set."
+      },
+      tle_text: {
+        label: "Pasted element set",
+        hint: "Two 69-character lines, optionally preceded by a name line."
+      },
+      carrier_freq_hz: {
+        label: "Carrier frequency",
+        hint: "As transmitted. What arrives is Doppler shifted by the satellite's"
+          + " motion, which is what draws the drifting track."
+      },
+      received_power_jy: {
+        label: "Received power",
+        hint: "Power at the array while the satellite is above the horizon cut."
+      },
+      sideband_bandwidth_hz: {
+        label: "Width of the sidebands",
+        hint: "Noise-like power either side of the carrier."
+      },
+      sideband_power_fraction: {
+        label: "Share of the power in the sidebands",
+        hint: "0 is a pure carrier line; 1 puts all of it into the sidebands."
+      },
+      min_elevation_deg: {
+        label: "Horizon cut",
+        hint: "Below this elevation the satellite counts as set and transmits nothing."
+      },
+      apply_doppler: {
+        label: "Apply the Doppler shift",
+        hint: "Turn it off to hold the carrier at one frequency and see what the drift"
+          + " was worth."
+      }
+    },
+    aircraft: {
+      east_m: {
+        label: "Starting position, east",
+        hint: "Where the aircraft is at the first sample, relative to the array."
+      },
+      north_m: { label: "Starting position, north", hint: "Same, towards north." },
+      altitude_m: {
+        label: "Altitude",
+        hint: "High enough and it is well above the horizon, unlike ground transmitters."
+      },
+      velocity_east_m_s: {
+        label: "Ground speed, east",
+        hint: "The course is a straight line; the delays move from block to block as"
+          + " it flies."
+      },
+      velocity_north_m_s: { label: "Ground speed, north", hint: "Together these set the heading." },
+      carrier_freq_hz: {
+        label: "Transponder frequency",
+        hint: "Keep it inside the recorded band to see the bursts."
+      },
+      bandwidth_hz: { label: "Width of each burst", hint: "How wide a slice of the band a reply fills." },
+      received_power_jy: {
+        label: "Received power",
+        hint: "Transponders are loud: the default sits far above the noise."
+      },
+      message_rate_hz: {
+        label: "Replies per second",
+        hint: "Each reply is one short burst."
+      },
+      pulse_width_samples: { label: "Burst length", hint: "In voltage samples." },
+      min_elevation_deg: {
+        label: "Horizon cut",
+        hint: "Below this elevation the aircraft is out of sight and transmits nothing."
+      }
+    },
+    comb: {
+      azimuth_deg: { label: "Bearing from the array", hint: "Compass bearing, north through east." },
+      elevation_deg: {
+        label: "Elevation above the horizon",
+        hint: "Interfering hardware is usually low on the horizon."
+      },
+      distance_m: {
+        label: "Distance from the array",
+        hint: "Sets how much the delay differs between antennas."
+      },
+      fundamental_hz: {
+        label: "Fundamental frequency",
+        hint: "The device's base frequency. It may sit far below the band; only its"
+          + " in-band harmonics show up."
+      },
+      harmonic_numbers: {
+        label: "Which harmonics it emits",
+        hint: "Multiples of the fundamental, comma separated — e.g. 999,1000,1001 makes"
+          + " three lines a fundamental apart."
+      },
+      received_power_jy: {
+        label: "Received power per harmonic",
+        hint: "Every listed harmonic arrives with this much power."
+      },
+      bandwidth_hz: {
+        label: "Width of each harmonic",
+        hint: "0 makes every harmonic a pure line, one channel wide."
+      },
+      duty_cycle: {
+        label: "Fraction of the time it emits",
+        hint: "1 is continuous; less than 1 chops the comb into frames."
+      },
+      frame_duration_s: { label: "Length of one on/off frame", hint: "The period of the chopping." }
+    }
+  };
+
   // One field descriptor -> one labelled control. `values` is the object
   // the control writes back into, in API units; the descriptor's `factor`
   // is what the person sees divided by.
-  function buildField(descriptor, values, onChange) {
-    var wrap = el("div", "field" + (descriptor.kind === "text"
-      && descriptor.multiline ? " field-wide" : ""));
+  //
+  // `copy` is an optional {name: {label, hint}} map of front-end wording
+  // that overrides the descriptor's own: the server's field names are the
+  // API contract and never change, but what a reader is shown may say the
+  // same thing in plainer words, with one line underneath saying what the
+  // number does to the data. See FIELD_COPY.
+  function buildField(descriptor, values, onChange, copy) {
+    var words = (copy && copy[descriptor.name]) || {};
+    var isToggle = descriptor.kind === "toggle";
+    var wide = (descriptor.kind === "text" && descriptor.multiline) || isToggle;
+    var wrap = el("div", "field" + (wide ? " field-wide" : "")
+      + (isToggle ? " field-toggle" : ""));
     var id = "f" + Math.random().toString(36).slice(2, 9);
-    var label = el("label", "field-label");
+    var label = el("label", isToggle ? "toggle-label" : "field-label");
     label.htmlFor = id;
-    label.textContent = descriptor.label;
+    var labelText = el("span", null, words.label || descriptor.label);
     if (descriptor.unit) {
-      label.appendChild(document.createTextNode(" "));
-      label.appendChild(el("span", "field-unit", "(" + descriptor.unit + ")"));
+      labelText.appendChild(document.createTextNode(" "));
+      labelText.appendChild(el("span", "field-unit", "(" + descriptor.unit + ")"));
     }
-    wrap.appendChild(label);
 
     var input;
     if (descriptor.kind === "choice") {
@@ -487,7 +714,20 @@
       if (onChange) { onChange(); }
     });
 
-    wrap.appendChild(input);
+    // A checkbox reads as a sentence with the box in front of it; every
+    // other control reads as a caption above the box.
+    if (isToggle) {
+      label.appendChild(input);
+      label.appendChild(labelText);
+      wrap.appendChild(label);
+    } else {
+      label.appendChild(labelText);
+      wrap.appendChild(label);
+      wrap.appendChild(input);
+    }
+
+    var hint = words.hint || descriptor.help;
+    if (hint) { wrap.appendChild(el("p", "field-hint", hint)); }
     return wrap;
   }
 
@@ -521,7 +761,7 @@
       var body = el("div", "card-body");
       var grid = el("div", "field-grid");
       state.defaults.sky_source.fields.forEach(function (descriptor) {
-        grid.appendChild(buildField(descriptor, source));
+        grid.appendChild(buildField(descriptor, source, null, FIELD_COPY.sky));
       });
       body.appendChild(grid);
       card.appendChild(body);
@@ -568,7 +808,7 @@
       var body = el("div", "card-body");
       var grid = el("div", "field-grid");
       state.defaults.spectral_line.fields.forEach(function (descriptor) {
-        grid.appendChild(buildField(descriptor, source));
+        grid.appendChild(buildField(descriptor, source, null, FIELD_COPY.line));
       });
       body.appendChild(grid);
       card.appendChild(body);
@@ -610,52 +850,92 @@
     return { label: label, box: box };
   }
 
-  function buildRfiExtras(source) {
-    var row = el("div", "card-extras");
+  // One labelled block inside the card's Advanced fold: a checkbox line,
+  // the numbers it reveals, and a sentence saying what it changes.
+  function extraBlock(row, toggle, inputs, hint) {
+    var block = el("div", "extra");
+    block.appendChild(toggle.label);
+    var numbers = el("div", "extra-numbers");
+    inputs.forEach(function (entry) {
+      var field = el("label", "extra-field");
+      field.appendChild(el("span", "extra-field-label", entry[0]));
+      field.appendChild(entry[1]);
+      numbers.appendChild(field);
+    });
+    block.appendChild(numbers);
+    block.appendChild(el("p", "field-hint", hint));
+    row.appendChild(block);
+    return numbers;
+  }
 
-    var coupling = extraToggle("coupling scatter", Boolean(source.coupling));
+  function buildRfiExtras(source) {
+    var fold = el("details", "advanced advanced-card");
+    var summary = el("summary", null, "Advanced: how it couples into the antennas");
+    fold.appendChild(summary);
+    var row = el("div", "card-extras");
+    fold.appendChild(row);
+
+    var coupling = extraToggle(
+      "Every antenna receives it a little differently", Boolean(source.coupling)
+    );
     var couplingSigma = extraNumber(
       source.coupling ? source.coupling.sigma_db : 3.0, 0.5, 0, 60,
       "Per-antenna lognormal coupling scatter, dB"
     );
-    couplingSigma.hidden = !source.coupling;
+    var couplingNumbers = extraBlock(
+      row, coupling, [["Spread between antennas (dB)", couplingSigma]],
+      "Off, the transmitter arrives at exactly the same strength everywhere. On, each"
+        + " antenna's gain towards it is drawn from a lognormal spread — nearer masts"
+        + " and local screening do this."
+    );
+    couplingNumbers.hidden = !source.coupling;
     function syncCoupling() {
       source.coupling = coupling.box.checked
         ? { type: "lognormal", sigma_db: parseFloat(couplingSigma.value) || 0, seed: Math.round(state.sim.seed) }
         : null;
-      couplingSigma.hidden = !coupling.box.checked;
+      couplingNumbers.hidden = !coupling.box.checked;
     }
     coupling.box.addEventListener("change", syncCoupling);
     couplingSigma.addEventListener("change", syncCoupling);
-    row.appendChild(coupling.label);
-    row.appendChild(couplingSigma);
 
-    var polarized = extraToggle("polarized", Boolean(source.polarization));
+    var polarized = extraToggle("The signal is polarized", Boolean(source.polarization));
     var polAngle = extraNumber(
       source.polarization ? source.polarization.angle_deg : 45.0, 1, -360, 360,
       "Linear polarization angle, degrees, first receptor towards the second"
     );
-    polAngle.hidden = !source.polarization;
+    var polNumbers = extraBlock(
+      row, polarized, [["Angle (deg)", polAngle]],
+      "Splits the power between the two receptors instead of sharing it evenly."
+        + " Only visible with two polarizations recorded (section 4); 0° goes into the"
+        + " first receptor, 90° into the second."
+    );
+    polNumbers.hidden = !source.polarization;
     function syncPolarization() {
       source.polarization = polarized.box.checked
         ? { type: "linear", angle_deg: parseFloat(polAngle.value) || 0 }
         : null;
-      polAngle.hidden = !polarized.box.checked;
+      polNumbers.hidden = !polarized.box.checked;
     }
     polarized.box.addEventListener("change", syncPolarization);
     polAngle.addEventListener("change", syncPolarization);
-    row.appendChild(polarized.label);
-    row.appendChild(polAngle);
 
     if (source.type === "tower" || source.type === "comb") {
-      var envelope = extraToggle("clocked on/off", Boolean(source.envelope));
+      var envelope = extraToggle(
+        "Add a second, slower on/off cycle", Boolean(source.envelope)
+      );
       var envPeriod = extraNumber(
         source.envelope ? source.envelope.period_s * 1000 : 20.0, 1, 0.1, 1e5, "Envelope period, ms"
       );
       var envDuty = extraNumber(
         source.envelope ? source.envelope.duty : 0.5, 0.05, 0, 1, "Envelope duty (on-fraction)"
       );
-      envPeriod.hidden = envDuty.hidden = !source.envelope;
+      var envNumbers = extraBlock(
+        row, envelope,
+        [["Cycle length (ms)", envPeriod], ["Fraction on", envDuty]],
+        "On top of the frame pattern above: a long duty cycle over the short one, as a"
+          + " transmitter that bursts in scheduled slots would give."
+      );
+      envNumbers.hidden = !source.envelope;
       function syncEnvelope() {
         source.envelope = envelope.box.checked
           ? {
@@ -664,26 +944,29 @@
             duty: parseFloat(envDuty.value) || 0.5
           }
           : null;
-        envPeriod.hidden = envDuty.hidden = !envelope.box.checked;
+        envNumbers.hidden = !envelope.box.checked;
       }
       envelope.box.addEventListener("change", syncEnvelope);
       envPeriod.addEventListener("change", syncEnvelope);
       envDuty.addEventListener("change", syncEnvelope);
-      row.appendChild(envelope.label);
-      row.appendChild(envPeriod);
-      row.appendChild(envDuty);
     }
 
     if (source.type === "impulsive") {
       var periodic = typeof source.arrival === "object" && source.arrival !== null;
-      var arrival = extraToggle("periodic arrivals (not Poisson)", periodic);
+      var arrival = extraToggle("Bursts arrive on a clock, not at random", periodic);
       var arrRate = extraNumber(
         periodic ? source.arrival.rate_hz : 100.0, 10, 0, 1e5, "Arrival rate, events/s"
       );
       var arrJitter = extraNumber(
         periodic ? source.arrival.jitter_s * 1000 : 0.5, 0.1, 0, 1e4, "Arrival jitter, ms"
       );
-      arrRate.hidden = arrJitter.hidden = !periodic;
+      var arrNumbers = extraBlock(
+        row, arrival,
+        [["Bursts per second", arrRate], ["Wobble on each arrival (ms)", arrJitter]],
+        "Off, arrivals are Poisson — genuinely random gaps. On, they are evenly spaced"
+          + " with a little jitter, like mains-synchronised arcing."
+      );
+      arrNumbers.hidden = !periodic;
       function syncArrival() {
         source.arrival = arrival.box.checked
           ? {
@@ -692,17 +975,14 @@
             jitter_s: (parseFloat(arrJitter.value) || 0) / 1000
           }
           : "poisson";
-        arrRate.hidden = arrJitter.hidden = !arrival.box.checked;
+        arrNumbers.hidden = !arrival.box.checked;
       }
       arrival.box.addEventListener("change", syncArrival);
       arrRate.addEventListener("change", syncArrival);
       arrJitter.addEventListener("change", syncArrival);
-      row.appendChild(arrival.label);
-      row.appendChild(arrRate);
-      row.appendChild(arrJitter);
     }
 
-    return row;
+    return fold;
   }
 
   function renderRfiCards() {
@@ -736,13 +1016,14 @@
       card.appendChild(head);
 
       var body = el("div", "card-body");
+      body.appendChild(el("p", "card-intro", descriptorSet.summary));
       var grid = el("div", "field-grid");
       descriptorSet.fields.forEach(function (descriptor) {
         // The pasted element set only matters when it is going to be used.
         if (descriptor.name === "tle_text" && source.tle_source !== "custom") { return; }
         grid.appendChild(buildField(descriptor, source, function () {
           if (descriptor.name === "tle_source") { renderRfiCards(); }
-        }));
+        }, FIELD_COPY[source.type]));
       });
       body.appendChild(grid);
       card.appendChild(body);
@@ -755,29 +1036,38 @@
     var host = $("sim-fields");
     while (host.firstChild) { host.removeChild(host.firstChild); }
     var limits = state.defaults.limits;
+    var sim = state.defaults.sim;
     var descriptors = [
       {
-        name: "n_chan", label: "Channels", kind: "number", factor: 1,
-        min: 4, max: limits.max_n_chan, step: 4, default: state.defaults.sim.n_chan
+        name: "n_chan", label: "Frequency channels", kind: "number", factor: 1,
+        min: 4, max: limits.max_n_chan, step: 4, default: sim.n_chan,
+        help: "Channels are a fixed " + fmt(sim.chan_width_hz / 1e3, 2)
+          + " kHz wide, so this sets how much bandwidth is recorded."
       },
       {
-        name: "n_blocks", label: "Integrations", kind: "number", factor: 1,
-        min: 1, max: limits.max_n_blocks, step: 1, default: state.defaults.sim.n_blocks
+        name: "n_blocks", label: "Time blocks", kind: "number", factor: 1,
+        min: 1, max: limits.max_n_blocks, step: 1, default: sim.n_blocks,
+        help: "Each block is " + fmt(sim.block_duration_s * 1000, 1)
+          + " ms long, so this sets how long the observation lasts."
       },
       {
-        name: "center_freq_hz", label: "Band centre", kind: "number", unit: "MHz",
+        name: "center_freq_hz", label: "Centre of the band", kind: "number", unit: "MHz",
         factor: 1e6, min: 1e6, max: 1e11, step: 0.1,
-        default: state.defaults.sim.center_freq_hz
+        default: sim.center_freq_hz,
+        help: "Where the recorded band sits. Sources outside the band shown below"
+          + " will not appear."
       },
       {
-        name: "noise_std", label: "Receiver noise", kind: "number", unit: "√Jy",
-        factor: 1, min: 0, max: 1e4, step: 0.1, default: state.defaults.sim.noise_std,
-        help: "Its square is the noise power added to every autocorrelation."
+        name: "noise_std", label: "Receiver noise level", kind: "number", unit: "√Jy",
+        factor: 1, min: 0, max: 1e4, step: 0.1, default: sim.noise_std,
+        help: "Its square is the noise power added to every antenna. Leave it at 1 and"
+          + " read every source power as a multiple of it."
       },
       {
-        name: "seed", label: "Seed", kind: "number", factor: 1,
-        min: 0, max: 2147483647, step: 1, default: state.defaults.sim.seed,
-        help: "The same seed gives byte-identical data."
+        name: "seed", label: "Random seed", kind: "number", factor: 1,
+        min: 0, max: 2147483647, step: 1, default: sim.seed,
+        help: "The same seed reproduces byte-identical data; change it for a fresh"
+          + " noise realisation."
       }
     ];
     descriptors.forEach(function (descriptor) {
@@ -790,11 +1080,14 @@
     var sim = state.defaults.sim;
     var duration = state.sim.n_blocks * sim.block_duration_s;
     var bandwidth = state.sim.n_chan * sim.chan_width_hz;
+    var half = bandwidth / 2;
     $("sim-summary").textContent =
-      fmt(duration * 1000, 1) + " ms of data · "
-      + fmt(bandwidth / 1e6, 3) + " MHz wide · "
-      + fmt(sim.chan_width_hz / 1e3, 2) + " kHz channels · start "
-      + sim.start_time_utc + " UTC";
+      "This run records " + fmt(duration * 1000, 1) + " ms of data from "
+      + fmt((state.sim.center_freq_hz - half) / 1e6, 3) + " to "
+      + fmt((state.sim.center_freq_hz + half) / 1e6, 3) + " MHz ("
+      + fmt(bandwidth / 1e6, 3) + " MHz in "
+      + fmt(sim.chan_width_hz / 1e3, 2) + " kHz channels), starting "
+      + sim.start_time_utc + " UTC.";
   }
 
   // The realism panel's fields have no server-side schema of their own
@@ -803,68 +1096,137 @@
   // file's own field descriptors, the same pattern `renderSimFields`
   // already uses for the observation fields. Each entry's `section` opens
   // a new labelled subgroup within the one field-grid.
+  // `section` opens a labelled subgroup with its own one-line summary;
+  // `advanced: true` moves a field into that subgroup's Advanced fold, for
+  // knobs whose meaning only lands once you already know the hardware.
   var REALISM_FIELDS = [
-    { name: "n_pol", label: "Polarizations", kind: "choice", default: "1",
-      options: [{ value: "1", label: "1 (single)" }, { value: "2", label: "2 (dual, XX/YY)" }],
-      section: "Polarization" },
+    { name: "n_pol", label: "How many polarizations to record", kind: "choice", default: "1",
+      options: [{ value: "1", label: "1 — a single receptor" },
+        { value: "2", label: "2 — both receptors (XX and YY)" }],
+      section: "Polarization",
+      sectionIntro: "A real dish has two perpendicular receptors. Recording both lets a"
+        + " polarized transmitter look different in each.",
+      help: "With two, the waterfall below gains a control for which receptor it shows." },
 
-    { name: "instrument_enabled", label: "Per-antenna gain/bandpass realism", kind: "toggle",
-      default: false, section: "Instrument" },
-    { name: "gain_scatter_db", label: "Gain scatter", kind: "number", unit: "dB", factor: 1,
-      min: 0, max: 10, step: 0.05, default: 0.4 },
-    { name: "phase_offsets", label: "Phase offsets", kind: "choice", default: "zero",
-      options: [{ value: "zero", label: "zero (calibrated)" }, { value: "uniform", label: "uniform (uncalibrated)" }] },
-    { name: "bandpass_ripple_db", label: "Bandpass ripple", kind: "number", unit: "dB", factor: 1,
-      min: 0, max: 5, step: 0.01, default: 0.05 },
-    { name: "band_slope_db", label: "Band slope", kind: "number", unit: "dB", factor: 1,
-      min: 0, max: 10, step: 0.05, default: 0.0 },
-    { name: "subband_scatter_db", label: "Subband scatter", kind: "number", unit: "dB", factor: 1,
-      min: 0, max: 10, step: 0.05, default: 0.0 },
-    { name: "n_subbands", label: "Subbands", kind: "number", factor: 1,
-      min: 1, max: 64, step: 1, default: 1 },
+    { name: "instrument_enabled", label: "Give every antenna its own gain and bandpass",
+      kind: "toggle", default: false, section: "Antenna-to-antenna differences",
+      sectionIntro: "By default every antenna is identical. Real ones are not: their"
+        + " gains differ and their passbands are not flat.",
+      help: "Nothing below this line applies until it is ticked." },
+    { name: "gain_scatter_db", label: "Gain spread between antennas", kind: "number", unit: "dB",
+      factor: 1, min: 0, max: 10, step: 0.05, default: 0.4,
+      help: "How much overall sensitivity varies from antenna to antenna." },
+    { name: "phase_offsets", label: "Antenna phase offsets", kind: "choice", default: "zero",
+      options: [{ value: "zero", label: "None — the array is perfectly calibrated" },
+        { value: "uniform", label: "Random — an uncalibrated array" }],
+      help: "Random offsets scatter the phases, and the dirty image loses its clean peak." },
+    { name: "bandpass_ripple_db", label: "Ripple across the band", kind: "number", unit: "dB",
+      factor: 1, min: 0, max: 5, step: 0.01, default: 0.05,
+      help: "A gentle wiggle in gain with frequency, different for each antenna." },
+    { name: "band_slope_db", label: "Tilt across the band", kind: "number", unit: "dB", factor: 1,
+      min: 0, max: 10, step: 0.05, default: 0.0,
+      help: "One edge of the band more sensitive than the other." },
+    { name: "subband_scatter_db", label: "Gain steps between sub-bands", kind: "number",
+      unit: "dB", factor: 1, min: 0, max: 10, step: 0.05, default: 0.0, advanced: true,
+      help: "Step changes in gain, as separate digitiser boards covering slices of the"
+        + " band would give." },
+    { name: "n_subbands", label: "How many sub-bands", kind: "number", factor: 1,
+      min: 1, max: 64, step: 1, default: 1, advanced: true,
+      help: "How many equal slices the band is cut into for the step above." },
 
-    { name: "quantization_enabled", label: "4-bit quantization (int4)", kind: "toggle",
-      default: false, section: "Quantization" },
-    { name: "quant_target_counts", label: "Target rms", kind: "number", unit: "counts", factor: 1,
-      min: 0.1, max: 20, step: 0.01, default: 1.33 },
+    { name: "quantization_enabled", label: "Round the voltages to 4-bit samples",
+      kind: "toggle", default: false, section: "Digitisation",
+      sectionIntro: "Recorders write a few bits per sample, not exact numbers. Strong"
+        + " interference then spills across the whole band, which is what makes it hard"
+        + " to remove after the fact.",
+      help: "Off, the voltages keep full precision — an idealisation." },
+    { name: "quant_target_counts", label: "Where the noise sits in the 4-bit range",
+      kind: "number", unit: "counts", factor: 1, min: 0.1, max: 20, step: 0.01, default: 1.33,
+      help: "Rms level the digitiser aims for; about 1.33 counts loses the least"
+        + " information for Gaussian noise." },
 
-    { name: "channelizer_enabled", label: "Polyphase filterbank channelizer", kind: "toggle",
-      default: false, section: "Channelizer" },
-    { name: "n_taps", label: "Taps", kind: "number", factor: 1, min: 1, max: 32, step: 1, default: 4 },
-    { name: "window", label: "Window", kind: "choice", default: "hamming",
-      options: [{ value: "hann", label: "hann" }, { value: "hamming", label: "hamming" },
-        { value: "blackman", label: "blackman" }] },
-    { name: "sinc_bandwidth", label: "Sinc bandwidth", kind: "number", factor: 1,
-      min: 0.1, max: 8, step: 0.01, default: 1.01 },
+    { name: "channelizer_enabled", label: "Split the band with a real filterbank",
+      kind: "toggle", default: false, section: "Channelisation",
+      sectionIntro: "By default channels are formed by a perfect Fourier transform."
+        + " Real hardware uses a polyphase filterbank, so neighbouring channels leak"
+        + " into each other and a narrow transmitter smears sideways.",
+      help: "Off, each channel is perfectly isolated from its neighbours." },
+    { name: "n_taps", label: "Filter taps", kind: "number", factor: 1, min: 1, max: 32, step: 1,
+      default: 4, advanced: true,
+      help: "More taps mean sharper channel edges and less leakage." },
+    { name: "window", label: "Window function", kind: "choice", default: "hamming",
+      options: [{ value: "hann", label: "Hann" }, { value: "hamming", label: "Hamming" },
+        { value: "blackman", label: "Blackman" }], advanced: true,
+      help: "The taper applied along the filter; it trades channel width against how"
+        + " far the leakage reaches." },
+    { name: "sinc_bandwidth", label: "Channel width factor", kind: "number", factor: 1,
+      min: 0.1, max: 8, step: 0.01, default: 1.01, advanced: true,
+      help: "Width of the prototype filter in channels; 1.01 keeps channels roughly"
+        + " one channel wide." },
 
-    { name: "calibration_enabled", label: "Residual calibration errors", kind: "toggle",
-      default: false, section: "Calibration errors" },
-    { name: "phase_error_deg_rms", label: "Phase error", kind: "number", unit: "deg", factor: 1,
-      min: 0, max: 180, step: 0.5, default: 5.0 },
+    { name: "calibration_enabled", label: "Leave residual calibration errors",
+      kind: "toggle", default: false, section: "Calibration residuals",
+      sectionIntro: "Even a calibrated array is never exactly calibrated. These are the"
+        + " leftovers, applied per antenna.",
+      help: "Off, calibration is assumed perfect." },
+    { name: "phase_error_deg_rms", label: "Leftover phase error", kind: "number", unit: "deg rms",
+      factor: 1, min: 0, max: 180, step: 0.5, default: 5.0,
+      help: "A constant phase slip per antenna; it smears the image peak." },
     // max matches CalibrationErrorParams.delay_error_ns_rms's `le` bound in
     // simulate.py -- keep the two in sync if either changes.
-    { name: "delay_error_ns_rms", label: "Delay error", kind: "number", unit: "ns", factor: 1,
-      min: 0, max: 10, step: 0.1, default: 0.0 },
-    { name: "amplitude_error_db_rms", label: "Amplitude error", kind: "number", unit: "dB", factor: 1,
-      min: 0, max: 10, step: 0.05, default: 0.0 },
+    { name: "delay_error_ns_rms", label: "Leftover delay error", kind: "number", unit: "ns rms",
+      factor: 1, min: 0, max: 10, step: 0.1, default: 0.0, advanced: true,
+      help: "A phase error that grows across the band, rather than a constant one." },
+    { name: "amplitude_error_db_rms", label: "Leftover amplitude error", kind: "number",
+      unit: "dB rms", factor: 1, min: 0, max: 10, step: 0.05, default: 0.0, advanced: true,
+      help: "Per-antenna gain left over after calibration." },
 
-    { name: "beam_enabled", label: "Primary beam attenuation", kind: "toggle",
-      default: false, section: "Primary beam" },
+    { name: "beam_enabled", label: "Dim sources away from where the dish points",
+      kind: "toggle", default: false, section: "Primary beam",
+      sectionIntro: "A dish is most sensitive straight ahead. This attenuates celestial"
+        + " sources by their offset from the pointing centre; interference is not"
+        + " attenuated by it.",
+      help: "Off, the dish is equally sensitive in every direction." },
     { name: "beam_type", label: "Beam shape", kind: "choice", default: "gaussian",
-      options: [{ value: "gaussian", label: "Gaussian" }, { value: "airy", label: "Airy" }] },
+      options: [{ value: "gaussian", label: "Gaussian — a smooth main lobe" },
+        { value: "airy", label: "Airy — a real aperture, with rings" }],
+      help: "The Airy pattern adds the sidelobe rings a circular dish really has." },
     { name: "dish_diameter_m", label: "Dish diameter", kind: "number", unit: "m", factor: 1,
-      min: 0.1, max: 1000, step: 0.1, default: 4.5 }
+      min: 0.1, max: 1000, step: 0.1, default: 4.5,
+      help: "Sets the beam width: a bigger dish sees a narrower patch of sky." }
   ];
 
   function renderRealismFields() {
     var host = $("realism-fields");
     while (host.firstChild) { host.removeChild(host.firstChild); }
+    var grid = null;
+    var advancedGrid = null;
+
     REALISM_FIELDS.forEach(function (descriptor) {
       if (descriptor.section) {
-        host.appendChild(el("div", "subgroup-label", descriptor.section));
+        var block = el("div", "realism-section");
+        block.appendChild(el("h4", "subgroup-label", descriptor.section));
+        if (descriptor.sectionIntro) {
+          block.appendChild(el("p", "group-intro", descriptor.sectionIntro));
+        }
+        grid = el("div", "field-grid");
+        block.appendChild(grid);
+        var fold = el("details", "advanced");
+        fold.appendChild(el("summary", null, "Advanced"));
+        advancedGrid = el("div", "field-grid");
+        fold.appendChild(advancedGrid);
+        block.appendChild(fold);
+        host.appendChild(block);
       }
-      host.appendChild(buildField(descriptor, state.realism));
+      (descriptor.advanced ? advancedGrid : grid)
+        .appendChild(buildField(descriptor, state.realism));
     });
+
+    // A section with nothing expert-only in it should not advertise a fold.
+    Array.prototype.forEach.call(host.querySelectorAll("details.advanced"),
+      function (fold) {
+        if (!fold.querySelector(".field")) { fold.hidden = true; }
+      });
   }
 
   function defaultRealism() {
@@ -896,7 +1258,97 @@
     return values;
   }
 
-  /* ------------------------------------------------------------- 6. run */
+  /* --------------------------------------------------------- 6. presets */
+
+  /* Canned scenarios, built out of the same state the forms edit: loading
+   * one resets everything to the server's defaults, applies the scenario,
+   * redraws every form, and runs. Nothing here is a separate code path --
+   * whatever a preset sets, a reader can find and change in the sections
+   * above. */
+  var PRESETS = [
+    {
+      id: "clean",
+      label: "Clean sky — one source, no interference",
+      apply: function () { /* the base state already is exactly this */ }
+    },
+    {
+      id: "tower",
+      label: "Cell tower — a narrowband transmitter switching on and off",
+      apply: function () {
+        state.rfiSources = [newRfiSource("tower")];
+      }
+    },
+    {
+      id: "satellite",
+      label: "Satellite pass — a carrier drifting with Doppler",
+      apply: function () {
+        state.rfiSources = [newRfiSource("satellite")];
+      }
+    },
+    {
+      id: "busy",
+      label: "Busy band — a tower, a harmonic comb and sparking hardware",
+      apply: function () {
+        state.rfiSources = [
+          newRfiSource("tower"),
+          newRfiSource("comb"),
+          newRfiSource("impulsive")
+        ];
+      }
+    },
+    {
+      id: "realistic",
+      label: "Realistic instrument — the same tower through imperfect hardware",
+      apply: function () {
+        state.rfiSources = [newRfiSource("tower")];
+        state.realism.n_pol = "2";
+        state.realism.instrument_enabled = true;
+        state.realism.quantization_enabled = true;
+        state.realism.channelizer_enabled = true;
+        state.realism.calibration_enabled = true;
+        state.realism.beam_enabled = true;
+      }
+    }
+  ];
+
+  function resetToDefaults() {
+    var defaults = state.defaults;
+    state.antennas = defaults.array.antennas.map(function (row) { return row.slice(); });
+    state.sim = {
+      n_chan: defaults.sim.n_chan,
+      n_blocks: defaults.sim.n_blocks,
+      center_freq_hz: defaults.sim.center_freq_hz,
+      noise_std: defaults.sim.noise_std,
+      seed: defaults.sim.seed
+    };
+    state.skySources = [newSkySource()];
+    state.rfiSources = [];
+    state.spectralLines = [];
+    state.realism = defaultRealism();
+    state.waterfallPol = 0;
+  }
+
+  function renderAllForms() {
+    renderSitePlan();
+    renderSkyCards();
+    renderRfiCards();
+    renderLineCards();
+    renderSimFields();
+    renderRealismFields();
+  }
+
+  function applyPreset(id) {
+    var preset = PRESETS.filter(function (entry) { return entry.id === id; })[0];
+    if (!preset) { return; }
+    resetToDefaults();
+    preset.apply();
+    renderAllForms();
+    $("waterfall-pol").value = "0";
+    $("section-run").scrollIntoView({ behavior: "smooth", block: "start" });
+    run();
+  }
+
+  /* ------------------------------------------------------------- 7. run */
 
   function showNotice(kind, text) {
     state.notices.push({ kind: kind, text: text });
@@ -976,13 +1428,23 @@
     };
   }
 
+  // The Run button appears twice -- once in the sticky header, once beside
+  // the results -- so both copies move together.
+  function runButtons() { return [$("run"), $("run-main")]; }
+
+  function setRunStatus(text) {
+    [$("run-status"), $("run-status-main")].forEach(function (node) {
+      node.textContent = text;
+    });
+  }
+
   function run() {
     if (state.running) { return; }
     state.running = true;
     state.notices = [];
     renderNotices();
-    $("run").disabled = true;
-    $("run-status").textContent = "running…";
+    runButtons().forEach(function (button) { button.disabled = true; });
+    setRunStatus("running…");
     $("waterfall-sweep").hidden = state.result === null;
 
     request("/api/simulate?pol=" + state.waterfallPol, {
@@ -995,25 +1457,22 @@
       state.waterfallAntenna = clamp(
         state.waterfallAntenna, 0, result.waterfall.antennas.length - 1
       );
-      var dualPol = result.observation.n_pol === 2;
-      $("waterfall-pol").hidden = !dualPol;
-      $("waterfall-pol-label").hidden = !dualPol;
+      $("waterfall-pol-group").hidden = result.observation.n_pol !== 2;
       result.warnings.forEach(function (message) { showNotice("note", message); });
-      $("run-status").textContent =
-        "done in " + fmt(result.wall_time_s, 2) + " s";
+      setRunStatus("done in " + fmt(result.wall_time_s, 2) + " s");
       $("wall-time").textContent = fmt(result.wall_time_s, 2) + " s wall";
       renderResults();
     }).catch(function (error) {
       showNotice("error", error.message);
-      $("run-status").textContent = "not run";
+      setRunStatus("not run");
     }).then(function () {
       state.running = false;
-      $("run").disabled = false;
+      runButtons().forEach(function (button) { button.disabled = false; });
       $("waterfall-sweep").hidden = true;
     });
   }
 
-  /* -------------------------------------------------------- 7. displays */
+  /* -------------------------------------------------------- 8. displays */
 
   function prepareCanvas(canvas) {
     var rect = canvas.getBoundingClientRect();
@@ -1402,7 +1861,7 @@
     renderUv();
   }
 
-  /* -------------------------------------------------------- 8. tooltips */
+  /* -------------------------------------------------------- 9. tooltips */
 
   function bindTooltip(canvas) {
     var tooltip = $("tooltip");
@@ -1457,20 +1916,31 @@
     svg.addEventListener("mouseleave", function () { $("tooltip").hidden = true; });
   }
 
-  /* ------------------------------------------------------ 9. wiring */
+  /* ----------------------------------------------------- 10. wiring */
 
   function renderSiteMeta() {
     var array = state.defaults.array;
     var meta = $("site-meta");
     while (meta.firstChild) { meta.removeChild(meta.firstChild); }
-    [["site", array.latitude_deg.toFixed(3) + "°, " + array.longitude_deg.toFixed(3) + "°"],
-     ["height", array.height_m.toFixed(0) + " m"]].forEach(function (pair) {
+    [["Site latitude, longitude",
+      array.latitude_deg.toFixed(3) + "°, " + array.longitude_deg.toFixed(3) + "°"],
+     ["Height above sea level", array.height_m.toFixed(0) + " m"]].forEach(function (pair) {
       meta.appendChild(el("dt", null, pair[0]));
       meta.appendChild(el("dd", null, pair[1]));
     });
   }
 
   function bindControls() {
+    var presetSelect = $("preset");
+    PRESETS.forEach(function (preset) {
+      var option = el("option", null, preset.label);
+      option.value = preset.id;
+      presetSelect.appendChild(option);
+    });
+    $("load-preset").addEventListener("click", function () {
+      applyPreset(presetSelect.value);
+    });
+
     var typeSelect = $("rfi-type");
     state.defaults.rfi_types.forEach(function (entry) {
       var option = el("option", null, entry.label);
@@ -1513,7 +1983,9 @@
       renderLineCards();
     });
 
-    $("run").addEventListener("click", run);
+    runButtons().forEach(function (button) {
+      button.addEventListener("click", run);
+    });
 
     $("waterfall-antenna").addEventListener("change", function (event) {
       state.waterfallAntenna = Number(event.target.value);
@@ -1550,28 +2022,12 @@
   function boot() {
     request("/api/defaults").then(function (defaults) {
       state.defaults = defaults;
-      state.antennas = defaults.array.antennas.map(function (row) { return row.slice(); });
-      state.sim = {
-        n_chan: defaults.sim.n_chan,
-        n_blocks: defaults.sim.n_blocks,
-        center_freq_hz: defaults.sim.center_freq_hz,
-        noise_std: defaults.sim.noise_std,
-        seed: defaults.sim.seed
-      };
-      state.skySources = [newSkySource()];
-      state.rfiSources = [];
-      state.spectralLines = [];
-      state.realism = defaultRealism();
+      resetToDefaults();
 
       renderSiteMeta();
       bindSitePlan();
       bindControls();
-      renderSitePlan();
-      renderSkyCards();
-      renderRfiCards();
-      renderLineCards();
-      renderSimFields();
-      renderRealismFields();
+      renderAllForms();
       renderMaskToggles();
       run();
     }).catch(function (error) {

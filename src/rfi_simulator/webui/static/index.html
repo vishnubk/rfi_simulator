@@ -11,7 +11,7 @@
 
 <header class="masthead">
   <div class="masthead-mark" aria-hidden="true">
-    <svg viewBox="0 0 32 32" width="26" height="26">
+    <svg viewBox="0 0 32 32" width="24" height="24">
       <path d="M16 4v24M4 16h24" stroke="currentColor" stroke-width="1.2"/>
       <circle cx="16" cy="16" r="7" fill="none" stroke="currentColor" stroke-width="1.2"/>
     </svg>
@@ -20,143 +20,222 @@
     <h1>Interference simulator</h1>
     <p>Place antennas, place interference, see what the telescope sees.</p>
   </div>
-  <dl class="masthead-meta mono" id="site-meta"></dl>
+
+  <div class="masthead-preset">
+    <label class="field-label" for="preset">Start from an example</label>
+    <div class="preset-row">
+      <select id="preset" class="input"></select>
+      <button type="button" class="button" id="load-preset">Load</button>
+    </div>
+  </div>
+
+  <div class="masthead-run">
+    <button type="button" class="button button-run" id="run">Run observation</button>
+    <span class="run-status mono" id="run-status"></span>
+  </div>
 </header>
 
-<main class="console">
+<main class="page">
 
-  <!-- ------------------------------------------------ site plan -->
-  <section class="zone zone-site" aria-labelledby="site-plan-heading">
-    <div class="zone-head">
-      <h2 class="panel-title" id="site-plan-heading">Site plan</h2>
-      <span class="panel-note mono" id="array-summary"></span>
+  <!-- ---------------------------------------------------------- 1. array -->
+  <section class="section" id="section-array" aria-labelledby="array-heading">
+    <div class="section-head">
+      <span class="section-number" aria-hidden="true">1</span>
+      <h2 class="section-title" id="array-heading">The array</h2>
     </div>
-
-    <div class="sheet" id="sheet">
-      <svg id="site-plan" role="application" tabindex="0"
-           aria-label="Array site plan. Click to add an antenna, drag to move it, double-click to remove it. With the plan focused, press A to add an antenna at the centre."></svg>
-      <p class="sheet-empty" id="sheet-empty" hidden>Click the site plan to place your first antenna</p>
-      <output class="sheet-readout mono" id="cursor-readout" aria-live="off"></output>
-    </div>
-
-    <p class="hint">
-      Click bare ground to add an antenna. Drag a marker to move it.
-      Double-click a marker to remove it.
+    <p class="section-intro">
+      Where the antennas stand on the ground. Positions are metres east and north of
+      the array centre; every pair of antennas makes one baseline, and the longest
+      baseline sets how sharp the image can be.
     </p>
 
-    <div class="button-row">
-      <button type="button" class="button" id="reset-array">Reset to the default array</button>
-      <button type="button" class="button button-quiet" id="clear-array">Remove all</button>
-    </div>
-
-    <div class="antenna-table-wrap">
-      <table class="antenna-table mono">
-        <caption class="panel-title">Antennas</caption>
-        <thead>
-          <tr><th scope="col">#</th><th scope="col">East&nbsp;m</th><th scope="col">North&nbsp;m</th><th scope="col"></th></tr>
-        </thead>
-        <tbody id="antenna-rows"></tbody>
-      </table>
-    </div>
-  </section>
-
-  <!-- ------------------------------------------- sky and interference -->
-  <section class="zone zone-sources" aria-labelledby="sources-heading">
-    <div class="zone-head">
-      <h2 class="panel-title" id="sources-heading">Sky &amp; interference</h2>
-    </div>
-
-    <div class="scroll-region">
-      <div class="group">
-        <div class="group-head">
-          <h3 class="group-title">Sky sources</h3>
-          <button type="button" class="button button-small" id="add-sky">Add sky source</button>
+    <div class="array-layout">
+      <div class="array-plan">
+        <div class="sheet" id="sheet">
+          <svg id="site-plan" role="application" tabindex="0"
+               aria-label="Array site plan. Click to add an antenna, drag to move it, double-click to remove it. With the plan focused, press A to add an antenna at the centre."></svg>
+          <p class="sheet-empty" id="sheet-empty" hidden>Click the site plan to place your first antenna</p>
+          <output class="sheet-readout mono" id="cursor-readout" aria-live="off"></output>
         </div>
-        <div id="sky-cards" class="card-stack"></div>
-        <p class="empty-note" id="sky-empty" hidden>No sky sources — the map will show noise only.</p>
+        <p class="hint">
+          Click bare ground to add an antenna, drag a marker to move it, double-click
+          it to remove it.
+        </p>
       </div>
 
-      <div class="group">
-        <div class="group-head">
-          <h3 class="group-title">Interference sources</h3>
+      <div class="array-side">
+        <p class="readout mono" id="array-summary"></p>
+        <dl class="site-meta mono" id="site-meta"></dl>
+        <div class="button-row">
+          <button type="button" class="button" id="reset-array">Reset to the default array</button>
+          <button type="button" class="button button-quiet" id="clear-array">Remove all</button>
         </div>
-        <div class="add-row">
-          <label class="field-label" for="rfi-type">Kind</label>
-          <select id="rfi-type" class="input"></select>
-          <button type="button" class="button button-small" id="add-rfi">Add</button>
-        </div>
-        <p class="type-summary" id="rfi-type-summary"></p>
-        <div id="rfi-cards" class="card-stack"></div>
-        <p class="empty-note" id="rfi-empty" hidden>No interference — a clean observation.</p>
-      </div>
 
-      <div class="group">
-        <div class="group-head">
-          <h3 class="group-title">Spectral lines (celestial, not RFI)</h3>
-          <button type="button" class="button button-small" id="add-line">Add line</button>
-        </div>
-        <div id="line-cards" class="card-stack"></div>
-        <p class="empty-note" id="line-empty" hidden>No spectral lines in this run.</p>
-      </div>
-
-      <div class="group">
-        <div class="group-head">
-          <h3 class="group-title">Observation</h3>
-        </div>
-        <div class="field-grid" id="sim-fields"></div>
-        <p class="hint mono" id="sim-summary"></p>
-      </div>
-
-      <div class="group">
-        <details id="realism-details">
-          <summary class="group-title">Instrument &amp; realism</summary>
-          <div class="field-grid realism-grid" id="realism-fields"></div>
+        <details class="advanced">
+          <summary>Antenna coordinates</summary>
+          <div class="antenna-table-wrap">
+            <table class="antenna-table mono">
+              <thead>
+                <tr><th scope="col">#</th><th scope="col">East&nbsp;m</th><th scope="col">North&nbsp;m</th><th scope="col"></th></tr>
+              </thead>
+              <tbody id="antenna-rows"></tbody>
+            </table>
+          </div>
         </details>
       </div>
     </div>
+  </section>
 
-    <div class="run-bar">
-      <button type="button" class="button button-run" id="run">Run observation</button>
-      <span class="run-status mono" id="run-status"></span>
+  <!-- ------------------------------------------------------------ 2. sky -->
+  <section class="section" id="section-sky" aria-labelledby="sky-heading">
+    <div class="section-head">
+      <span class="section-number" aria-hidden="true">2</span>
+      <h2 class="section-title" id="sky-heading">The sky</h2>
+    </div>
+    <p class="section-intro">
+      What the telescope is meant to be looking at. These are the real astronomical
+      signals — the things an interference-removal algorithm must leave intact.
+    </p>
+
+    <div class="group">
+      <div class="group-head">
+        <h3 class="group-title">Point sources</h3>
+        <button type="button" class="button button-small" id="add-sky">Add a source</button>
+      </div>
+      <p class="group-intro">
+        Each source is a point on the sky, offset from where the telescope points.
+        The dirty image at the bottom of the page should show a peak at the offset
+        you type here.
+      </p>
+      <div id="sky-cards" class="card-stack"></div>
+      <p class="empty-note" id="sky-empty" hidden>No sources — the image will show noise only.</p>
+    </div>
+
+    <div class="group">
+      <div class="group-head">
+        <h3 class="group-title">Spectral lines</h3>
+        <button type="button" class="button button-small" id="add-line">Add a line</button>
+      </div>
+      <p class="group-intro">
+        A narrow emission line, added to every antenna. It is celestial signal, not
+        interference: it is labelled that way in the ground truth, so an algorithm
+        that flags it is being scored as wrong.
+      </p>
+      <div id="line-cards" class="card-stack"></div>
+      <p class="empty-note" id="line-empty" hidden>No spectral lines in this run.</p>
     </div>
   </section>
 
-  <!-- ------------------------------------------------------- console -->
-  <section class="zone zone-console" aria-labelledby="console-heading">
-    <div class="zone-head">
-      <h2 class="panel-title" id="console-heading">Console</h2>
-      <span class="panel-note mono" id="wall-time"></span>
+  <!-- --------------------------------------------------- 3. interference -->
+  <section class="section" id="section-rfi" aria-labelledby="rfi-heading">
+    <div class="section-head">
+      <span class="section-number" aria-hidden="true">3</span>
+      <h2 class="section-title" id="rfi-heading">The interference</h2>
+    </div>
+    <p class="section-intro">
+      Human-made transmitters that reach the antennas. Pick a kind, add it, and the
+      simulator records exactly which time–frequency cells it touched — that record
+      is the ground truth an excision algorithm gets scored against.
+    </p>
+
+    <div class="add-row">
+      <label class="field-label" for="rfi-type">Kind of transmitter</label>
+      <select id="rfi-type" class="input"></select>
+      <button type="button" class="button button-small" id="add-rfi">Add</button>
+    </div>
+    <p class="type-summary" id="rfi-type-summary"></p>
+
+    <div id="rfi-cards" class="card-stack"></div>
+    <p class="empty-note" id="rfi-empty" hidden>No interference — a clean observation.</p>
+  </section>
+
+  <!-- ---------------------------------------------------- 4. imperfection -->
+  <section class="section" id="section-realism" aria-labelledby="realism-heading">
+    <div class="section-head">
+      <span class="section-number" aria-hidden="true">4</span>
+      <h2 class="section-title" id="realism-heading">The instrument</h2>
+    </div>
+    <p class="section-intro">
+      Until you open this, the simulator is an ideal instrument: identical antennas,
+      perfect calibration, no digitisation loss. Everything in here makes it worse
+      on purpose, in the ways real telescopes are worse.
+    </p>
+
+    <details class="realism" id="realism-details">
+      <summary>Make the instrument imperfect — all off by default</summary>
+      <div id="realism-fields"></div>
+    </details>
+  </section>
+
+  <!-- ------------------------------------------------- 5. run and results -->
+  <section class="section" id="section-run" aria-labelledby="run-heading">
+    <div class="section-head">
+      <span class="section-number" aria-hidden="true">5</span>
+      <h2 class="section-title" id="run-heading">Run it</h2>
+    </div>
+    <p class="section-intro">
+      How much data to record, and then the run itself. The simulator generates
+      voltages for every antenna, correlates them, and sends back the pictures below.
+    </p>
+
+    <div class="group">
+      <div class="group-head">
+        <h3 class="group-title">Recording settings</h3>
+      </div>
+      <div class="field-grid" id="sim-fields"></div>
+      <p class="readout mono" id="sim-summary"></p>
+    </div>
+
+    <div class="run-bar">
+      <button type="button" class="button button-run" id="run-main">Run observation</button>
+      <span class="run-status mono" id="run-status-main"></span>
+      <span class="run-wall mono" id="wall-time"></span>
     </div>
 
     <div class="notice-area" id="notices" aria-live="polite"></div>
 
-    <div class="console-grid">
+    <div class="results">
 
       <figure class="display display-wide" id="waterfall-display">
         <figcaption>
-          <span class="display-title">Autocorrelation waterfall</span>
+          <span class="display-title">What one antenna heard</span>
           <span class="display-sub mono" id="waterfall-sub"></span>
         </figcaption>
+        <p class="display-note">
+          Power against time and frequency, for a single antenna. Interference shows
+          up as bright stripes, blobs or drifting tracks.
+        </p>
+
         <div class="display-controls">
-          <label class="field-label" for="waterfall-antenna">Antenna</label>
-          <select id="waterfall-antenna" class="input input-dark input-small"></select>
-          <span class="control-sep" aria-hidden="true"></span>
-          <label class="field-label" for="waterfall-pol" id="waterfall-pol-label" hidden>Pol</label>
-          <select id="waterfall-pol" class="input input-dark input-small" hidden>
-            <option value="0">0</option>
-            <option value="1">1</option>
-          </select>
-          <span class="control-sep" aria-hidden="true"></span>
-          <span class="field-label">Ground truth</span>
-          <div class="mask-toggles" id="mask-toggles"></div>
-          <label class="checkline">
-            <input type="checkbox" id="hatch-toggle"> hatch
-          </label>
+          <span class="control-group">
+            <label class="field-label" for="waterfall-antenna">Antenna</label>
+            <select id="waterfall-antenna" class="input input-dark input-small"></select>
+          </span>
+          <span class="control-group" id="waterfall-pol-group" hidden>
+            <label class="field-label" for="waterfall-pol" id="waterfall-pol-label">Polarization</label>
+            <select id="waterfall-pol" class="input input-dark input-small">
+              <option value="0">0 (XX)</option>
+              <option value="1">1 (YY)</option>
+            </select>
+          </span>
         </div>
+
+        <div class="truth-bar">
+          <p class="truth-title">
+            Show where the RFI truly is — the labels an algorithm would be scored against
+          </p>
+          <div class="truth-controls">
+            <div class="mask-toggles" id="mask-toggles"></div>
+            <label class="checkline">
+              <input type="checkbox" id="hatch-toggle"> hatch the flagged cells
+            </label>
+          </div>
+        </div>
+
         <div class="canvas-wrap">
           <canvas id="waterfall-canvas"></canvas>
           <div class="sweep" id="waterfall-sweep" hidden></div>
-          <p class="display-empty" id="waterfall-empty">Run an observation to fill the console.</p>
+          <p class="display-empty" id="waterfall-empty">Run an observation to fill this in.</p>
         </div>
       </figure>
 
@@ -165,6 +244,10 @@
           <span class="display-title">Dirty image</span>
           <span class="display-sub mono" id="image-sub"></span>
         </figcaption>
+        <p class="display-note">
+          The sky as this array reconstructs it, before any deconvolution. The circle
+          marks the brightest pixel.
+        </p>
         <div class="canvas-wrap">
           <canvas id="image-canvas"></canvas>
         </div>
@@ -175,6 +258,10 @@
           <span class="display-title">Baseline coverage</span>
           <span class="display-sub mono" id="uv-sub"></span>
         </figcaption>
+        <p class="display-note">
+          Every antenna pair, in wavelengths. This is the sampling pattern that gives
+          the dirty image its shape.
+        </p>
         <div class="canvas-wrap">
           <svg id="uv-plot" role="img" aria-label="Baseline coverage in wavelengths"></svg>
         </div>
