@@ -12,6 +12,8 @@ computed for itself.
 """
 
 import json
+import math
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -39,6 +41,7 @@ from rfi_simulator.webui.simulate import (  # noqa: E402
     build_simulator,
     default_array,
     defaults_payload,
+    pointing_payload,
 )
 
 # Small but real: two integrations of 32 channels run in well under a
@@ -875,3 +878,259 @@ def test_everything_on_at_once_still_runs(client):
     result = response.json()
     assert result["observation"]["n_pol"] == 2
     assert len(result["sources"]) == 2
+
+
+# ----------------------------------------------------------------------
+# The array catalogue: the bundled layouts plus whatever directory the
+# operator points the server at
+# ----------------------------------------------------------------------
+EXTRA_ARRAY_YAML = """
+name: three element line
+latitude_deg: -30.7
+longitude_deg: 21.4
+height_m: 1050.0
+antennas:
+  - [0.0, 0.0, 0.0]
+  - [25.0, 0.0, 0.0]
+  - [50.0, 12.0, 0.0]
+"""
+
+
+@pytest.fixture(scope="module")
+def extra_array_dir(tmp_path_factory) -> Path:
+    """A directory holding one loadable layout and one that is not."""
+    directory = tmp_path_factory.mktemp("arrays")
+    (directory / "line_of_three.yaml").write_text(EXTRA_ARRAY_YAML)
+    (directory / "not_an_array.yaml").write_text("colours:\n  - red\n  - blue\n")
+    return directory
+
+
+@pytest.fixture(scope="module")
+def catalogue_client(extra_array_dir: Path) -> TestClient:
+    """A client whose server also offers the extra directory."""
+    return TestClient(create_app(array_dir=extra_array_dir))
+
+
+def test_the_catalogue_lists_the_bundled_and_the_extra_layouts(catalogue_client):
+    """A readable layout is offered; an unreadable YAML beside it is not."""
+    listing = catalogue_client.get("/api/arrays")
+    assert listing.status_code == 200
+    entries = listing.json()
+
+    by_name = {entry["name"]: entry for entry in entries}
+    array = default_array()
+    assert array.name in by_name
+    assert by_name[array.name]["n_antennas"] == len(array.antenna_positions_enu_m)
+    assert by_name["three element line"]["n_antennas"] == 3
+    assert all(entry["runnable"] for entry in entries)
+    assert all("antennas" not in entry for entry in entries), "the listing stays small"
+
+
+def test_one_catalogue_entry_round_trips_its_antennas(catalogue_client):
+    """What the picker loads is the file's own geometry and site."""
+    entries = catalogue_client.get("/api/arrays").json()
+    identifier = [entry for entry in entries if entry["name"] == "three element line"][0]["id"]
+
+    detail = catalogue_client.get(f"/api/arrays/{identifier}")
+    assert detail.status_code == 200
+    payload = detail.json()
+
+    assert payload["antennas"] == [[0.0, 0.0, 0.0], [25.0, 0.0, 0.0], [50.0, 12.0, 0.0]]
+    assert payload["latitude_deg"] == pytest.approx(-30.7)
+    assert payload["longitude_deg"] == pytest.approx(21.4)
+    assert payload["height_m"] == pytest.approx(1050.0)
+
+    # And it is a run the server accepts exactly as it was handed over.
+    body = make_request()
+    body["antennas"] = payload["antennas"]
+    body["site"] = {
+        "latitude_deg": payload["latitude_deg"],
+        "longitude_deg": payload["longitude_deg"],
+        "height_m": payload["height_m"],
+    }
+    assert catalogue_client.post("/api/simulate", json=body).status_code == 200
+
+
+def test_an_unknown_layout_is_a_404(catalogue_client):
+    """Ids come from the server's own listing; anything else is not found."""
+    assert catalogue_client.get("/api/arrays/no-such-layout").status_code == 404
+
+
+def test_a_layout_id_cannot_name_a_path(catalogue_client):
+    """The id is an identifier, never a file name to be traversed."""
+    for attempt in ("..", "%2e%2e%2fetc%2fpasswd", "..%2farray-default"):
+        assert catalogue_client.get(f"/api/arrays/{attempt}").status_code in {404, 422}
+
+
+def test_a_run_can_observe_from_another_site(client):
+    """The phase centre follows the site, because it is that site's zenith."""
+    equator = pointing_payload(0.0, 0.0, 0.0)
+    assert equator["dec_deg"] != pytest.approx(pointing_payload()["dec_deg"], abs=1.0)
+
+    body = make_request()
+    body["site"] = {"latitude_deg": 0.0, "longitude_deg": 0.0, "height_m": 0.0}
+    body["sky_sources"] = [{"name": "target", "offset_deg": [0.0, 0.0], "flux_jy": 5.0}]
+    result = client.post("/api/simulate", json=body).json()
+    assert result["sky_sources"][0]["dec_deg"] == pytest.approx(equator["dec_deg"], abs=1e-6)
+
+
+# ----------------------------------------------------------------------
+# Human-friendly sky positions
+# ----------------------------------------------------------------------
+def post_raw(client: TestClient, body: dict):
+    """POST a body that may hold NaN, which the JSON encoder refuses."""
+    return client.post(
+        "/api/simulate",
+        content=json.dumps(body),
+        headers={"content-type": "application/json"},
+    )
+
+
+def test_the_pointing_endpoint_agrees_with_the_image_grid(client):
+    """The bound the page quotes is the edge of the image it will draw."""
+    response = client.get("/api/pointing")
+    assert response.status_code == 200
+    pointing = response.json()
+
+    assert np.isfinite(pointing["ra_deg"]) and 0.0 <= pointing["ra_deg"] < 360.0
+    assert np.isfinite(pointing["dec_deg"]) and -90.0 <= pointing["dec_deg"] <= 90.0
+    # The zenith's declination is the site's latitude, up to the geodetic
+    # flattening -- a fraction of a degree, not a degree.
+    assert pointing["dec_deg"] == pytest.approx(default_array().latitude_deg, abs=0.2)
+
+    image = client.post("/api/simulate", json=make_request()).json()["image"]
+    half_width = float(np.degrees(np.arcsin(max(image["l"]))))
+    assert pointing["field_half_width_deg"] == pytest.approx(half_width, rel=1e-9)
+    assert max(image["l"]) == pytest.approx(0.5 * pointing["field_of_view_rad"])
+
+
+def test_a_source_can_be_placed_in_degrees_from_the_pointing(client):
+    """`offset_deg` is the exact sine of the angle, in the library's l and m."""
+    body = make_request()
+    body["sky_sources"] = [{"name": "target", "offset_deg": [0.5, -0.3], "flux_jy": 5.0}]
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 200, response.text
+    resolved = response.json()["sky_sources"][0]
+
+    assert resolved["l"] == pytest.approx(math.sin(math.radians(0.5)), abs=1e-12)
+    assert resolved["m"] == pytest.approx(math.sin(math.radians(-0.3)), abs=1e-12)
+    assert resolved["in_field"] is True
+    # East is towards increasing right ascension, north towards increasing
+    # declination -- the convention `PointSource.from_lm` documents.
+    pointing = client.get("/api/pointing").json()
+    assert resolved["ra_deg"] > pointing["ra_deg"]
+    assert resolved["dec_deg"] < pointing["dec_deg"]
+
+    peak = response.json()["image"]["peak"]
+    assert peak["l"] == pytest.approx(resolved["l"], abs=1e-3)
+    assert peak["m"] == pytest.approx(resolved["m"], abs=1e-3)
+
+
+def test_a_source_placed_at_the_pointing_lands_dead_centre(client):
+    """An absolute position equal to the phase centre resolves to l = m = 0."""
+    pointing = client.get("/api/pointing").json()
+    body = make_request()
+    body["sky_sources"] = [
+        {
+            "name": "centre",
+            "radec_deg": [pointing["ra_deg"], pointing["dec_deg"]],
+            "flux_jy": 5.0,
+        }
+    ]
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 200, response.text
+    resolved = response.json()["sky_sources"][0]
+
+    assert resolved["l"] == pytest.approx(0.0, abs=1e-9)
+    assert resolved["m"] == pytest.approx(0.0, abs=1e-9)
+    assert response.json()["image"]["peak"]["value_jy"] > 1.0
+
+
+def test_an_absolute_position_images_where_the_offset_one_does(client):
+    """The two notations are two spellings of one place."""
+    pointing = client.get("/api/pointing").json()
+    offset = client.post(
+        "/api/simulate",
+        json=dict(
+            make_request(),
+            sky_sources=[{"name": "a", "offset_deg": [0.4, 0.2], "flux_jy": 5.0}],
+        ),
+    ).json()["sky_sources"][0]
+
+    absolute = client.post(
+        "/api/simulate",
+        json=dict(
+            make_request(),
+            sky_sources=[
+                {
+                    "name": "b",
+                    "radec_deg": [offset["ra_deg"], offset["dec_deg"]],
+                    "flux_jy": 5.0,
+                }
+            ],
+        ),
+    ).json()["sky_sources"][0]
+
+    assert absolute["l"] == pytest.approx(offset["l"], abs=1e-9)
+    assert absolute["m"] == pytest.approx(offset["m"], abs=1e-9)
+    assert offset["ra_deg"] > pointing["ra_deg"]
+    assert offset["dec_deg"] > pointing["dec_deg"]
+
+
+def test_a_source_far_outside_the_field_is_reported_as_such(client):
+    """Out of the image is not an error: it is simulated, and labelled."""
+    body = make_request()
+    body["sky_sources"] = [{"name": "far", "offset_deg": [4.0, 0.0], "flux_jy": 5.0}]
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 200, response.text
+    assert response.json()["sky_sources"][0]["in_field"] is False
+
+
+@pytest.mark.parametrize(
+    "position",
+    [
+        {"l": 0.01, "m": 0.0, "offset_deg": [0.5, -0.3]},
+        {"l": 0.01, "m": 0.0, "radec_deg": [10.0, 10.0]},
+        {"offset_deg": [0.5, -0.3], "radec_deg": [10.0, 10.0]},
+        {"l": 0.01},
+        {"m": 0.01},
+        {"offset_deg": [0.5]},
+        {"offset_deg": [0.5, -0.3, 0.1]},
+        {"offset_deg": [90.0, 0.0]},
+        {"radec_deg": [10.0, 120.0]},
+    ],
+)
+def test_one_position_per_source_and_it_must_be_in_range(client, position):
+    """Two positions, half a position, or an impossible one: all refused."""
+    body = make_request()
+    body["sky_sources"] = [dict(position, name="target", flux_jy=5.0)]
+    assert client.post("/api/simulate", json=body).status_code == 422
+
+
+@pytest.mark.parametrize(
+    "position",
+    [
+        {"offset_deg": [float("nan"), 0.0]},
+        {"offset_deg": [0.5, float("inf")]},
+        {"radec_deg": [float("nan"), 0.0]},
+        {"l": float("nan"), "m": 0.0},
+    ],
+)
+def test_a_position_that_is_not_a_number_is_refused(client, position):
+    """NaN parses as a float, and must not get past the validator."""
+    body = make_request()
+    body["sky_sources"] = [dict(position, name="target", flux_jy=5.0)]
+    assert post_raw(client, body).status_code == 422
+
+
+def test_a_source_with_no_position_at_all_lands_where_the_page_opens(client):
+    """No position given is the page's own default offset, not the origin."""
+    body = make_request()
+    body["sky_sources"] = [{"name": "target", "flux_jy": 5.0}]
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 200, response.text
+    resolved = response.json()["sky_sources"][0]
+
+    default_offset = defaults_payload()["sky_source"]["position"]["default_offset_deg"]
+    assert resolved["l"] == pytest.approx(math.sin(math.radians(default_offset[0])), abs=1e-12)
+    assert resolved["m"] == pytest.approx(math.sin(math.radians(default_offset[1])), abs=1e-12)

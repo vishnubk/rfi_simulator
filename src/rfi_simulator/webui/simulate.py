@@ -29,7 +29,10 @@ without either side inventing a second convention.
 
 from __future__ import annotations
 
+import logging
 import math
+import os
+import re
 import time
 import warnings
 from collections.abc import Iterator
@@ -37,6 +40,8 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import numpy as np
+from astropy import units as u
+from astropy.coordinates import SkyCoord
 from astropy.time import Time
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -69,9 +74,21 @@ from rfi_simulator.channelizer import (
     DEFAULT_WINDOW,
 )
 from rfi_simulator.delays import earth_location, zenith_coord
+from rfi_simulator.sky import lm_from_radec
 from rfi_simulator.voltages import DEFAULT_CHAN_WIDTH_HZ, DEFAULT_QUANT_TARGET_COUNTS
 
+_log = logging.getLogger(__name__)
+
+_SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
+
+ARRAY_DIR_ENV_VAR = "RFI_SIMULATOR_ARRAY_DIR"
+"""str: Environment variable naming a directory of extra array
+configurations, offered alongside the bundled ones. `main` sets it from
+``--array-dir`` so the value survives into the process the reloader
+starts."""
+
 __all__ = [
+    "ARRAY_DIR_ENV_VAR",
     "DEFAULT_CENTER_FREQ_HZ",
     "DEFAULT_N_BLOCKS",
     "DEFAULT_N_CHAN",
@@ -84,9 +101,13 @@ __all__ = [
     "MAX_TOTAL_SAMPLES",
     "START_TIME_UTC",
     "SimulateRequest",
+    "array_catalogue",
+    "array_detail",
+    "array_summaries",
     "build_simulator",
     "default_array",
     "defaults_payload",
+    "pointing_payload",
     "run_simulation",
     "sample_tle_text",
 ]
@@ -113,7 +134,7 @@ DEFAULT_CENTER_FREQ_HZ = 1.405e9
 DEFAULT_NOISE_STD = 1.0
 DEFAULT_SEED = 20260730
 
-MAX_ANTENNAS = 32
+MAX_ANTENNAS = 128
 MAX_N_CHAN = 512
 MAX_N_BLOCKS = 32
 MAX_SKY_SOURCES = 8
@@ -127,23 +148,26 @@ The same bound the aircraft trajectory uses. Beyond it the geometry is no
 longer a local array, and coordinates near the floating-point ceiling
 overflow into infinities that leave the response full of nulls."""
 
-MAX_TOTAL_SAMPLES = 48_000_000
+MAX_TOTAL_SAMPLES = 100_000_000
 """int: Most voltage samples one run may generate.
 
 The count is ``n_antennas * n_chan * n_blocks * N_TIME_PER_BLOCK``. Each
 of the individual caps is modest on its own, but their product is not:
-taking every one of them at once would allocate several gigabytes and run
-for about a minute. This budget keeps a run to a few hundred megabytes and
-a few seconds while leaving room for the largest setups the page offers in
-any one direction -- a 32-antenna array at the default width, or a
-512-channel band on a handful of antennas."""
+taking every one of them at once would allocate tens of gigabytes and run
+for many minutes. This budget leaves room for the largest setups the page
+offers in any one direction -- a hundred-element array at the default
+width, or a 512-channel band on a handful of antennas -- while keeping the
+memory a run holds at once (one block of voltages, not the whole
+observation) to something a laptop has. The largest runs it allows take
+tens of seconds rather than the few seconds a default run takes, which is
+what the page warns about when a large array is loaded."""
 
 MAX_BINS = 256
 """int: Most cells the browser is ever sent along one axis of a waterfall."""
 
 MAX_WATERFALL_CELLS = 400_000
 """int: Budget for all antennas' waterfalls together. The time axis is
-thinned until the whole response fits, so a 32-antenna run stays a
+thinned until the whole response fits, so a many-antenna run stays a
 few megabytes rather than a few tens."""
 
 DYNAMIC_RANGE_DB = 60.0
@@ -160,12 +184,38 @@ IMAGE_MAX_CHANNELS = 64
 """int: Channels the direct-DFT image uses. Above this the channels are
 evenly subsampled, which costs sensitivity but does not move sources."""
 
+IMAGE_FIELD_HALF_WIDTH_DEG = math.degrees(math.asin(0.5 * IMAGE_FIELD_OF_VIEW_RAD))
+"""float: Angular half-width of the imaged field, degrees.
+
+`IMAGE_FIELD_OF_VIEW_RAD` is the *full* width of the direction-cosine grid
+(`rfi_simulator.imaging.lm_axis`), so its half is the largest ``l`` or
+``m`` the image covers, and the angle that corresponds to is its arcsine.
+The two differ by a part in ten thousand at this size; the arcsine is used
+anyway so that the number the page quotes is the same angle the source
+placement uses."""
+
+DEFAULT_OFFSET_EAST_DEG = 0.5
+DEFAULT_OFFSET_NORTH_DEG = -0.3
+"""float: Where a freshly added sky source sits, degrees east and north of
+the pointing centre. Comfortably inside `IMAGE_FIELD_HALF_WIDTH_DEG`, and
+off-centre in both axes so a mirrored sign convention would be visible in
+the image rather than hidden by symmetry."""
+
+MAX_OFFSET_DEG = 30.0
+"""float: Largest tangent-plane offset a source may be given, degrees.
+
+``sin(30 deg)`` is 0.5, which is the same bound `MAX_LM` puts on the
+direction cosines themselves."""
+
+MAX_LM = 0.5
+"""float: Largest direction cosine a source may be given."""
+
 
 # ----------------------------------------------------------------------
 # Packaged inputs
 # ----------------------------------------------------------------------
-def _config_path(filename: str) -> Path | None:
-    """Locate a file in the repository's ``configs`` directory, if present.
+def _config_dir() -> Path | None:
+    """The repository's ``configs`` directory, if this is a checkout.
 
     The search only ever looks inside a checkout: it climbs from this
     module to the first directory holding a ``pyproject.toml`` and stops
@@ -183,10 +233,19 @@ def _config_path(filename: str) -> Path | None:
     if root_index is None:
         return None
     for parent in parents[: root_index + 1]:
-        candidate = parent / "configs" / filename
-        if candidate.is_file():
+        candidate = parent / "configs"
+        if candidate.is_dir():
             return candidate
     return None
+
+
+def _config_path(filename: str) -> Path | None:
+    """Locate a file in the repository's ``configs`` directory, if present."""
+    directory = _config_dir()
+    if directory is None:
+        return None
+    candidate = directory / filename
+    return candidate if candidate.is_file() else None
 
 
 _FALLBACK_ANTENNAS = [
@@ -227,6 +286,110 @@ def default_array() -> ArrayConfig:
         name="array_default",
         **_FALLBACK_SITE,
     )
+
+
+def _slugify(text: str) -> str:
+    """A short identifier made only of letters, digits and hyphens."""
+    slug = _SLUG_STRIP_RE.sub("-", text.lower()).strip("-")
+    return slug[:60] or "array"
+
+
+def _array_directories(extra_dir: str | Path | None = None) -> list[Path]:
+    """Directories scanned for array configurations, in listing order.
+
+    The bundled ``configs`` directory comes first so the default array is
+    always the first entry; `extra_dir` (the ``--array-dir`` flag, or
+    `ARRAY_DIR_ENV_VAR` in the environment) is appended when it is set and
+    exists. Nothing else on the filesystem is ever read: the operator names
+    one directory, and only that directory is offered.
+    """
+    directories: list[Path] = []
+    bundled = _config_dir()
+    if bundled is not None:
+        directories.append(bundled)
+    if extra_dir is None:
+        extra_dir = os.environ.get(ARRAY_DIR_ENV_VAR) or None
+    if extra_dir:
+        extra = Path(extra_dir).expanduser()
+        if extra.is_dir() and extra.resolve() not in {d.resolve() for d in directories}:
+            directories.append(extra)
+    return directories
+
+
+def array_catalogue(extra_dir: str | Path | None = None) -> list[tuple[str, ArrayConfig]]:
+    """Every array configuration this server can offer.
+
+    Parameters
+    ----------
+    extra_dir : str or pathlib.Path, optional
+        A second directory to scan, in addition to the bundled one.
+        Defaults to `ARRAY_DIR_ENV_VAR` in the environment.
+
+    Returns
+    -------
+    list of (str, ArrayConfig)
+        Identifier and loaded configuration, in listing order. The
+        identifier is derived from the file name *here*, on the server; a
+        client never names a path, so no request can point this at a file
+        the operator did not offer. A YAML that `ArrayConfig.from_yaml`
+        refuses -- anything from an unrelated YAML file sharing the
+        directory to a malformed array -- is skipped without comment
+        beyond a debug log line.
+    """
+    entries: list[tuple[str, ArrayConfig]] = []
+    taken: set[str] = set()
+    for directory in _array_directories(extra_dir):
+        paths = sorted(path for path in directory.iterdir() if path.suffix in {".yaml", ".yml"})
+        for path in paths:
+            try:
+                array = ArrayConfig.from_yaml(path)
+            except Exception:  # noqa: BLE001 - any unreadable file is simply not offered
+                _log.debug("not offering %s: it is not a readable array configuration", path)
+                continue
+            identifier = _slugify(path.stem)
+            if identifier in taken:
+                suffix = 2
+                while f"{identifier}-{suffix}" in taken:
+                    suffix += 1
+                identifier = f"{identifier}-{suffix}"
+            taken.add(identifier)
+            entries.append((identifier, array))
+    return entries
+
+
+def _array_payload(identifier: str, array: ArrayConfig) -> dict[str, Any]:
+    """One array in the shape the page's array section holds it."""
+    positions = np.asarray(array.antenna_positions_enu_m, dtype=np.float64)
+    return {
+        "id": identifier,
+        "name": array.name or identifier,
+        "n_antennas": int(positions.shape[0]),
+        "latitude_deg": float(array.latitude_deg),
+        "longitude_deg": float(array.longitude_deg),
+        "height_m": float(array.height_m),
+        "antennas": [[float(value) for value in row] for row in positions],
+        "runnable": int(positions.shape[0]) <= MAX_ANTENNAS,
+    }
+
+
+def array_summaries(extra_dir: str | Path | None = None) -> list[dict[str, Any]]:
+    """The catalogue without the antenna positions, for the dropdown."""
+    return [
+        {
+            key: value
+            for key, value in _array_payload(identifier, array).items()
+            if key != "antennas"
+        }
+        for identifier, array in array_catalogue(extra_dir)
+    ]
+
+
+def array_detail(identifier: str, extra_dir: str | Path | None = None) -> dict[str, Any] | None:
+    """One catalogue entry in full, or ``None`` if there is no such id."""
+    for candidate, array in array_catalogue(extra_dir):
+        if candidate == identifier:
+            return _array_payload(candidate, array)
+    return None
 
 
 def sample_tle_text() -> str:
@@ -322,27 +485,43 @@ MHZ = 1.0e6
 KHZ = 1.0e3
 
 SKY_SOURCE_FIELDS = [
-    _num(
-        "l",
-        "Offset east (l)",
-        0.0087,
-        minimum=-0.5,
-        maximum=0.5,
-        step=0.001,
-        unit="direction cosine",
-        help_text="Direction cosine towards increasing right ascension.",
-    ),
-    _num(
-        "m",
-        "Offset north (m)",
-        -0.0052,
-        minimum=-0.5,
-        maximum=0.5,
-        step=0.001,
-        unit="direction cosine",
-        help_text="Direction cosine towards increasing declination.",
-    ),
     _num("flux_jy", "Flux density", 5.0, minimum=0.0, maximum=1.0e4, step=0.5, unit="Jy"),
+]
+"""list of dict: The schema-driven part of a sky source's form.
+
+Position is deliberately not in here: it is one quantity expressed three
+different ways (see `SkySource`), which the one-control-per-field form
+builder cannot render, so the page draws a small unit switcher for it by
+hand and describes the three modes from `SKY_POSITION_MODES`."""
+
+SKY_POSITION_MODES = [
+    {
+        "value": "offset",
+        "label": "Offset from pointing (degrees E/N)",
+        "fields": ["east_deg", "north_deg"],
+        "unit": "deg",
+        "step": 0.05,
+        "limit": MAX_OFFSET_DEG,
+        "labels": ["East of pointing", "North of pointing"],
+    },
+    {
+        "value": "radec",
+        "label": "Right ascension / declination (degrees)",
+        "fields": ["ra_deg", "dec_deg"],
+        "unit": "deg",
+        "step": 0.01,
+        "limit": 360.0,
+        "labels": ["Right ascension (ICRS)", "Declination (ICRS)"],
+    },
+    {
+        "value": "lm",
+        "label": "Direction cosines l/m (advanced)",
+        "fields": ["l", "m"],
+        "unit": "direction cosine",
+        "step": 0.001,
+        "limit": MAX_LM,
+        "labels": ["l (east)", "m (north)"],
+    },
 ]
 
 # `waveform` is a real scalar field on `TowerParams`/`CombParams`, so it is
@@ -851,21 +1030,135 @@ def _build_arrival(arrival: ArrivalSpec) -> Any:
 # ----------------------------------------------------------------------
 # Request models
 # ----------------------------------------------------------------------
+def _pair(name: str, value: list[float] | None, limit: float) -> list[float] | None:
+    """Validate a two-number position spec: finite, in range, exactly two."""
+    if value is None:
+        return None
+    if len(value) != 2:
+        raise ValueError(f"{name} must be two numbers, got {len(value)}")
+    for number in value:
+        if not math.isfinite(number):
+            raise ValueError(f"{name} must be finite numbers, got {value}")
+        if abs(number) > limit:
+            raise ValueError(f"{name} must lie between -{limit:g} and {limit:g}, got {number}")
+    return [float(number) for number in value]
+
+
 class SkySource(BaseModel):
-    """One celestial point source, placed by direction cosines."""
+    """One celestial point source and where on the sky it sits.
+
+    The position may be given in any one of three ways, and giving more
+    than one is an error rather than a silent precedence rule:
+
+    ``offset_deg``
+        ``[east_deg, north_deg]`` from the pointing centre, on the tangent
+        plane: ``l = sin(east_deg * pi / 180)``, ``m = sin(north_deg *
+        pi / 180)``. The exact sine, not the small-angle approximation --
+        they agree to a part in ten thousand over the imaged field, and
+        using the sine means the number a user types is the angle the
+        source really lands at.
+    ``radec_deg``
+        ``[ra_deg, dec_deg]``, absolute ICRS, projected onto the same
+        tangent plane by `rfi_simulator.sky.lm_from_radec` -- the
+        library's own forward SIN projection, which is the exact inverse
+        of the `PointSource.from_lm` used to build the source.
+    ``l``/``m``
+        Direction cosines, the library's native coordinates: ``l``
+        increases east (towards increasing right ascension), ``m`` north
+        (towards increasing declination).
+
+    With none of them given the source lands at
+    (`DEFAULT_OFFSET_EAST_DEG`, `DEFAULT_OFFSET_NORTH_DEG`).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(default="source", max_length=40)
-    l: float = Field(default=0.0087, ge=-0.5, le=0.5)  # noqa: E741 - the standard symbol
-    m: float = Field(default=-0.0052, ge=-0.5, le=0.5)
+    l: float | None = Field(default=None, ge=-MAX_LM, le=MAX_LM)  # noqa: E741 - standard symbol
+    m: float | None = Field(default=None, ge=-MAX_LM, le=MAX_LM)
+    offset_deg: list[float] | None = None
+    radec_deg: list[float] | None = None
     flux_jy: float = Field(default=5.0, ge=0.0, le=1.0e4)
 
+    @field_validator("offset_deg")
+    @classmethod
+    def _check_offset(cls, value: list[float] | None) -> list[float] | None:
+        return _pair("offset_deg", value, MAX_OFFSET_DEG)
+
+    @field_validator("radec_deg")
+    @classmethod
+    def _check_radec(cls, value: list[float] | None) -> list[float] | None:
+        value = _pair("radec_deg", value, 360.0)
+        if value is not None and abs(value[1]) > 90.0:
+            raise ValueError(f"radec_deg declination must lie in [-90, 90], got {value[1]}")
+        return value
+
     @model_validator(mode="after")
-    def _check_on_sky(self) -> "SkySource":
-        if self.l**2 + self.m**2 >= 1.0:
+    def _check_one_position(self) -> "SkySource":
+        given = []
+        if self.l is not None or self.m is not None:
+            if self.l is None or self.m is None:
+                raise ValueError("give both l and m, or neither")
+            given.append("l/m")
+        if self.offset_deg is not None:
+            given.append("offset_deg")
+        if self.radec_deg is not None:
+            given.append("radec_deg")
+        if len(given) > 1:
+            raise ValueError(
+                "give this source one position only, not " + " and ".join(given) + " together"
+            )
+        if self.l is not None and self.l**2 + self.m**2 >= 1.0:
             raise ValueError("l and m place this source off the sky: l^2 + m^2 must be below 1")
         return self
+
+    def resolve_lm(self, phase_center: SkyCoord) -> tuple[float, float]:
+        """Direction cosines of this source relative to `phase_center`.
+
+        Parameters
+        ----------
+        phase_center : astropy.coordinates.SkyCoord
+            Where the run points; only `radec_deg` sources depend on it.
+
+        Returns
+        -------
+        tuple of float
+            ``(l, m)``, whichever way the position was given.
+        """
+        if self.l is not None and self.m is not None:
+            return (float(self.l), float(self.m))
+        if self.radec_deg is not None:
+            coord = SkyCoord(
+                ra=self.radec_deg[0] * u.deg, dec=self.radec_deg[1] * u.deg, frame="icrs"
+            )
+            l_dir, m_dir = lm_from_radec(phase_center, coord)
+            return (float(l_dir), float(m_dir))
+        east_deg, north_deg = self.offset_deg or (
+            DEFAULT_OFFSET_EAST_DEG,
+            DEFAULT_OFFSET_NORTH_DEG,
+        )
+        return (math.sin(math.radians(east_deg)), math.sin(math.radians(north_deg)))
+
+    def build(self, phase_center: SkyCoord) -> PointSource:
+        """This source as a library `PointSource`.
+
+        A source given in right ascension and declination is built at that
+        coordinate directly rather than round-tripped through ``(l, m)``:
+        the projection is many-to-one over the whole sphere, so a position
+        far outside the field would otherwise come back mirrored onto the
+        near hemisphere instead of simply being absent from the image.
+        """
+        if self.radec_deg is not None:
+            return PointSource(
+                flux_jy=self.flux_jy,
+                coord=SkyCoord(
+                    ra=self.radec_deg[0] * u.deg, dec=self.radec_deg[1] * u.deg, frame="icrs"
+                ),
+                name=self.name,
+            )
+        return PointSource.from_lm(
+            phase_center, self.resolve_lm(phase_center), self.flux_jy, name=self.name
+        )
 
 
 class TowerParams(BaseModel):
@@ -1284,6 +1577,23 @@ class QuantizationParams(BaseModel):
     quant_scale: float | None = Field(default=None, gt=0.0)
 
 
+class SiteParams(BaseModel):
+    """Where on Earth the array origin stands.
+
+    Optional: a request that leaves it out observes from the default
+    array's site. It matters because the phase centre is the zenith of
+    *this* point at the start of the observation, so loading another
+    array's antennas without its site would point the telescope somewhere
+    that array never looks.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    latitude_deg: float = Field(default=0.0, ge=-90.0, le=90.0)
+    longitude_deg: float = Field(default=0.0, ge=-360.0, le=360.0)
+    height_m: float = Field(default=0.0, ge=-500.0, le=1.0e4)
+
+
 class SimParams(BaseModel):
     """Observation size and the receiver noise level."""
 
@@ -1300,12 +1610,14 @@ class SimulateRequest(BaseModel):
     """Everything one run needs.
 
     Antenna positions are local East-North-Up metres relative to the
-    array origin, which is the site of the default array.
+    array origin, which is `site` when it is given and the default
+    array's site otherwise.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     antennas: list[list[float]] = Field(default_factory=list, max_length=MAX_ANTENNAS)
+    site: SiteParams | None = None
     sky_sources: list[SkySource] = Field(default_factory=list, max_length=MAX_SKY_SOURCES)
     rfi_sources: list[RFIParams] = Field(default_factory=list, max_length=MAX_RFI_SOURCES)
     spectral_lines: list[SpectralLineParams] = Field(
@@ -1375,6 +1687,64 @@ def default_request() -> SimulateRequest:
 # ----------------------------------------------------------------------
 # Defaults payload
 # ----------------------------------------------------------------------
+def phase_center_for_site(latitude_deg: float, longitude_deg: float, height_m: float) -> SkyCoord:
+    """Where a run from this site points: the zenith at `START_TIME_UTC`.
+
+    Built through the library's own `earth_location`/`zenith_coord` pair,
+    on a throwaway two-antenna array, so that the coordinate the page
+    quotes and the coordinate `build_simulator` fringe-stops on cannot
+    drift apart.
+    """
+    array = ArrayConfig(
+        antenna_positions_enu_m=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        latitude_deg=latitude_deg,
+        longitude_deg=longitude_deg,
+        height_m=height_m,
+    )
+    return zenith_coord(earth_location(array), Time(START_TIME_UTC, scale="utc"))
+
+
+def pointing_payload(
+    latitude_deg: float | None = None,
+    longitude_deg: float | None = None,
+    height_m: float | None = None,
+) -> dict[str, Any]:
+    """Where the telescope points, and how far out the image reaches.
+
+    Parameters
+    ----------
+    latitude_deg, longitude_deg, height_m : float, optional
+        The site to answer for. Any left out is taken from the default
+        array, so the no-argument call describes the run the page opens
+        with.
+
+    Returns
+    -------
+    dict
+        ``ra_deg``/``dec_deg`` of the phase centre in ICRS, the site it
+        was computed for, the start time, and ``field_half_width_deg`` --
+        how far from the pointing a source can sit and still land inside
+        the dirty image.
+    """
+    site = default_array()
+    latitude = site.latitude_deg if latitude_deg is None else float(latitude_deg)
+    longitude = site.longitude_deg if longitude_deg is None else float(longitude_deg)
+    height = site.height_m if height_m is None else float(height_m)
+    center = phase_center_for_site(latitude, longitude, height)
+    return {
+        "ra_deg": float(center.ra.deg),
+        "dec_deg": float(center.dec.deg),
+        "start_time_utc": START_TIME_UTC,
+        "latitude_deg": latitude,
+        "longitude_deg": longitude,
+        "height_m": height,
+        "field_half_width_deg": IMAGE_FIELD_HALF_WIDTH_DEG,
+        "field_of_view_rad": IMAGE_FIELD_OF_VIEW_RAD,
+        "image_n_pix": IMAGE_N_PIX,
+        "tracking": True,
+    }
+
+
 def defaults_payload() -> dict[str, Any]:
     """Everything the page needs to draw itself before the first run.
 
@@ -1419,7 +1789,13 @@ def defaults_payload() -> dict[str, Any]:
             "label": "Sky source",
             "fields": SKY_SOURCE_FIELDS,
             "defaults": _schema_defaults(SKY_SOURCE_FIELDS),
+            "position": {
+                "modes": SKY_POSITION_MODES,
+                "default_mode": "offset",
+                "default_offset_deg": [DEFAULT_OFFSET_EAST_DEG, DEFAULT_OFFSET_NORTH_DEG],
+            },
         },
+        "pointing": pointing_payload(),
         "spectral_line": {
             "label": "Spectral line",
             "fields": SPECTRAL_LINE_FIELDS,
@@ -1502,18 +1878,15 @@ def build_simulator(request: SimulateRequest) -> VoltageSimulator:
     site = default_array()
     array = ArrayConfig(
         antenna_positions_enu_m=np.asarray(request.antennas, dtype=np.float64),
-        latitude_deg=site.latitude_deg,
-        longitude_deg=site.longitude_deg,
-        height_m=site.height_m,
+        latitude_deg=site.latitude_deg if request.site is None else request.site.latitude_deg,
+        longitude_deg=site.longitude_deg if request.site is None else request.site.longitude_deg,
+        height_m=site.height_m if request.site is None else request.site.height_m,
         name=site.name,
     )
     start_time = Time(START_TIME_UTC, scale="utc")
     phase_center = zenith_coord(earth_location(array), start_time)
 
-    sources = [
-        PointSource.from_lm(phase_center, (source.l, source.m), source.flux_jy, name=source.name)
-        for source in request.sky_sources
-    ]
+    sources = [source.build(phase_center) for source in request.sky_sources]
     rfi_sources = [source.build() for source in request.rfi_sources]
     spectral_lines = [line.build() for line in request.spectral_lines]
 
@@ -1771,6 +2144,22 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
             }
             for index, (params, source) in enumerate(
                 zip(request.rfi_sources, simulator.rfi_sources)
+            )
+        ],
+        "sky_sources": [
+            {
+                "name": source.name,
+                "flux_jy": float(source.flux_jy),
+                "l": float(lm[0]),
+                "m": float(lm[1]),
+                "ra_deg": float(source.coord.icrs.ra.deg),
+                "dec_deg": float(source.coord.icrs.dec.deg),
+                "in_field": bool(
+                    max(abs(float(lm[0])), abs(float(lm[1]))) <= 0.5 * IMAGE_FIELD_OF_VIEW_RAD
+                ),
+            }
+            for source, lm in (
+                (source, source.lm(simulator.phase_center)) for source in simulator.sources
             )
         ],
         "image": {

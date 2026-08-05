@@ -65,6 +65,21 @@
 
       <div class="array-side">
         <p class="readout mono" id="array-summary"></p>
+
+        <div class="array-add">
+          <button type="button" class="button button-accent" id="add-antenna">+ Add an antenna</button>
+          <span class="hint hint-inline">drops one on free ground; drag it where you want it</span>
+        </div>
+
+        <div class="array-load">
+          <label class="field-label" for="array-choice">Load a known layout</label>
+          <div class="preset-row">
+            <select id="array-choice" class="input"></select>
+            <button type="button" class="button" id="load-array">Load</button>
+          </div>
+          <p class="hint" id="array-load-note" hidden></p>
+        </div>
+
         <dl class="site-meta mono" id="site-meta"></dl>
         <div class="button-row">
           <button type="button" class="button" id="reset-array">Reset to the default array</button>
@@ -103,10 +118,10 @@
         <button type="button" class="button button-small" id="add-sky">Add a source</button>
       </div>
       <p class="group-intro">
-        Each source is a point on the sky, offset from where the telescope points.
-        The dirty image at the bottom of the page should show a peak at the offset
-        you type here.
+        Each source is a point on the sky. The dirty image at the bottom of the page
+        should show a peak where you put it.
       </p>
+      <p class="hint" id="pointing-hint"></p>
       <div id="sky-cards" class="card-stack"></div>
       <p class="empty-note" id="sky-empty" hidden>No sources — the image will show noise only.</p>
     </div>

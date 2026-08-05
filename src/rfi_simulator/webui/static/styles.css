@@ -177,6 +177,24 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 
 .array-side { min-width: 0; }
 
+.array-add {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.hint-inline { margin-top: 0; }
+
+.array-load {
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.array-load .preset-row { margin-top: 4px; }
+
 .site-meta {
   margin: 0 0 12px;
   display: grid;
@@ -357,6 +375,35 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 }
 
 .card-body { padding: 12px; }
+
+/* the sky source's position: one quantity, three ways of writing it */
+.position-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px dashed var(--rule);
+}
+
+.position-inputs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.position-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.position-note.position-warn {
+  color: #8a5a12;
+  background: #fdf3e2;
+  border-left: 2px solid var(--amber);
+  padding: 4px 8px;
+}
 
 .card-intro {
   margin: 0 0 12px;
@@ -571,6 +618,15 @@ details.realism > summary { font-size: 14px; font-weight: 600; color: var(--ink)
   border-color: var(--room-edge);
   color: var(--ink-soft);
 }
+
+.button-accent {
+  background: var(--amber);
+  border-color: var(--amber-dim);
+  color: #23180a;
+  font-weight: 600;
+}
+
+.button-accent:hover { background: #e59b45; }
 
 .button-row {
   display: flex;

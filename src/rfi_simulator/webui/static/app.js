@@ -35,6 +35,8 @@
 
   var VIEW = 400;          // site-plan internal coordinate box, px
   var SHEET_PAD = 30;      // margin inside it, px
+  var MIN_SPACING_M = 5;   // how far apart a dropped antenna tries to land
+  var LARGE_ARRAY = 32;    // above this, a loaded layout gets a "slower run" note
   var NICE_STEPS = [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000];
 
   function $(id) { return document.getElementById(id); }
@@ -87,6 +89,10 @@
   var state = {
     defaults: null,
     antennas: [],
+    site: null,           // {latitude_deg, longitude_deg, height_m, name}
+    pointing: null,       // {ra_deg, dec_deg, field_half_width_deg, ...}
+    arrays: [],           // catalogue from /api/arrays
+    loadedArray: null,    // JSON of the antennas as last loaded or reset
     skySources: [],
     rfiSources: [],
     spectralLines: [],
@@ -335,6 +341,143 @@
     renderSitePlan();
   }
 
+  function nearestAntennaGap(east, north) {
+    var nearest = Infinity;
+    state.antennas.forEach(function (antenna) {
+      var de = antenna[0] - east;
+      var dn = antenna[1] - north;
+      nearest = Math.min(nearest, Math.sqrt(de * de + dn * dn));
+    });
+    return nearest;
+  }
+
+  // The discoverable route to a new antenna: drop one on free ground
+  // somewhere inside the piece of site the plan already shows, then let
+  // the user drag it. Math.random is honest here -- where a marker lands
+  // is a convenience of the editor, not part of the simulated physics, and
+  // nothing downstream is meant to be reproducible from it. Candidates
+  // land at least MIN_SPACING_M from their neighbours where possible, both
+  // so the two markers can be told apart and grabbed separately and
+  // because coincident antennas make a zero-length baseline the library
+  // warns about.
+  function addAntennaAtRandom() {
+    var extent = extentMetres() * 0.85;
+    var best = [0, 0];
+    var bestGap = -1;
+    for (var attempt = 0; attempt < 60; attempt += 1) {
+      var candidate = [
+        (Math.random() * 2 - 1) * extent,
+        (Math.random() * 2 - 1) * extent
+      ];
+      var gap = nearestAntennaGap(candidate[0], candidate[1]);
+      if (gap > bestGap) { bestGap = gap; best = candidate; }
+      if (gap >= MIN_SPACING_M) { break; }
+    }
+    addAntenna(best[0], best[1]);
+  }
+
+  /* --- known layouts -------------------------------------------------- */
+
+  function markArrayLoaded() {
+    state.loadedArray = JSON.stringify(state.antennas);
+  }
+
+  function arrayIsEdited() {
+    return state.loadedArray !== null && JSON.stringify(state.antennas) !== state.loadedArray;
+  }
+
+  function renderArrayChoices() {
+    var select = $("array-choice");
+    while (select.firstChild) { select.removeChild(select.firstChild); }
+    state.arrays.forEach(function (entry) {
+      var text = entry.name + " — " + entry.n_antennas + " antennas";
+      if (!entry.runnable) {
+        text += " (more than this front end runs)";
+      }
+      var option = el("option", null, text);
+      option.value = entry.id;
+      select.appendChild(option);
+    });
+    var empty = state.arrays.length === 0;
+    if (empty) { select.appendChild(el("option", null, "no layouts available")); }
+    select.disabled = empty;
+    $("load-array").disabled = empty;
+  }
+
+  // Loading a big array can put the recording settings past the size the
+  // server accepts, so the number of integrations and then of channels is
+  // halved until the product fits. Better to run something smaller at once
+  // than to hand back a validation error for a button press.
+  function fitRecordingToArray() {
+    var limits = state.defaults.limits;
+    var perBlock = state.antennas.length * state.defaults.sim.n_time_per_block;
+    var changed = false;
+    function total() { return perBlock * state.sim.n_chan * state.sim.n_blocks; }
+    while (total() > limits.max_total_samples && state.sim.n_blocks > 1) {
+      state.sim.n_blocks = Math.max(1, Math.floor(state.sim.n_blocks / 2));
+      changed = true;
+    }
+    while (total() > limits.max_total_samples && state.sim.n_chan > 4) {
+      state.sim.n_chan = Math.max(4, Math.floor(state.sim.n_chan / 2));
+      changed = true;
+    }
+    return changed;
+  }
+
+  function showArrayNote(array, trimmed) {
+    var note = $("array-load-note");
+    var n = array.n_antennas;
+    var baselines = n * (n - 1) / 2;
+    var lines = [];
+    if (n > LARGE_ARRAY) {
+      lines.push("Loaded " + array.name + ": " + n + " antennas, " + baselines
+        + " baselines. Baselines grow as the square of the antenna count, so this run"
+        + " will take appreciably longer than the default array's — tens of seconds"
+        + " rather than a few. Fewer channels or integrations in section 5 make it quick"
+        + " again.");
+    } else {
+      lines.push("Loaded " + array.name + ": " + n + " antennas, " + baselines + " baselines.");
+    }
+    if (trimmed) {
+      lines.push("Recording settings were reduced to " + state.sim.n_chan + " channels and "
+        + state.sim.n_blocks + " integrations to keep the run within the server's size budget.");
+    }
+    if (!array.runnable) {
+      lines.push("This layout has more antennas than this front end will run ("
+        + state.defaults.limits.max_antennas + "); remove some before running.");
+    }
+    note.textContent = lines.join(" ");
+    note.hidden = false;
+  }
+
+  function loadArray(id) {
+    var entry = state.arrays.filter(function (candidate) { return candidate.id === id; })[0];
+    if (!entry) { return; }
+    if (arrayIsEdited()
+        && !window.confirm("Loading " + entry.name + " replaces the antennas you have moved."
+          + " Go ahead?")) {
+      return;
+    }
+    request("/api/arrays/" + encodeURIComponent(id)).then(function (array) {
+      state.antennas = array.antennas.map(function (row) { return row.slice(); });
+      state.site = {
+        name: array.name,
+        latitude_deg: array.latitude_deg,
+        longitude_deg: array.longitude_deg,
+        height_m: array.height_m
+      };
+      markArrayLoaded();
+      var trimmed = fitRecordingToArray();
+      renderSitePlan();
+      renderSiteMeta();
+      renderSimFields();
+      showArrayNote(array, trimmed);
+      refreshPointing();
+    }).catch(function (error) {
+      showNotice("error", "Could not load that layout: " + error.message);
+    });
+  }
+
   function bindSitePlan() {
     var svg = $("site-plan");
     var readout = $("cursor-readout");
@@ -417,7 +560,12 @@
       state.antennas = state.defaults.array.antennas.map(function (row) {
         return row.slice();
       });
+      state.site = defaultSite();
+      markArrayLoaded();
+      $("array-load-note").hidden = true;
       renderSitePlan();
+      renderSiteMeta();
+      refreshPointing();
     });
 
     $("clear-array").addEventListener("click", function () {
@@ -436,15 +584,6 @@
    * `help` text (see simulate.py's field descriptors). */
   var FIELD_COPY = {
     sky: {
-      l: {
-        label: "Offset east of the pointing",
-        hint: "Direction cosine towards increasing right ascension; 0.01 is about 0.6°."
-      },
-      m: {
-        label: "Offset north of the pointing",
-        hint: "Direction cosine towards increasing declination. Zero and zero puts the"
-          + " source dead centre."
-      },
       flux_jy: {
         label: "Brightness",
         hint: "How bright the source is. The dirty image should peak at this value,"
@@ -731,6 +870,159 @@
     return wrap;
   }
 
+  /* --- where a sky source sits ----------------------------------------
+   *
+   * The same position written three ways: degrees east/north of the
+   * pointing, absolute right ascension and declination, or the library's
+   * direction cosines. The request carries whichever the user chose and
+   * the server does the authoritative conversion (see `SkySource` in
+   * simulate.py); everything below exists only so that flipping the unit
+   * switcher shows the same place in the new units, and so the page can
+   * warn before a run that a source is off the edge of the image. It is
+   * the same projection the library uses (`rfi_simulator.sky`), written
+   * out here for display and nothing else.
+   */
+  function rad(degrees) { return degrees * Math.PI / 180; }
+  function deg(radians) { return radians * 180 / Math.PI; }
+
+  function lmFromRadec(ra0, dec0, ra, dec) {
+    var delta = rad(ra - ra0);
+    return [
+      Math.cos(rad(dec)) * Math.sin(delta),
+      Math.sin(rad(dec)) * Math.cos(rad(dec0))
+        - Math.cos(rad(dec)) * Math.sin(rad(dec0)) * Math.cos(delta)
+    ];
+  }
+
+  function radecFromLm(ra0, dec0, l, m) {
+    var n = Math.sqrt(Math.max(0, 1 - l * l - m * m));
+    var dec = Math.asin(clamp(m * Math.cos(rad(dec0)) + n * Math.sin(rad(dec0)), -1, 1));
+    var ra = rad(ra0) + Math.atan2(l, n * Math.cos(rad(dec0)) - m * Math.sin(rad(dec0)));
+    return [((deg(ra) % 360) + 360) % 360, deg(dec)];
+  }
+
+  function sourceLm(source) {
+    if (source.mode === "lm") { return [source.l, source.m]; }
+    if (source.mode === "radec") {
+      if (!state.pointing) { return [0, 0]; }
+      return lmFromRadec(state.pointing.ra_deg, state.pointing.dec_deg,
+        source.ra_deg, source.dec_deg);
+    }
+    return [Math.sin(rad(source.east_deg)), Math.sin(rad(source.north_deg))];
+  }
+
+  function setSourceMode(source, mode) {
+    var lm = sourceLm(source);
+    if (mode === "lm") {
+      source.l = Math.round(lm[0] * 1e6) / 1e6;
+      source.m = Math.round(lm[1] * 1e6) / 1e6;
+    } else if (mode === "radec") {
+      var radec = state.pointing
+        ? radecFromLm(state.pointing.ra_deg, state.pointing.dec_deg, lm[0], lm[1])
+        : [0, 0];
+      source.ra_deg = Math.round(radec[0] * 1e5) / 1e5;
+      source.dec_deg = Math.round(radec[1] * 1e5) / 1e5;
+    } else {
+      source.east_deg = Math.round(deg(Math.asin(clamp(lm[0], -1, 1))) * 1e5) / 1e5;
+      source.north_deg = Math.round(deg(Math.asin(clamp(lm[1], -1, 1))) * 1e5) / 1e5;
+    }
+    source.mode = mode;
+  }
+
+  function positionMode(value) {
+    return state.defaults.sky_source.position.modes.filter(function (mode) {
+      return mode.value === value;
+    })[0];
+  }
+
+  // One line under the position inputs: the same place in the other two
+  // notations, plus an amber word of warning when it falls outside the
+  // piece of sky the dirty image covers.
+  function describePosition(source, note) {
+    var lm = sourceLm(source);
+    var eastDeg = deg(Math.asin(clamp(lm[0], -1, 1)));
+    var northDeg = deg(Math.asin(clamp(lm[1], -1, 1)));
+    var radec = state.pointing
+      ? radecFromLm(state.pointing.ra_deg, state.pointing.dec_deg, lm[0], lm[1])
+      : null;
+    var parts = [
+      fmt(eastDeg, 3) + "° E, " + fmt(northDeg, 3) + "° N of the pointing",
+      "l " + lm[0].toFixed(5) + ", m " + lm[1].toFixed(5)
+    ];
+    if (radec) {
+      parts.push("RA " + fmt(radec[0], 4) + "°, Dec " + fmt(radec[1], 4) + "°");
+    }
+    note.textContent = parts.join("   ·   ");
+
+    var half = state.pointing ? state.pointing.field_half_width_deg : Infinity;
+    var outside = Math.max(Math.abs(eastDeg), Math.abs(northDeg)) > half;
+    note.className = "position-note mono" + (outside ? " position-warn" : "");
+    if (outside) {
+      note.textContent = "This sits outside the ±" + fmt(half, 1) + "° imaged field."
+        + " The simulator still records it, and it still lands in the voltages — it"
+        + " simply will not appear in the dirty image.   ·   " + note.textContent;
+    }
+  }
+
+  function positionBlock(source) {
+    var block = el("div", "position-block");
+    var modeField = el("div", "field");
+    var modeLabel = el("label", "field-label", "Position given as");
+    var modeId = "p" + Math.random().toString(36).slice(2, 9);
+    modeLabel.htmlFor = modeId;
+    var select = el("select", "input");
+    select.id = modeId;
+    state.defaults.sky_source.position.modes.forEach(function (mode) {
+      var option = el("option", null, mode.label);
+      option.value = mode.value;
+      select.appendChild(option);
+    });
+    select.value = source.mode;
+    modeField.appendChild(modeLabel);
+    modeField.appendChild(select);
+    block.appendChild(modeField);
+
+    var inputs = el("div", "position-inputs");
+    var note = el("p", "position-note mono");
+    var mode = positionMode(source.mode);
+
+    mode.fields.forEach(function (key, which) {
+      var field = el("div", "field");
+      var id = "p" + Math.random().toString(36).slice(2, 9);
+      var label = el("label", "field-label");
+      label.htmlFor = id;
+      var text = el("span", null, mode.labels[which]);
+      text.appendChild(document.createTextNode(" "));
+      text.appendChild(el("span", "field-unit", "(" + mode.unit + ")"));
+      label.appendChild(text);
+      var input = el("input", "input");
+      input.type = "number";
+      input.id = id;
+      input.step = mode.step;
+      input.value = source[key];
+      input.addEventListener("input", function () {
+        var parsed = parseFloat(input.value);
+        if (isFinite(parsed)) {
+          source[key] = parsed;
+          describePosition(source, note);
+        }
+      });
+      field.appendChild(label);
+      field.appendChild(input);
+      inputs.appendChild(field);
+    });
+
+    select.addEventListener("change", function () {
+      setSourceMode(source, select.value);
+      renderSkyCards();
+    });
+
+    block.appendChild(inputs);
+    describePosition(source, note);
+    block.appendChild(note);
+    return block;
+  }
+
   function renderSkyCards() {
     var host = $("sky-cards");
     while (host.firstChild) { host.removeChild(host.firstChild); }
@@ -759,6 +1051,7 @@
       card.appendChild(head);
 
       var body = el("div", "card-body");
+      body.appendChild(positionBlock(source));
       var grid = el("div", "field-grid");
       state.defaults.sky_source.fields.forEach(function (descriptor) {
         grid.appendChild(buildField(descriptor, source, null, FIELD_COPY.sky));
@@ -1235,9 +1528,21 @@
     return values;
   }
 
-  function newSkySource() {
+  function newSkySource(east_deg, north_deg) {
+    var position = state.defaults.sky_source.position;
     var values = Object.assign({}, state.defaults.sky_source.defaults);
     values.name = "source " + (state.skySources.length + 1);
+    values.mode = position.default_mode;
+    values.east_deg = east_deg === undefined ? position.default_offset_deg[0] : east_deg;
+    values.north_deg = north_deg === undefined ? position.default_offset_deg[1] : north_deg;
+    // The other two notations are filled in from these the moment the unit
+    // switcher is used; seeding them keeps the inputs from starting empty.
+    // The offsets themselves are left exactly as typed rather than
+    // round-tripped back through the projection.
+    values.mode = "offset";
+    setSourceMode(values, "lm");
+    setSourceMode(values, "radec");
+    values.mode = position.default_mode;
     return values;
   }
 
@@ -1269,7 +1574,11 @@
     {
       id: "clean",
       label: "Clean sky — one source, no interference",
-      apply: function () { /* the base state already is exactly this */ }
+      // Placed in degrees east and north of the pointing, like every other
+      // source the page makes; the server resolves it to direction cosines.
+      apply: function () {
+        state.skySources = [newSkySource(0.5, -0.3)];
+      }
     },
     {
       id: "tower",
@@ -1311,9 +1620,22 @@
     }
   ];
 
+  function defaultSite() {
+    var array = state.defaults.array;
+    return {
+      name: array.name,
+      latitude_deg: array.latitude_deg,
+      longitude_deg: array.longitude_deg,
+      height_m: array.height_m
+    };
+  }
+
   function resetToDefaults() {
     var defaults = state.defaults;
     state.antennas = defaults.array.antennas.map(function (row) { return row.slice(); });
+    state.site = defaultSite();
+    state.pointing = defaults.pointing;
+    markArrayLoaded();
     state.sim = {
       n_chan: defaults.sim.n_chan,
       n_blocks: defaults.sim.n_blocks,
@@ -1330,6 +1652,8 @@
 
   function renderAllForms() {
     renderSitePlan();
+    renderSiteMeta();
+    renderPointingHint();
     renderSkyCards();
     renderRfiCards();
     renderLineCards();
@@ -1343,6 +1667,7 @@
     resetToDefaults();
     preset.apply();
     renderAllForms();
+    $("array-load-note").hidden = true;
     $("waterfall-pol").value = "0";
     $("section-run").scrollIntoView({ behavior: "smooth", block: "start" });
     run();
@@ -1373,8 +1698,25 @@
       antennas: state.antennas.map(function (antenna) {
         return [antenna[0], antenna[1], antenna[2] || 0];
       }),
+      site: state.site ? {
+        latitude_deg: state.site.latitude_deg,
+        longitude_deg: state.site.longitude_deg,
+        height_m: state.site.height_m
+      } : null,
+      // Whichever notation the user chose travels as it stands: the server
+      // resolves it against the run's own phase centre, so there is one
+      // conversion and it is the library's.
       sky_sources: state.skySources.map(function (source) {
-        return { name: source.name, l: source.l, m: source.m, flux_jy: source.flux_jy };
+        var payload = { name: source.name, flux_jy: source.flux_jy };
+        if (source.mode === "lm") {
+          payload.l = source.l;
+          payload.m = source.m;
+        } else if (source.mode === "radec") {
+          payload.radec_deg = [source.ra_deg, source.dec_deg];
+        } else {
+          payload.offset_deg = [source.east_deg, source.north_deg];
+        }
+        return payload;
       }),
       rfi_sources: state.rfiSources.map(function (source) {
         var payload = {};
@@ -1919,14 +2261,42 @@
   /* ----------------------------------------------------- 10. wiring */
 
   function renderSiteMeta() {
-    var array = state.defaults.array;
+    var site = state.site || defaultSite();
     var meta = $("site-meta");
     while (meta.firstChild) { meta.removeChild(meta.firstChild); }
-    [["Site latitude, longitude",
-      array.latitude_deg.toFixed(3) + "°, " + array.longitude_deg.toFixed(3) + "°"],
-     ["Height above sea level", array.height_m.toFixed(0) + " m"]].forEach(function (pair) {
+    [["Layout", site.name || "custom"],
+     ["Site latitude, longitude",
+      site.latitude_deg.toFixed(3) + "°, " + site.longitude_deg.toFixed(3) + "°"],
+     ["Height above sea level", site.height_m.toFixed(0) + " m"]].forEach(function (pair) {
       meta.appendChild(el("dt", null, pair[0]));
       meta.appendChild(el("dd", null, pair[1]));
+    });
+  }
+
+  // Where the run points, in words, above the sky sources. The zenith of
+  // the site at the start of the recording -- so it moves when another
+  // layout, on another site, is loaded.
+  function renderPointingHint() {
+    var pointing = state.pointing;
+    if (!pointing) { return; }
+    $("pointing-hint").textContent =
+      "The telescope points at RA " + fmt(pointing.ra_deg, 3) + "°, Dec "
+      + fmt(pointing.dec_deg, 3) + "° — the zenith at the start of the recording, which"
+      + " the simulator tracks for the whole run. Keep sources within ±"
+      + fmt(pointing.field_half_width_deg, 1) + "° of it: that is the imaged field of view.";
+  }
+
+  function refreshPointing() {
+    var site = state.site || defaultSite();
+    var query = "?latitude_deg=" + encodeURIComponent(site.latitude_deg)
+      + "&longitude_deg=" + encodeURIComponent(site.longitude_deg)
+      + "&height_m=" + encodeURIComponent(site.height_m);
+    return request("/api/pointing" + query).then(function (pointing) {
+      state.pointing = pointing;
+      renderPointingHint();
+      renderSkyCards();
+    }).catch(function (error) {
+      showNotice("error", "Could not work out where the telescope points: " + error.message);
     });
   }
 
@@ -1939,6 +2309,13 @@
     });
     $("load-preset").addEventListener("click", function () {
       applyPreset(presetSelect.value);
+    });
+
+    $("add-antenna").addEventListener("click", addAntennaAtRandom);
+
+    var arraySelect = $("array-choice");
+    $("load-array").addEventListener("click", function () {
+      loadArray(arraySelect.value);
     });
 
     var typeSelect = $("rfi-type");
@@ -2025,10 +2402,22 @@
       resetToDefaults();
 
       renderSiteMeta();
+      renderPointingHint();
       bindSitePlan();
       bindControls();
       renderAllForms();
       renderMaskToggles();
+
+      // The layout catalogue is a convenience, not a prerequisite: a
+      // server offering none still runs, with an empty picker.
+      request("/api/arrays").then(function (arrays) {
+        state.arrays = arrays;
+        renderArrayChoices();
+      }).catch(function () {
+        state.arrays = [];
+        renderArrayChoices();
+      });
+
       run();
     }).catch(function (error) {
       showNotice("error", "Could not reach the simulator: " + error.message);

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Path as PathParam
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -29,7 +30,15 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from rfi_simulator import __version__
-from rfi_simulator.webui.simulate import SimulateRequest, defaults_payload, run_simulation
+from rfi_simulator.webui.simulate import (
+    ARRAY_DIR_ENV_VAR,
+    SimulateRequest,
+    array_detail,
+    array_summaries,
+    defaults_payload,
+    pointing_payload,
+    run_simulation,
+)
 
 __all__ = ["create_app", "main"]
 
@@ -148,7 +157,7 @@ class ContentLengthLimitMiddleware:
         await self.app(scope, counted_receive, send)
 
 
-def create_app(host: str | None = None) -> FastAPI:
+def create_app(host: str | None = None, array_dir: str | Path | None = None) -> FastAPI:
     """Build the application.
 
     Parameters
@@ -158,12 +167,18 @@ def create_app(host: str | None = None) -> FastAPI:
         ``Host`` headers. Loopback names are always accepted. Defaults to
         `HOST_ENV_VAR` in the environment, which is how `main` passes the
         bound interface through the reloader's fresh process.
+    array_dir : str or pathlib.Path, optional
+        A directory of extra array configurations to offer alongside the
+        bundled ones. Defaults to `ARRAY_DIR_ENV_VAR` in the environment.
+        Only this one directory is ever read, and clients name entries by
+        an identifier this process assigned, never by path.
 
     Returns
     -------
     fastapi.FastAPI
-        With ``GET /api/defaults``, ``POST /api/simulate``, and the page
-        itself at ``/``.
+        With ``GET /api/defaults``, ``GET /api/pointing``,
+        ``GET /api/arrays``, ``GET /api/arrays/{array_id}``,
+        ``POST /api/simulate``, and the page itself at ``/``.
     """
     app = FastAPI(
         title="Interference simulator",
@@ -175,6 +190,8 @@ def create_app(host: str | None = None) -> FastAPI:
 
     if host is None:
         host = os.environ.get(HOST_ENV_VAR) or None
+    if array_dir is None:
+        array_dir = os.environ.get(ARRAY_DIR_ENV_VAR) or None
 
     allowed_hosts = list(LOCAL_HOSTS)
     if host in WILDCARD_HOSTS:
@@ -210,6 +227,40 @@ def create_app(host: str | None = None) -> FastAPI:
     def get_defaults() -> dict[str, Any]:
         """Default array, default observation, guard rails and form schemas."""
         return defaults_payload()
+
+    @app.get("/api/pointing")
+    def get_pointing(
+        latitude_deg: float | None = Query(default=None, ge=-90.0, le=90.0),
+        longitude_deg: float | None = Query(default=None, ge=-360.0, le=360.0),
+        height_m: float | None = Query(default=None, ge=-500.0, le=1.0e4),
+    ) -> dict[str, Any]:
+        """Where a run from this site points, and how wide the image is.
+
+        The page asks again whenever the site changes -- loading another
+        array moves the zenith, and the honest bounds it quotes for source
+        placement move with it.
+        """
+        return pointing_payload(latitude_deg, longitude_deg, height_m)
+
+    @app.get("/api/arrays")
+    def get_arrays() -> list[dict[str, Any]]:
+        """Array layouts this server can offer, without their positions."""
+        return array_summaries(array_dir)
+
+    @app.get("/api/arrays/{array_id}")
+    def get_array(
+        array_id: str = PathParam(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$"),
+    ) -> dict[str, Any]:
+        """One layout in full: antennas and the site they stand on.
+
+        `array_id` is matched against identifiers this process handed out
+        in `get_arrays`; it never reaches the filesystem, so there is no
+        path for a request to traverse. Anything unknown is a 404.
+        """
+        payload = array_detail(array_id, array_dir)
+        if payload is None:
+            raise HTTPException(status_code=404, detail=f"no array layout called {array_id!r}")
+        return payload
 
     @app.post("/api/simulate")
     def post_simulate(
@@ -285,6 +336,15 @@ def main(argv: list[str] | None = None) -> int:
         "--port", type=int, default=DEFAULT_PORT, help="port to listen on (default: %(default)s)"
     )
     parser.add_argument(
+        "--array-dir",
+        default=None,
+        help=(
+            "directory of extra array layout YAML files to offer in the page's "
+            "layout picker, alongside the bundled ones (default: the "
+            f"{ARRAY_DIR_ENV_VAR} environment variable, if set)"
+        ),
+    )
+    parser.add_argument(
         "--reload", action="store_true", help="restart when the source changes (development)"
     )
     args = parser.parse_args(argv)
@@ -292,6 +352,10 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     os.environ[HOST_ENV_VAR] = args.host
+    if args.array_dir:
+        # Same reason as the host: an import-string application is built
+        # in a process this one does not otherwise get to configure.
+        os.environ[ARRAY_DIR_ENV_VAR] = str(Path(args.array_dir).expanduser())
     uvicorn.run(
         "rfi_simulator.webui.server:create_app",
         factory=True,
