@@ -148,17 +148,13 @@
       <h2 class="section-title" id="rfi-heading">The interference</h2>
     </div>
     <p class="section-intro">
-      Human-made transmitters that reach the antennas. Pick a kind, add it, and the
-      simulator records exactly which time–frequency cells it touched — that record
+      Human-made transmitters that reach the antennas. Tick the kinds you want and the
+      simulator records exactly which time–frequency cells they touched — that record
       is the ground truth an excision algorithm gets scored against.
     </p>
 
-    <div class="add-row">
-      <label class="field-label" for="rfi-type">Kind of transmitter</label>
-      <select id="rfi-type" class="input"></select>
-      <button type="button" class="button button-small" id="add-rfi">Add</button>
-    </div>
-    <p class="type-summary" id="rfi-type-summary"></p>
+    <p class="field-label kind-legend" id="rfi-kinds-legend">Tick the kinds of interference to add</p>
+    <div class="kind-grid" id="rfi-kinds" role="group" aria-labelledby="rfi-kinds-legend"></div>
 
     <div id="rfi-cards" class="card-stack"></div>
     <p class="empty-note" id="rfi-empty" hidden>No interference — a clean observation.</p>

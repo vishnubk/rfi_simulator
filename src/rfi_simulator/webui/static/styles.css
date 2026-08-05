@@ -490,23 +490,97 @@ textarea.input { resize: vertical; min-height: 72px; line-height: 1.35; }
 
 .input-small { width: auto; padding: 3px 5px; }
 
-.add-row {
+/* ------------------------------------------------- interference picker */
+/* One tick box per kind of transmitter, named after the thing in the
+ * world and described in a line. Ticked kinds are tinted, so which are
+ * in the run is legible without reading the cards underneath. */
+.kind-legend { margin: 0 0 8px; }
+
+.kind-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.kind-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--room-edge);
+  border-radius: var(--radius);
+  background: #fff;
+  cursor: pointer;
+}
+
+.kind-card:hover { border-color: var(--ink-faint); }
+
+.kind-card.kind-on {
+  border-color: var(--amber-dim);
+  background: #fdf6ea;
+}
+
+.kind-box { margin: 3px 0 0; flex: none; }
+
+.kind-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.kind-title {
   display: flex;
   align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 6px;
+  gap: 6px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--ink);
 }
 
-.add-row .field-label { flex: none; }
-.add-row .input { flex: 1; min-width: 200px; }
+.kind-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--amber);
+  color: #23180a;
+}
 
-.type-summary {
-  margin: 0 0 14px;
+.kind-blurb {
+  font-size: 12.5px;
+  line-height: 1.35;
+  color: var(--ink-soft);
+}
+
+/* the compact face of a source card: the few numbers that kind is about */
+.card-summary {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 2px 12px;
+  justify-content: start;
+  margin: 0;
+  color: var(--ink-soft);
+}
+
+.card-summary dt { color: var(--ink-faint); }
+.card-summary dd { margin: 0; }
+
+details.card-details { border-top: 1px solid var(--rule); }
+
+details.card-details > summary {
+  cursor: pointer;
+  padding: 8px 12px;
   font-size: 13px;
   color: var(--ink-soft);
-  max-width: 68ch;
+  list-style: revert;
 }
+
+details.card-details > summary:hover { color: var(--ink); }
+details.card-details > .card-body { padding-top: 4px; }
+
+.card-foot { padding: 0 12px 12px; }
 
 .empty-note {
   margin: 0;

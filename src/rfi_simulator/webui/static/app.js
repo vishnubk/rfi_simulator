@@ -95,6 +95,7 @@
     loadedArray: null,    // JSON of the antennas as last loaded or reset
     skySources: [],
     rfiSources: [],
+    rfiOpen: [],         // whether each rfi card's "More details" fold is open
     spectralLines: [],
     sim: {},
     realism: {},
@@ -1068,6 +1069,164 @@
     })[0];
   }
 
+  /* --- the interference picker ----------------------------------------
+   *
+   * The server's own labels for the source types are precise but written
+   * for someone who already knows the field ("Ground transmitter",
+   * "Impulsive broadband"). What a first-time reader is offered instead
+   * is one tick box per kind, named after the thing in the world and
+   * described in a line: ticking one adds a source with the schema's own
+   * defaults, and everything that kind can be tuned by is one "More
+   * details" click away.
+   *
+   * `keys` names the two or three numbers worth printing on the compact
+   * card -- frequency, power, and whatever third quantity that kind is
+   * really about. They are field names of that type's own schema, so the
+   * card reads its values and units straight out of the descriptors.
+   *
+   * Kinds the server offers but this list does not name still appear,
+   * described by the server's own label and summary; nothing here is
+   * required for a type to work.
+   */
+  var RFI_KINDS = [
+    { type: "tower", title: "Cell tower",
+      blurb: "a narrowband transmitter on the horizon",
+      keys: ["center_freq_hz", "received_power_jy", "duty_cycle"] },
+    { type: "satellite", title: "Satellite",
+      blurb: "a moving transmitter crossing the sky (real orbit)",
+      keys: ["carrier_freq_hz", "received_power_jy", "min_elevation_deg"] },
+    { type: "aircraft", title: "Aircraft",
+      blurb: "ADS-B transponder flying over",
+      keys: ["carrier_freq_hz", "received_power_jy", "message_rate_hz"] },
+    { type: "impulsive", title: "Broadband bursts",
+      blurb: "short wideband crackles (sparking, radar-like)",
+      keys: ["rate_hz", "received_power_jy", "pulse_width_samples"] },
+    { type: "comb", title: "Harmonic comb",
+      blurb: "one device polluting many frequencies at once",
+      keys: ["fundamental_hz", "received_power_jy", "duty_cycle"] }
+  ];
+
+  function rfiKind(typeName) {
+    var known = RFI_KINDS.filter(function (kind) { return kind.type === typeName; })[0];
+    if (known) { return known; }
+    var entry = rfiType(typeName);
+    return { type: typeName, title: entry.label, blurb: entry.summary, keys: [] };
+  }
+
+  // Every kind the server offers, the named ones first and in the order
+  // a newcomer meets them rather than the schema's.
+  function rfiKinds() {
+    var named = RFI_KINDS.filter(function (kind) { return Boolean(rfiType(kind.type)); });
+    var namedTypes = named.map(function (kind) { return kind.type; });
+    var rest = state.defaults.rfi_types.filter(function (entry) {
+      return namedTypes.indexOf(entry.type) === -1;
+    }).map(function (entry) { return rfiKind(entry.type); });
+    return named.concat(rest);
+  }
+
+  function countOfKind(typeName) {
+    return state.rfiSources.filter(function (source) {
+      return source.type === typeName;
+    }).length;
+  }
+
+  function addRfiSource(typeName) {
+    if (state.rfiSources.length >= state.defaults.limits.max_rfi_sources) {
+      showNotice("error", "That is the most interference sources one run takes ("
+        + state.defaults.limits.max_rfi_sources + ").");
+      return false;
+    }
+    state.rfiSources.push(newRfiSource(typeName));
+    state.rfiOpen.push(false);
+    return true;
+  }
+
+  // "Edited" means anything about the source differs from what ticking
+  // the box would have made, its name aside -- that is what is worth
+  // asking about before it is thrown away.
+  function rfiSourceIsEdited(source) {
+    var fresh = newRfiSource(source.type);
+    return Object.keys(fresh).some(function (key) {
+      if (key === "name") { return false; }
+      return JSON.stringify(source[key]) !== JSON.stringify(fresh[key]);
+    });
+  }
+
+  function removeRfiKind(typeName) {
+    var kind = rfiKind(typeName);
+    var edited = state.rfiSources.some(function (source) {
+      return source.type === typeName && rfiSourceIsEdited(source);
+    });
+    if (edited && !window.confirm("Remove the " + kind.title.toLowerCase()
+        + " you have changed? The settings you typed will be lost.")) {
+      return false;
+    }
+    for (var i = state.rfiSources.length - 1; i >= 0; i -= 1) {
+      if (state.rfiSources[i].type === typeName) {
+        state.rfiSources.splice(i, 1);
+        state.rfiOpen.splice(i, 1);
+      }
+    }
+    return true;
+  }
+
+  function renderRfiKinds() {
+    var host = $("rfi-kinds");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+
+    rfiKinds().forEach(function (kind) {
+      var count = countOfKind(kind.type);
+      var card = el("label", "kind-card" + (count ? " kind-on" : ""));
+      var box = el("input", "kind-box");
+      box.type = "checkbox";
+      box.checked = count > 0;
+
+      var text = el("span", "kind-text");
+      var title = el("span", "kind-title");
+      title.appendChild(document.createTextNode(kind.title));
+      // A "1" badge on a single source says nothing the tick does not;
+      // the count earns its place once there is more than one.
+      if (count > 1) { title.appendChild(el("span", "kind-count", "×" + count)); }
+      text.appendChild(title);
+      text.appendChild(el("span", "kind-blurb", kind.blurb));
+
+      card.appendChild(box);
+      card.appendChild(text);
+      box.addEventListener("change", function () {
+        if (box.checked) { addRfiSource(kind.type); } else { removeRfiKind(kind.type); }
+        renderRfi();
+      });
+      host.appendChild(card);
+    });
+  }
+
+  // Numbers on a compact card are printed, not editable: the same field
+  // has a control inside the fold below, and two live inputs on one
+  // value would disagree the moment either was typed into.
+  function showNumber(value) {
+    if (typeof value !== "number") { return String(value); }
+    if (!isFinite(value)) { return "--"; }
+    return String(Math.round(value * 1e6) / 1e6);
+  }
+
+  function fillKeyNumbers(source, host) {
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    var descriptors = rfiType(source.type).fields;
+    var copy = FIELD_COPY[source.type] || {};
+    rfiKind(source.type).keys.forEach(function (name) {
+      var descriptor = descriptors.filter(function (entry) {
+        return entry.name === name;
+      })[0];
+      if (!descriptor) { return; }
+      var words = copy[name] || {};
+      var shown = descriptor.kind === "number"
+        ? showNumber(source[name] / (descriptor.factor || 1))
+        : String(source[name]);
+      host.appendChild(el("dt", null, words.label || descriptor.label));
+      host.appendChild(el("dd", null, shown + (descriptor.unit ? " " + descriptor.unit : "")));
+    });
+  }
+
   // A spectral line is ground truth labelled "celestial", not "rfi" (see
   // rfi_simulator.sky.SpectralLineForeground); its card follows the same
   // pattern as a sky source's, just with its own field list and colour.
@@ -1278,19 +1437,32 @@
     return fold;
   }
 
+  /* One card per interference source: a compact face with the two or
+   * three numbers that kind is about, and the whole schema-driven form
+   * -- every field, plus the Advanced coupling and polarization fold --
+   * behind "More details". Which folds are open is remembered in
+   * `state.rfiOpen`, so re-rendering does not shut a card the user had
+   * opened. Nothing about what is sent changes here: every control still
+   * writes into the same source object, under the same field name, that
+   * `buildRequest` serializes. */
   function renderRfiCards() {
     var host = $("rfi-cards");
     while (host.firstChild) { host.removeChild(host.firstChild); }
+    // Presets and resets replace the source list wholesale, so the fold
+    // state is squared up against it here rather than at every writer.
+    while (state.rfiOpen.length < state.rfiSources.length) { state.rfiOpen.push(false); }
+    state.rfiOpen.length = state.rfiSources.length;
     $("rfi-empty").hidden = state.rfiSources.length > 0;
 
     state.rfiSources.forEach(function (source, index) {
       var descriptorSet = rfiType(source.type);
+      var kind = rfiKind(source.type);
       var card = el("div", "card");
       var head = el("div", "card-head");
       var swatch = el("span", "card-swatch");
       swatch.style.background = "rgba(" + MASK_RGB + ", 1)";
       head.appendChild(swatch);
-      head.appendChild(el("span", "card-kind", descriptorSet.label));
+      head.appendChild(el("span", "card-kind", kind.title));
       var name = el("input", "input card-name");
       name.value = source.name;
       name.setAttribute("aria-label", "Interference source name");
@@ -1303,26 +1475,59 @@
       remove.setAttribute("aria-label", "Remove this interference source");
       remove.addEventListener("click", function () {
         state.rfiSources.splice(index, 1);
-        renderRfiCards();
+        state.rfiOpen.splice(index, 1);
+        renderRfi();
       });
       head.appendChild(remove);
       card.appendChild(head);
 
       var body = el("div", "card-body");
       body.appendChild(el("p", "card-intro", descriptorSet.summary));
+      var numbers = el("dl", "card-summary mono");
+      fillKeyNumbers(source, numbers);
+      body.appendChild(numbers);
+      card.appendChild(body);
+
+      var fold = el("details", "card-details");
+      fold.open = Boolean(state.rfiOpen[index]);
+      fold.appendChild(el("summary", null, "More details"));
+      fold.addEventListener("toggle", function () {
+        state.rfiOpen[index] = fold.open;
+      });
+
+      var detail = el("div", "card-body");
       var grid = el("div", "field-grid");
       descriptorSet.fields.forEach(function (descriptor) {
         // The pasted element set only matters when it is going to be used.
         if (descriptor.name === "tle_text" && source.tle_source !== "custom") { return; }
         grid.appendChild(buildField(descriptor, source, function () {
-          if (descriptor.name === "tle_source") { renderRfiCards(); }
+          if (descriptor.name === "tle_source") { renderRfi(); return; }
+          fillKeyNumbers(source, numbers);
         }, FIELD_COPY[source.type]));
       });
-      body.appendChild(grid);
-      card.appendChild(body);
-      card.appendChild(buildRfiExtras(source));
+      detail.appendChild(grid);
+      fold.appendChild(detail);
+      fold.appendChild(buildRfiExtras(source));
+
+      var foot = el("div", "card-foot");
+      var another = el("button", "button button-small",
+        "+ Add another " + kind.title.toLowerCase());
+      another.type = "button";
+      another.addEventListener("click", function () {
+        addRfiSource(source.type);
+        renderRfi();
+      });
+      foot.appendChild(another);
+      fold.appendChild(foot);
+
+      card.appendChild(fold);
       host.appendChild(card);
     });
+  }
+
+  function renderRfi() {
+    renderRfiKinds();
+    renderRfiCards();
   }
 
   function renderSimFields() {
@@ -1528,13 +1733,42 @@
     return values;
   }
 
+  /* Where the nth added source lands when the user does not say.
+   *
+   * The first one keeps the server's advertised default offset. Every
+   * one after it steps round a golden-angle spiral, growing as the
+   * square root of the count so the points stay evenly spread, and
+   * capped inside the imaged field. Sources dropped on one another add
+   * coherently into a single peak, so a page that gave every new source
+   * the same default made two clicks of "Add a source" look like one
+   * source in the dirty image.
+   */
+  var GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
+
+  function defaultOffsetDeg(index) {
+    var base = state.defaults.sky_source.position.default_offset_deg;
+    if (index <= 0) { return [base[0], base[1]]; }
+    var radius = Math.sqrt(base[0] * base[0] + base[1] * base[1]) || 0.5;
+    var half = state.pointing ? state.pointing.field_half_width_deg : radius * 2;
+    var reach = Math.min(0.75 * half, radius * Math.sqrt(index + 1));
+    var angle = Math.atan2(base[1], base[0]) + index * GOLDEN_ANGLE;
+    return [
+      Math.round(reach * Math.cos(angle) * 1e3) / 1e3,
+      Math.round(reach * Math.sin(angle) * 1e3) / 1e3
+    ];
+  }
+
+  // `state.skySources` must already hold every source that comes before
+  // this one: both the name and the spiral placement count it.
   function newSkySource(east_deg, north_deg) {
     var position = state.defaults.sky_source.position;
+    var index = state.skySources.length;
+    var spot = defaultOffsetDeg(index);
     var values = Object.assign({}, state.defaults.sky_source.defaults);
-    values.name = "source " + (state.skySources.length + 1);
+    values.name = "source " + (index + 1);
     values.mode = position.default_mode;
-    values.east_deg = east_deg === undefined ? position.default_offset_deg[0] : east_deg;
-    values.north_deg = north_deg === undefined ? position.default_offset_deg[1] : north_deg;
+    values.east_deg = east_deg === undefined ? spot[0] : east_deg;
+    values.north_deg = north_deg === undefined ? spot[1] : north_deg;
     // The other two notations are filled in from these the moment the unit
     // switcher is used; seeding them keeps the inputs from starting empty.
     // The offsets themselves are left exactly as typed rather than
@@ -1549,7 +1783,9 @@
   function newRfiSource(typeName) {
     var descriptorSet = rfiType(typeName);
     var values = Object.assign({ type: typeName }, descriptorSet.defaults);
-    values.name = descriptorSet.label.toLowerCase();
+    // Named after the tick box that made it, so the ground-truth chips
+    // under the waterfall read in the same words as the picker.
+    values.name = rfiKind(typeName).title.toLowerCase();
     var same = state.rfiSources.filter(function (source) {
       return source.type === typeName;
     }).length;
@@ -1577,7 +1813,8 @@
       // Placed in degrees east and north of the pointing, like every other
       // source the page makes; the server resolves it to direction cosines.
       apply: function () {
-        state.skySources = [newSkySource(0.5, -0.3)];
+        state.skySources = [];
+        state.skySources.push(newSkySource(0.5, -0.3));
       }
     },
     {
@@ -1643,8 +1880,11 @@
       noise_std: defaults.sim.noise_std,
       seed: defaults.sim.seed
     };
-    state.skySources = [newSkySource()];
+    // Cleared first: `newSkySource` counts what is already there.
+    state.skySources = [];
+    state.skySources.push(newSkySource());
     state.rfiSources = [];
+    state.rfiOpen = [];
     state.spectralLines = [];
     state.realism = defaultRealism();
     state.waterfallPol = 0;
@@ -1655,7 +1895,7 @@
     renderSiteMeta();
     renderPointingHint();
     renderSkyCards();
-    renderRfiCards();
+    renderRfi();
     renderLineCards();
     renderSimFields();
     renderRealismFields();
@@ -2318,27 +2558,8 @@
       loadArray(arraySelect.value);
     });
 
-    var typeSelect = $("rfi-type");
-    state.defaults.rfi_types.forEach(function (entry) {
-      var option = el("option", null, entry.label);
-      option.value = entry.type;
-      typeSelect.appendChild(option);
-    });
-    function showTypeSummary() {
-      $("rfi-type-summary").textContent = rfiType(typeSelect.value).summary;
-    }
-    typeSelect.addEventListener("change", showTypeSummary);
-    showTypeSummary();
-
-    $("add-rfi").addEventListener("click", function () {
-      if (state.rfiSources.length >= state.defaults.limits.max_rfi_sources) {
-        showNotice("error", "That is the most interference sources one run takes ("
-          + state.defaults.limits.max_rfi_sources + ").");
-        return;
-      }
-      state.rfiSources.push(newRfiSource(typeSelect.value));
-      renderRfiCards();
-    });
+    // The interference tick boxes bind themselves as they are drawn
+    // (see `renderRfiKinds`), since the grid is rebuilt on every change.
 
     $("add-sky").addEventListener("click", function () {
       if (state.skySources.length >= state.defaults.limits.max_sky_sources) {

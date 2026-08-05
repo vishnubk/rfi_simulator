@@ -202,6 +202,90 @@ def test_a_clean_run_places_the_source_where_it_was_put(client):
     assert result["warnings"] == [], "a zenith-phased flat array should run clean"
 
 
+def _local_maxima(image: np.ndarray, threshold: float) -> list[tuple[int, int]]:
+    """Every interior pixel no darker than its eight neighbours.
+
+    Deliberately naive: the images here are 64 x 64 and the point is to
+    count peaks, not to find them quickly.
+    """
+    found = []
+    for row in range(1, image.shape[0] - 1):
+        for col in range(1, image.shape[1] - 1):
+            value = image[row, col]
+            if value >= threshold and value >= image[row - 1 : row + 2, col - 1 : col + 2].max():
+                found.append((row, col))
+    return found
+
+
+def test_several_sources_each_raise_their_own_peak(client):
+    """Three sources at three places are three peaks, not one.
+
+    The contract the page leans on: whatever it puts in ``sky_sources``
+    comes back resolved one for one, and every source that is in the
+    field raises its own maximum in the dirty image. A page that gave
+    several sources the same position would show a single blob -- see
+    `test_sources_on_one_spot_add_into_a_single_peak` for what that
+    looks like from here.
+    """
+    offsets = [(0.6, 0.0), (-0.5, 0.4), (0.1, -0.6)]
+    body = make_request()
+    body["sky_sources"] = [
+        {"name": f"source {index}", "offset_deg": [east, north], "flux_jy": 5.0}
+        for index, (east, north) in enumerate(offsets)
+    ]
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 200, response.text
+    result = response.json()
+
+    resolved = result["sky_sources"]
+    assert len(resolved) == len(offsets)
+    places = {(round(source["l"], 9), round(source["m"], 9)) for source in resolved}
+    assert len(places) == len(offsets), "three offsets must resolve to three positions"
+    assert all(source["in_field"] for source in resolved)
+
+    image = np.asarray(result["image"]["values"])
+    l_grid = np.asarray(result["image"]["l"])
+    m_grid = np.asarray(result["image"]["m"])
+    peaks = _local_maxima(image, 0.5 * float(image.max()))
+
+    brightest = []
+    for source in resolved:
+        col = int(np.argmin(np.abs(l_grid - source["l"])))
+        row = int(np.argmin(np.abs(m_grid - source["m"])))
+        near = [peak for peak in peaks if abs(peak[0] - row) <= 2 and abs(peak[1] - col) <= 2]
+        assert near, f"no peak within two pixels of {source['name']}"
+        value = max(float(image[peak]) for peak in near)
+        # Every source is as bright as every other, so none of them may
+        # be a faint bump beside one dominant blob.
+        assert value > 0.7 * float(image.max()), source["name"]
+        brightest.append(value)
+
+    # The three sources are the three brightest things in the image; the
+    # rest of the maxima are this small array's sidelobes.
+    others = sorted((float(image[peak]) for peak in peaks), reverse=True)[len(offsets) :]
+    assert min(brightest) > max(others)
+
+
+def test_sources_on_one_spot_add_into_a_single_peak(client):
+    """Coincident sources are one peak of their summed flux.
+
+    Not a bug in itself -- it is what interferometry does -- but it is
+    why the page must place added sources apart from one another.
+    """
+    body = make_request()
+    body["sky_sources"] = [
+        {"name": f"source {index}", "offset_deg": [0.5, -0.3], "flux_jy": 5.0} for index in range(3)
+    ]
+    result = client.post("/api/simulate", json=body).json()
+
+    image = np.asarray(result["image"]["values"])
+    # One bright thing, three times one source's flux -- everything else
+    # above half the maximum is this small array's sidelobe pattern.
+    peaks = _local_maxima(image, 0.9 * float(image.max()))
+    assert len(peaks) == 1
+    assert result["image"]["peak"]["value_jy"] == pytest.approx(15.0, rel=0.1)
+
+
 def test_the_same_seed_gives_the_same_image_twice(client):
     """Determinism is the point of seeding; two runs must agree bit for bit."""
     body = make_request(seed=1234)
