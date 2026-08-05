@@ -32,11 +32,13 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from rfi_simulator import __version__
 from rfi_simulator.webui.simulate import (
     ARRAY_DIR_ENV_VAR,
+    FlagRequest,
     SimulateRequest,
     array_detail,
     array_summaries,
     defaults_payload,
     pointing_payload,
+    run_flaggers,
     run_simulation,
 )
 
@@ -178,7 +180,8 @@ def create_app(host: str | None = None, array_dir: str | Path | None = None) -> 
     fastapi.FastAPI
         With ``GET /api/defaults``, ``GET /api/pointing``,
         ``GET /api/arrays``, ``GET /api/arrays/{array_id}``,
-        ``POST /api/simulate``, and the page itself at ``/``.
+        ``POST /api/simulate``, ``POST /api/flag``, and the page itself
+        at ``/``.
     """
     app = FastAPI(
         title="Interference simulator",
@@ -286,6 +289,30 @@ def create_app(host: str | None = None, array_dir: str | Path | None = None) -> 
         with _simulation_slots:
             try:
                 return run_simulation(request, pol=pol)
+            except ValueError as exc:
+                return JSONResponse(
+                    status_code=422,
+                    content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]},
+                )
+
+    @app.post("/api/flag")
+    def post_flag(request: FlagRequest) -> Any:
+        """Score one or two classical flaggers against a run's ground truth.
+
+        The body carries the whole observation again rather than the
+        identifier of an earlier one: this server keeps no per-client
+        state, and a run is reproducible from its seed, so re-simulating
+        is what makes the flagged data provably the same data the page is
+        already showing. It queues behind the same
+        `MAX_CONCURRENT_SIMULATIONS` slot as a run, because it is one.
+
+        A `ValueError` -- an antenna that does not exist in this array, an
+        accumulation that would build too large a grid, or anything the
+        library refuses -- comes back as a 422 with its own message.
+        """
+        with _simulation_slots:
+            try:
+                return run_flaggers(request)
             except ValueError as exc:
                 return JSONResponse(
                     status_code=422,

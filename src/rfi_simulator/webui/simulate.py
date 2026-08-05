@@ -21,6 +21,16 @@ ground truth by construction.
 peak, which keeps empty channels from taking the colour scale to minus
 infinity and makes the scale comparable between runs of the same setup.
 
+**Three levels, one run.** A response describes the same observation at
+the three places an excision method can work: the per-antenna voltages
+(`_WaterfallReducer`), the correlated visibilities
+(`_visibility_payload`) and the dirty image. Each level is reduced under
+its own budget, and each carries the ground truth *of that level* --
+occupancy masks at voltage resolution, ``rfi_fraction`` at the
+integration grid -- rather than one level's truth redrawn on another's
+axes. `run_flaggers` adds a fourth thing to compare against: what the
+classical methods actually catch.
+
 **Units at the boundary.** The library speaks hertz, metres, seconds and
 janskys, and so does this API. Field descriptors in `defaults_payload`
 carry a display unit and a multiplier so the browser can show megahertz
@@ -74,6 +84,8 @@ from rfi_simulator.channelizer import (
     DEFAULT_WINDOW,
 )
 from rfi_simulator.delays import earth_location, zenith_coord
+from rfi_simulator.flaggers import mad_clip_mask, spectral_kurtosis_mask, sumthreshold_mask
+from rfi_simulator.metrics import flag_scores, pool_truth_accumulations
 from rfi_simulator.sky import lm_from_radec
 from rfi_simulator.voltages import DEFAULT_CHAN_WIDTH_HZ, DEFAULT_QUANT_TARGET_COUNTS
 
@@ -92,6 +104,8 @@ __all__ = [
     "DEFAULT_CENTER_FREQ_HZ",
     "DEFAULT_N_BLOCKS",
     "DEFAULT_N_CHAN",
+    "FLAG_METHODS",
+    "FlagRequest",
     "MAX_ANTENNAS",
     "MAX_COORDINATE_M",
     "MAX_N_BLOCKS",
@@ -108,6 +122,7 @@ __all__ = [
     "default_array",
     "defaults_payload",
     "pointing_payload",
+    "run_flaggers",
     "run_simulation",
     "sample_tle_text",
 ]
@@ -172,6 +187,48 @@ few megabytes rather than a few tens."""
 
 DYNAMIC_RANGE_DB = 60.0
 """float: Decibels below the observation peak at which power is clamped."""
+
+VIS_MAX_CHAN_BINS = 256
+"""int: Channel bins in the baseline-averaged visibility waterfall.
+
+The integration axis needs no budget of its own: there are at most
+`MAX_N_BLOCKS` integrations in a run, so the whole map is a few thousand
+numbers however wide the band is."""
+
+VIS_SPECTRA_MAX_CHAN_BINS = 128
+"""int: Channel bins in the per-baseline amplitude/phase spectra."""
+
+MIN_SPECTRA_BASELINES = 16
+"""int: Baselines the per-baseline spectra always offer, however large the
+array is. Below this the picker stops being a picker."""
+
+MAX_VIS_SPECTRUM_VALUES = 200_000
+"""int: Budget for the per-baseline spectra, counting amplitudes and
+phases together.
+
+One baseline of a default run is 8 integrations x 128 channels x 2
+quantities, so the default array's 45 baselines all fit with room to
+spare. A large array does not: `_visibility_spectra` first offers a
+subset of baselines evenly spaced through the uv-distance ordering, and
+only if that is still not enough averages integrations together. Either
+reduction is reported alongside the numbers, so the page can print what
+it is drawing."""
+
+FLAG_DEFAULT_M = 250
+"""int: Default accumulation length of the flagger endpoint, in voltage
+time samples. Divides `N_TIME_PER_BLOCK`, so accumulations never straddle
+a block boundary and four of them fit in each block."""
+
+MAX_FLAG_CELLS = 4_000_000
+"""int: Largest ``n_chan x n_accumulations`` grid a flagging run may
+build. Reached only by asking for a short accumulation on a wide band;
+the message says which knob to turn."""
+
+FLAG_OVERLAY_MAX_CHAN_BINS = 256
+"""int: Channel bins the flagger overlay is pooled onto before it is sent.
+The *scores* are always computed on the native grid -- pooling a mask can
+only make it look better -- so this affects the picture and nothing else.
+"""
 
 DISPLAY_PERCENTILES = (0.5, 99.5)
 """tuple of float: Percentiles of the decibel map used as the colour-scale
@@ -1804,6 +1861,11 @@ def defaults_payload() -> dict[str, Any]:
         "rfi_types": [
             dict(entry, defaults=_schema_defaults(entry["fields"])) for entry in RFI_TYPES
         ],
+        "flaggers": {
+            "methods": FLAG_METHODS,
+            "max_methods": MAX_FLAG_METHODS,
+            "defaults": FlagParams().model_dump(),
+        },
         "sample_tle": sample_tle_text(),
     }
 
@@ -1824,6 +1886,230 @@ def _waterfall_shape(n_antennas: int, n_chan: int, n_blocks: int) -> tuple[int, 
 def _round_grid(values: np.ndarray, decimals: int) -> list[list[float]]:
     """A 2-D array as nested lists, rounded to keep the response small."""
     return np.round(values, decimals).astype(float).tolist()
+
+
+def _finite(value: float) -> float | None:
+    """A float the JSON encoder will accept: ``None`` for NaN and infinity.
+
+    `rfi_simulator.metrics.flag_scores` reports an undefined score as NaN
+    -- precision when nothing was flagged, recall when the truth holds no
+    interference -- and NaN is not representable in JSON, so the response
+    would fail to encode rather than fail to answer. ``None`` is the
+    honest transport for "this score is not defined for this run"; the
+    page prints it as a dash.
+    """
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _beam_half_power_rad(beam: GaussianBeam | AiryBeam, freq_hz: float) -> float | None:
+    """Angle at which this beam's power response has fallen to one half.
+
+    Found by bisection on the beam's own `power_response` rather than
+    from a closed form, so the number drawn on the image is the same
+    model the sources were attenuated by whichever beam is fitted. Both
+    beams fall monotonically through 0.5 well inside their first null
+    (`AiryBeam`'s brightest sidelobe reaches under 2 % of the peak), so
+    there is exactly one crossing to find.
+
+    Parameters
+    ----------
+    beam : GaussianBeam or AiryBeam
+        The fitted primary beam.
+    freq_hz : float
+        Frequency to evaluate at, Hz -- the band centre, since the beam
+        narrows across a band.
+
+    Returns
+    -------
+    float or None
+        The half-power radius in radians, or ``None`` for a beam so wide
+        that it has not reached half power by the horizon, where there is
+        no circle to draw.
+    """
+    low, high = 0.0, 0.5 * math.pi
+    if float(beam.power_response(high, freq_hz)) >= 0.5:
+        return None
+    for _ in range(60):
+        middle = 0.5 * (low + high)
+        if float(beam.power_response(middle, freq_hz)) >= 0.5:
+            low = middle
+        else:
+            high = middle
+    return 0.5 * (low + high)
+
+
+def _visibility_spectra(visibilities: Any, order: np.ndarray, pol: int) -> dict[str, Any]:
+    """Amplitude and phase against frequency, per baseline, per integration.
+
+    Parameters
+    ----------
+    visibilities : rfi_simulator.correlator.Visibilities
+        The correlated observation.
+    order : numpy.ndarray
+        Indices of the cross-correlation baselines, shortest first. The
+        subset that survives the payload budget is taken from this
+        ordering, so a reduced response still spans the whole range of
+        baseline lengths.
+    pol : int
+        Receptor to report, matching the waterfall's own choice.
+
+    Returns
+    -------
+    dict
+        ``baselines`` (which entries of `order` are included),
+        ``amplitude`` and ``phase_deg`` (baseline, integration, channel),
+        the two axes, and how the two reductions were applied.
+
+    Notes
+    -----
+    Amplitude is the mean of ``|V|`` over the cells of a bin and phase is
+    the argument of the mean of ``V``. They are deliberately not taken
+    from the same complex average: a bin whose phase turns over its width
+    has a small vector mean, which would read as an amplitude null that
+    the individual channels do not have.
+    """
+    data = visibilities.pol_data[:, :, pol, :]
+    n_int, _, n_chan = data.shape
+    chan_bins = min(n_chan, VIS_SPECTRA_MAX_CHAN_BINS)
+
+    # Baselines are thinned before integrations are averaged together, and
+    # only down to `MIN_SPECTRA_BASELINES`: offering fewer antenna pairs
+    # costs a reader nothing but choice, while averaging the integrations
+    # away costs them the one thing this plot is for -- watching a
+    # baseline's phase turn from one integration to the next.
+    int_bins = n_int
+    selected = order
+
+    def values() -> int:
+        return 2 * len(selected) * int_bins * chan_bins
+
+    if values() > MAX_VIS_SPECTRUM_VALUES:
+        keep = max(MIN_SPECTRA_BASELINES, MAX_VIS_SPECTRUM_VALUES // (2 * int_bins * chan_bins))
+        if len(selected) > keep:
+            selected = order[:: -(-len(selected) // keep)]
+    while int_bins > 1 and values() > MAX_VIS_SPECTRUM_VALUES:
+        int_bins = max(1, int_bins // 2)
+
+    block = data[:, selected, :]
+    amplitude = bin_mean(np.abs(block).astype(np.float64), axis=2, n_bins=chan_bins)
+    complex_mean = bin_mean(
+        block.real.astype(np.float64), axis=2, n_bins=chan_bins
+    ) + 1j * bin_mean(block.imag.astype(np.float64), axis=2, n_bins=chan_bins)
+    if int_bins != n_int:
+        amplitude = bin_mean(amplitude, axis=0, n_bins=int_bins)
+        complex_mean = bin_mean(complex_mean.real, axis=0, n_bins=int_bins) + 1j * bin_mean(
+            complex_mean.imag, axis=0, n_bins=int_bins
+        )
+
+    freq_hz = bin_mean(np.asarray(visibilities.freq_hz, dtype=np.float64), axis=0, n_bins=chan_bins)
+    centres = (np.arange(n_int) + 0.5) * visibilities.integration_time_s
+    time_s = bin_mean(centres, axis=0, n_bins=int_bins)
+
+    # (integration, baseline, channel) -> (baseline, integration, channel):
+    # one entry per baseline is what the page indexes into.
+    return {
+        "baselines": [int(index) for index in selected],
+        "freq_mhz": (freq_hz / 1.0e6).round(6).tolist(),
+        "time_s": time_s.round(6).tolist(),
+        "amplitude": np.round(np.moveaxis(amplitude, 0, 1), 5).tolist(),
+        "phase_deg": np.round(np.degrees(np.angle(np.moveaxis(complex_mean, 0, 1))), 3).tolist(),
+        "integrations_per_bin": int(round(n_int / max(1, int_bins))),
+        "channels_per_bin": int(round(n_chan / max(1, chan_bins))),
+        "n_baselines_offered": int(len(selected)),
+    }
+
+
+def _visibility_payload(visibilities: Any, pol: int) -> dict[str, Any]:
+    """What the correlator saw, reduced to what a browser can draw.
+
+    Parameters
+    ----------
+    visibilities : rfi_simulator.correlator.Visibilities
+        The correlated observation.
+    pol : int
+        Receptor to report -- the same one the voltage waterfall shows,
+        so the two panels describe the same signal path.
+
+    Returns
+    -------
+    dict
+        ``amplitude``: ``|V|`` averaged over every cross-correlation
+        baseline, on a (channel, integration) grid, which is where a
+        visibility-domain flagger works. ``sources``: the library's own
+        ``rfi_fraction`` -- the fraction of each integration's samples a
+        source occupied -- pooled onto that same grid with an ANY rule,
+        plus its exact mean and maximum. ``baselines``: one row per
+        antenna pair. ``spectra``: see `_visibility_spectra`.
+
+    Notes
+    -----
+    Occupancy is a property of a time-frequency cell, not of a baseline:
+    interference reaches every antenna, so `rfi_fraction` has no baseline
+    axis to summarise and the per-baseline rows carry only amplitudes.
+    """
+    data = visibilities.pol_data[:, :, pol, :]
+    cross = visibilities.cross_mask
+    n_int, _, n_chan = data.shape
+    chan_bins = min(n_chan, VIS_MAX_CHAN_BINS)
+
+    amplitude = np.abs(data[:, cross, :]).astype(np.float64).mean(axis=1)  # (n_int, n_chan)
+    amplitude = bin_mean(amplitude.T, axis=0, n_bins=chan_bins)  # (chan_bins, n_int)
+
+    low, high = (float(value) for value in np.percentile(amplitude, DISPLAY_PERCENTILES))
+    if high - low <= 0.0:
+        low, high = float(amplitude.min()), float(amplitude.max()) or 1.0
+
+    fraction = np.asarray(visibilities.rfi_fraction, dtype=np.float64)  # (n_int, n_src, n_chan)
+    sources = []
+    for index, name in enumerate(visibilities.rfi_source_names):
+        plane = fraction[:, index, :]
+        mask = bin_any(plane.T > 0.0, axis=0, n_bins=chan_bins)
+        sources.append(
+            {
+                "name": str(name),
+                "mask": mask.astype(np.uint8).tolist(),
+                "mean_fraction": float(plane.mean()) if plane.size else 0.0,
+                "max_fraction": float(plane.max()) if plane.size else 0.0,
+            }
+        )
+
+    lengths = np.linalg.norm(np.asarray(visibilities.baseline_vectors_enu_m), axis=1)
+    cross_indices = np.flatnonzero(cross)
+    order = cross_indices[np.argsort(lengths[cross_indices], kind="stable")]
+    mean_amplitude = np.abs(data).astype(np.float64).mean(axis=(0, 2))
+
+    baselines = [
+        {
+            "index": int(index),
+            "ant_1": int(visibilities.ant_1[index]),
+            "ant_2": int(visibilities.ant_2[index]),
+            "length_m": float(np.round(lengths[index], 2)),
+            "mean_amp_jy": float(np.round(mean_amplitude[index], 5)),
+        }
+        for index in order
+    ]
+
+    return {
+        "amplitude": _round_grid(amplitude, 5),
+        "freq_mhz": (
+            bin_mean(np.asarray(visibilities.freq_hz, dtype=np.float64), axis=0, n_bins=chan_bins)
+            / 1.0e6
+        )
+        .round(6)
+        .tolist(),
+        "time_s": ((np.arange(n_int) + 0.5) * visibilities.integration_time_s).round(6).tolist(),
+        "vmin_jy": round(low, 5),
+        "vmax_jy": round(high, 5),
+        "peak_jy": round(float(amplitude.max()) if amplitude.size else 0.0, 5),
+        "n_baselines": int(np.count_nonzero(cross)),
+        "n_integrations": int(n_int),
+        "integration_time_s": float(visibilities.integration_time_s),
+        "sources": sources,
+        "baselines": baselines,
+        "spectra": _visibility_spectra(visibilities, order, pol),
+        "unit": "Jy",
+    }
 
 
 # ----------------------------------------------------------------------
@@ -2067,8 +2353,12 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
     dict
         JSON-ready: ``waterfall`` (per-antenna power in decibels on a
         shared grid), ``sources`` (one pooled ground-truth mask and one
-        exact occupancy fraction each), ``image`` (dirty image and its
-        peak), ``uv`` (baseline coordinates in wavelengths), any
+        exact occupancy fraction each), ``visibilities`` (what the
+        correlator saw, see `_visibility_payload`), ``image`` (dirty
+        image, its peak, and the fitted primary beam's half-power radius
+        when there is one), ``sky_sources`` (each with its band-centre
+        ``beam_response`` when a beam is fitted),
+        ``uv`` (baseline coordinates in wavelengths), any
         ``warnings`` the library raised, and the wall time. The waterfall
         also reports ``time_samples_per_cell``, the number of voltage
         samples pooled into one displayed column, so the page can say how
@@ -2105,6 +2395,8 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
             channels=slice(None, None, channel_step),
         )
         u_lambda, v_lambda, _ = uvw_wavelengths(visibilities)
+        visibility_payload = _visibility_payload(visibilities, pol)
+        beam_response = simulator.beam_response()
     wall_time_s = time.perf_counter() - started
 
     decibels, vmin_db, vmax_db, peak_db = _to_decibels(reduced["waterfall"])
@@ -2116,6 +2408,43 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
     cross = visibilities.cross_mask
     u_points = u_lambda[:, cross, center_channel].ravel()
     v_points = v_lambda[:, cross, center_channel].ravel()
+
+    # Band-centre primary-beam response per sky source -- the library's
+    # own ground truth (`VoltageSimulator.beam_response`), not a second
+    # evaluation of the beam here. `None` throughout when no beam is
+    # fitted, which is a different statement from "attenuated by 1.0".
+    beam_centre = (
+        None if beam_response is None else beam_response[:, simulator.n_chan // 2].astype(float)
+    )
+    sky_payload = []
+    for index, source in enumerate(simulator.sources):
+        lm = source.lm(simulator.phase_center)
+        sky_payload.append(
+            {
+                "name": source.name,
+                "flux_jy": float(source.flux_jy),
+                "l": float(lm[0]),
+                "m": float(lm[1]),
+                "ra_deg": float(source.coord.icrs.ra.deg),
+                "dec_deg": float(source.coord.icrs.dec.deg),
+                "in_field": bool(
+                    max(abs(float(lm[0])), abs(float(lm[1]))) <= 0.5 * IMAGE_FIELD_OF_VIEW_RAD
+                ),
+                "beam_response": None if beam_centre is None else float(beam_centre[index]),
+            }
+        )
+
+    beam_payload = None
+    if request.primary_beam is not None:
+        half_power_rad = _beam_half_power_rad(
+            request.primary_beam.build(), simulator.center_freq_hz
+        )
+        beam_payload = {
+            "type": request.primary_beam.type,
+            "dish_diameter_m": request.primary_beam.dish_diameter_m,
+            "half_power_rad": None if half_power_rad is None else round(half_power_rad, 9),
+            "center_freq_hz": float(simulator.center_freq_hz),
+        }
 
     messages = []
     for entry in caught:
@@ -2146,22 +2475,8 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
                 zip(request.rfi_sources, simulator.rfi_sources)
             )
         ],
-        "sky_sources": [
-            {
-                "name": source.name,
-                "flux_jy": float(source.flux_jy),
-                "l": float(lm[0]),
-                "m": float(lm[1]),
-                "ra_deg": float(source.coord.icrs.ra.deg),
-                "dec_deg": float(source.coord.icrs.dec.deg),
-                "in_field": bool(
-                    max(abs(float(lm[0])), abs(float(lm[1]))) <= 0.5 * IMAGE_FIELD_OF_VIEW_RAD
-                ),
-            }
-            for source, lm in (
-                (source, source.lm(simulator.phase_center)) for source in simulator.sources
-            )
-        ],
+        "sky_sources": sky_payload,
+        "visibilities": visibility_payload,
         "image": {
             "values": _round_grid(image, 6),
             "l": l_grid.round(8).tolist(),
@@ -2173,6 +2488,7 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
                 "m": float(m_grid[peak_row]),
                 "value_jy": float(image[peak_row, peak_col]),
             },
+            "beam": beam_payload,
             "unit": "Jy per beam",
         },
         "uv": {
@@ -2196,6 +2512,284 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
             "pol_names": list(visibilities.pol_names),
             "waterfall_pol": pol,
         },
+        "warnings": messages,
+        "wall_time_s": round(wall_time_s, 3),
+    }
+
+
+# ----------------------------------------------------------------------
+# Classical flaggers: the floor an excision algorithm has to beat
+# ----------------------------------------------------------------------
+MAX_FLAG_METHODS = 2
+"""int: Methods one flagging request may run.
+
+Two, because the point of the panel is a head-to-head: one column each,
+scored on the same cells of the same simulated data. Three columns would
+not fit the table and would not be read."""
+
+FLAG_METHODS = [
+    {
+        "value": "sk",
+        "label": "Spectral kurtosis",
+        "summary": (
+            "Tests each accumulation's power distribution against the exponential "
+            "one Gaussian noise gives. Catches carriers and short bursts, including "
+            "ones no louder than the noise."
+        ),
+        "grid": "pre-detection voltages, one decision per accumulation",
+    },
+    {
+        "value": "mad",
+        "label": "MAD clipping",
+        "summary": (
+            "Per-channel robust sigma clipping of the power spectrogram: median and "
+            "median absolute deviation over time, then a cut either side."
+        ),
+        "grid": "detected power, one decision per accumulated cell",
+    },
+    {
+        "value": "sumthreshold",
+        "label": "SumThreshold",
+        "summary": (
+            "Thresholds runs of neighbouring cells with a limit that falls as the run "
+            "lengthens, on the MAD-normalized residual. Finds faint but contiguous "
+            "interference a single-cell cut misses."
+        ),
+        "grid": "detected power, one decision per accumulated cell",
+    },
+]
+"""list of dict: The flagging methods the page offers, as descriptors the
+browser builds its controls from -- the same one-source-of-truth rule the
+form fields follow."""
+
+FlagMethod = Literal["sk", "mad", "sumthreshold"]
+
+
+class FlagParams(BaseModel):
+    """Tuning of the classical flaggers.
+
+    One model for all three methods rather than one per method: they
+    share the accumulation grid, and a page that lets a reader switch
+    method should not silently discard the settings of the one they
+    switched away from. Each method reads only the fields that mean
+    something to it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    m: int = Field(default=FLAG_DEFAULT_M, ge=2, le=N_TIME_PER_BLOCK)
+    pfa: float = Field(default=0.0027, gt=0.0, lt=1.0)
+    n_sigma: float = Field(default=5.0, gt=0.0, le=50.0)
+    chi_1: float = Field(default=6.0, gt=0.0, le=100.0)
+    iterations: int = Field(default=5, ge=1, le=10)
+
+    @field_validator("m")
+    @classmethod
+    def _check_accumulation(cls, value: int) -> int:
+        """Insist the accumulation divides a block.
+
+        Blocks are generated one at a time and never held together, so an
+        accumulation that straddled a block boundary could not be formed
+        at all; one that did not divide the block would silently drop the
+        remainder of every block instead of the remainder of the run.
+        """
+        if N_TIME_PER_BLOCK % value:
+            raise ValueError(
+                f"m must divide the {N_TIME_PER_BLOCK} time samples in a block, and "
+                f"{value} does not: accumulations are formed inside one block"
+            )
+        return value
+
+
+class FlagRequest(BaseModel):
+    """Run one or two classical flaggers over one antenna of a run.
+
+    The observation is described by `request`, exactly as
+    ``POST /api/simulate`` takes it, and is *re-simulated* here. That
+    costs a second pass over the voltages, and buys the two properties
+    that matter: the server keeps no per-client state, and the data
+    flagged is bit-identical to the data the page is displaying because
+    both are drawn from `SimParams.seed`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request: SimulateRequest
+    methods: list[FlagMethod] = Field(min_length=1, max_length=MAX_FLAG_METHODS)
+    antenna: int = Field(default=0, ge=0, le=MAX_ANTENNAS - 1)
+    pol: Literal[0, 1] = 0
+    params: FlagParams = Field(default_factory=FlagParams)
+
+    @field_validator("methods")
+    @classmethod
+    def _check_unique(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError(f"name each method once, got {value}")
+        return value
+
+
+def _flag_overlay(predicted: np.ndarray, truth: np.ndarray, chan_bins: int) -> dict[str, Any]:
+    """The three ways a decision can turn out, pooled for drawing.
+
+    Parameters
+    ----------
+    predicted, truth : numpy.ndarray
+        Boolean masks on the flagger's own grid, ``(n_chan, n_accum)``.
+    chan_bins : int
+        Channel bins to pool onto. Time is never pooled: the accumulation
+        grid is already coarse in time and its columns are what the
+        reader is being shown.
+
+    Returns
+    -------
+    dict
+        ``caught``, ``missed`` and ``false_alarm`` as 0/1 grids. Pooling
+        is an ANY rule per category, so one displayed cell can be more
+        than one colour where a bin holds both outcomes -- which is the
+        truth about that bin, and the reason the scores in the same
+        response are computed on the unpooled masks.
+    """
+    categories = {
+        "caught": predicted & truth,
+        "missed": truth & ~predicted,
+        "false_alarm": predicted & ~truth,
+    }
+    return {
+        name: bin_any(mask, axis=0, n_bins=chan_bins).astype(np.uint8).tolist()
+        for name, mask in categories.items()
+    }
+
+
+def run_flaggers(request: FlagRequest) -> dict[str, Any]:
+    """Re-simulate one run and score classical flaggers against its truth.
+
+    Parameters
+    ----------
+    request : FlagRequest
+        A validated request: the observation, the methods, and which
+        antenna and receptor to look at.
+
+    Returns
+    -------
+    dict
+        JSON-ready: one entry per method under ``methods``, each with the
+        scores `rfi_simulator.metrics.flag_scores` gives on the flagger's
+        own grid and an overlay of caught / missed / false alarm for
+        drawing; plus the shared ``grid`` those decisions live on and the
+        axes to draw it against.
+
+    Raises
+    ------
+    ValueError
+        If the antenna does not exist in this array, or the requested
+        accumulation would build a grid larger than `MAX_FLAG_CELLS`.
+
+    Notes
+    -----
+    **One grid for every method.** Spectral kurtosis is defined on
+    accumulations of ``m`` pre-detection samples and cannot be computed
+    from a spectrogram at all; the power-based methods are therefore run
+    on the mean power of the *same* accumulations rather than on the
+    voltage-resolution grid. That is both realistic -- a real time-domain
+    flagger runs on integrated spectra -- and the only way two methods
+    can be put in adjacent columns honestly, since scores computed on
+    different grids are not comparable. Ground truth is brought onto that
+    grid with `rfi_simulator.metrics.pool_truth_accumulations`, the
+    partition the kurtosis estimator itself uses.
+    """
+    started = time.perf_counter()
+    params = request.params
+    methods = list(request.methods)
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        simulator = build_simulator(request.request)
+        if request.antenna >= simulator.n_antennas:
+            raise ValueError(
+                f"this array has {simulator.n_antennas} antennas, so there is no "
+                f"antenna {request.antenna}"
+            )
+        pol = request.pol if simulator.n_pol > 1 else 0
+
+        accum_per_block = simulator.n_time_per_block // params.m
+        n_accum = accum_per_block * simulator.n_blocks
+        if simulator.n_chan * n_accum > MAX_FLAG_CELLS:
+            raise ValueError(
+                f"flagging this run on accumulations of {params.m} samples would build a "
+                f"{simulator.n_chan} x {n_accum} grid, more than the {MAX_FLAG_CELLS:,} "
+                "cells this front end flags at once: lengthen the accumulation or "
+                "record fewer channels"
+            )
+
+        sk_columns: list[np.ndarray] = []
+        power_columns: list[np.ndarray] = []
+        truth_columns: list[np.ndarray] = []
+        for block in simulator.blocks():
+            data = block.pol_data[request.antenna, pol]
+            if "sk" in methods:
+                sk_columns.append(spectral_kurtosis_mask(data, params.m, pfa=params.pfa))
+            trimmed = data[:, : accum_per_block * params.m]
+            power = (
+                trimmed.real.astype(np.float64) ** 2 + trimmed.imag.astype(np.float64) ** 2
+            ).reshape(simulator.n_chan, accum_per_block, params.m)
+            power_columns.append(power.mean(axis=2))
+            truth_columns.append(pool_truth_accumulations(block.rfi_mask.any(axis=0), params.m))
+
+        spectrogram = np.concatenate(power_columns, axis=1)
+        truth = np.concatenate(truth_columns, axis=1)
+
+        predictions: dict[str, np.ndarray] = {}
+        if "sk" in methods:
+            predictions["sk"] = np.concatenate(sk_columns, axis=1)
+        if "mad" in methods:
+            predictions["mad"] = mad_clip_mask(spectrogram, params.n_sigma)
+        if "sumthreshold" in methods:
+            _, residual = mad_clip_mask(spectrogram, params.n_sigma, return_statistic=True)
+            predictions["sumthreshold"] = sumthreshold_mask(
+                residual, params.chi_1, params.iterations
+            )
+    wall_time_s = time.perf_counter() - started
+
+    chan_bins = min(simulator.n_chan, FLAG_OVERLAY_MAX_CHAN_BINS)
+    accumulation_s = simulator.duration_s / n_accum
+    labels = {entry["value"]: entry["label"] for entry in FLAG_METHODS}
+    grids = {entry["value"]: entry["grid"] for entry in FLAG_METHODS}
+
+    results = [
+        {
+            "method": method,
+            "label": labels[method],
+            "grid": grids[method],
+            "scores": {
+                name: _finite(value)
+                for name, value in flag_scores(predictions[method], truth).items()
+            },
+            "overlay": _flag_overlay(predictions[method], truth, chan_bins),
+        }
+        for method in methods
+    ]
+
+    messages = []
+    for entry in caught_warnings:
+        text = str(entry.message)
+        if text not in messages:
+            messages.append(text)
+
+    return {
+        "methods": results,
+        "grid": {
+            "m": params.m,
+            "n_chan": int(simulator.n_chan),
+            "n_accumulations": int(n_accum),
+            "accumulation_s": round(float(accumulation_s), 9),
+            "chan_bins": int(chan_bins),
+            "freq_mhz": (bin_mean(simulator.freq_hz, axis=0, n_bins=chan_bins) / 1.0e6)
+            .round(6)
+            .tolist(),
+            "time_s": ((np.arange(n_accum) + 0.5) * accumulation_s).round(6).tolist(),
+        },
+        "antenna": int(request.antenna),
+        "pol": int(pol),
+        "params": params.model_dump(),
         "warnings": messages,
         "wall_time_s": round(wall_time_s, 3),
     }

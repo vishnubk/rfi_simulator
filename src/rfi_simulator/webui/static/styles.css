@@ -1,6 +1,10 @@
 /* Interference simulator.
  *
- * One page, read top to bottom: array, sky, interference, instrument, run.
+ * Two tabs. Setup is one long form, read top to bottom: array, sky,
+ * interference, instrument, recording. Results is three stacked level
+ * panels -- voltages, visibilities, image -- each showing one plot and one
+ * primary switch, with everything else folded away.
+ *
  * A control-room skin: charcoal command bar, white cards on a cool grey
  * ground, monospace readouts, and a four-state status colour system
  * (ok / warn / error / info) used everywhere a state is reported.
@@ -121,8 +125,9 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 
 .brand svg { display: block; color: var(--amber); }
 
-/* Section links behave like tabs on a dashboard: muted until hovered,
- * and the one whose section is in view wears the amber pill. */
+/* Two real tabs in the command bar, and under it a second row of links
+ * into the Setup panel's sections. Both use the same pill: muted until
+ * hovered, amber when it is the one you are on. */
 .topnav {
   display: flex;
   align-items: center;
@@ -132,11 +137,16 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 
 .navlink {
   padding: 4px 11px;
+  border: 0;
   border-radius: 3px;
+  background: none;
+  font-family: inherit;
   font-size: 13px;
+  line-height: 1.5;
   text-decoration: none;
   color: var(--bar-ink-muted);
   white-space: nowrap;
+  cursor: pointer;
 }
 
 .navlink:hover { color: var(--bar-ink); }
@@ -145,6 +155,32 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
   background: var(--amber);
   color: var(--ink);
   font-weight: 600;
+}
+
+.topnav .navlink { font-weight: 600; }
+
+/* The Setup sections' own row, a shade lighter than the command bar so it
+ * reads as belonging to it rather than to the page. */
+.subbar {
+  position: sticky;
+  top: 42px;
+  z-index: 9;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+  padding: 5px 20px;
+  background: #3a4045;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.14);
+}
+
+.subbar :focus-visible { outline-color: var(--amber); }
+.navlink-sub { font-size: 12.5px; padding: 3px 10px; }
+
+.tab-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 
 .topbar-right {
@@ -182,7 +218,7 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
   border-radius: var(--radius-card);
   box-shadow: var(--shadow-card);
   padding: 16px 18px 18px;
-  scroll-margin-top: 62px;
+  scroll-margin-top: 96px;   /* clears the command bar and the section row */
 }
 
 .section-head {
@@ -955,9 +991,13 @@ details.realism > summary { font-size: 13px; font-weight: 600; color: var(--ink)
 .runs-strip .button { margin-left: auto; }
 
 /* ------------------------------------------------------------ results */
+/* Three panels, one per level the data passes through, stacked in the
+ * order the data moves: voltages, visibilities, image. Stacked rather than
+ * tiled because each one is read as a picture, and a half-width picture of
+ * a dynamic spectrum is not worth having. */
 .results {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: 14px;
 }
 
@@ -973,8 +1013,6 @@ details.realism > summary { font-size: 13px; font-weight: 600; color: var(--ink)
   padding: 12px 14px 14px;
   color: var(--ink);
 }
-
-.display-wide { grid-column: 1 / -1; }
 
 .display figcaption {
   display: flex;
@@ -1093,7 +1131,11 @@ details.realism > summary { font-size: 13px; font-weight: 600; color: var(--ink)
   overflow: hidden;
 }
 
-.display-wide .canvas-wrap { min-height: 320px; }
+/* A level panel's own picture is the reason the panel exists, so it gets
+ * the room; the folds under it can be as short as they like. */
+#panel-voltages > .canvas-wrap,
+#panel-visibilities > .canvas-wrap,
+#panel-image > .canvas-wrap { min-height: 360px; }
 
 .canvas-wrap canvas,
 .canvas-wrap svg {
@@ -1132,6 +1174,175 @@ details.realism > summary { font-size: 13px; font-weight: 600; color: var(--ink)
   to { background-position: -130% 0; }
 }
 
+.canvas-wrap-tall { min-height: 340px; margin-top: 8px; }
+
+/* ------------------------------------------------------- switches */
+/* A panel's primary toggle. It is a real button carrying aria-pressed, and
+ * it lights amber when on, like every other "this is the selected thing"
+ * on the page. Everything a panel can do beyond its one switch lives in a
+ * fold, because the panels are read far more often than adjusted. */
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 12px 4px 9px;
+  border: 1px solid var(--edge);
+  border-radius: 13px;
+  background: var(--surface);
+  font-family: inherit;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+
+.switch:hover { border-color: var(--info-line); }
+
+.switch[aria-pressed="true"] {
+  background: var(--amber);
+  border-color: var(--amber-line);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.switch[disabled] {
+  color: var(--ink-faint);
+  background: var(--hairline-strong);
+  cursor: default;
+}
+
+.switch-dot {
+  width: 9px;
+  height: 9px;
+  border: 1px solid var(--info-line);
+  border-radius: 50%;
+  background: var(--surface);
+  flex: none;
+}
+
+.switch[aria-pressed="true"] .switch-dot {
+  background: var(--ink);
+  border-color: var(--ink);
+}
+
+/* --------------------------------------------------- antenna thumbnails */
+/* Every antenna's dynamic spectrum at once, on the run's shared colour
+ * scale so they can be read against each other; this is what the voltage
+ * panel opens on. Clicking a tile features that antenna full size.
+ *
+ * The column count is set by JS as --ant-cols (see thumbnailColumns), and
+ * the columns are fractions rather than a minimum width, so the wall fills
+ * the panel exactly for ten antennas and for ninety-six alike and never
+ * scrolls sideways. Tiles keep one aspect ratio at every count. */
+.thumb-panel { margin-top: 2px; }
+
+.thumb-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--ant-cols, 5), minmax(0, 1fr));
+  gap: 6px;
+  padding: 8px;
+  background: var(--console);
+  border-radius: var(--radius);
+}
+
+.thumb {
+  position: relative;
+  display: block;
+  padding: 0;
+  border: 1px solid var(--console-edge);
+  border-radius: 3px;
+  background: var(--console);
+  cursor: pointer;
+  overflow: hidden;
+  line-height: 0;
+  aspect-ratio: 16 / 9;
+}
+
+.thumb:hover { border-color: var(--console-ink-soft); }
+.thumb.is-active { border-color: var(--amber); box-shadow: 0 0 0 1px var(--amber); }
+
+.thumb-canvas { display: block; width: 100%; height: 100%; }
+
+.thumb-label {
+  position: absolute;
+  left: 3px;
+  top: 2px;
+  padding: 0 4px;
+  border-radius: 2px;
+  background: rgba(23, 26, 30, 0.7);
+  color: var(--console-ink);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.thumb-sub { display: block; margin: 6px 0 0; }
+
+/* ------------------------------------------------------- the flagger */
+/* A classical method run on the same voltages and scored against the same
+ * ground truth. The outcome colours are the page's own: green for right,
+ * the mask red for what was missed, amber for a false alarm. */
+.flagger-methods {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.flagger-method-name { font-size: 13px; font-weight: 600; color: var(--ink); }
+.flagger-method .field-hint { margin-top: 3px; }
+.flagger-method-grid { font-family: var(--font-mono); font-size: 11px; }
+
+.flagger-run-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.flagger-pills { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
+.flagger-pills:empty { display: none; }
+
+.flagger-legend {
+  display: flex;
+  gap: 8px 18px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.flagger-legend:empty { display: none; }
+
+.legend-item { display: inline-flex; align-items: center; gap: 6px; }
+
+.legend-swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  border: 1px solid var(--edge);
+  flex: none;
+}
+
+.flagger-grid-note { display: block; margin: 8px 0 0; }
+.flagger-grid-note:empty { display: none; }
+
+.muted-line {
+  margin: 10px 0 0;
+  font-size: 12.5px;
+  color: var(--ink-faint);
+}
+
+/* ------------------------------------------------- image panel extras */
+.vis-spectra-note { display: block; margin: 8px 0 0; }
+
+.uv-block {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--hairline);
+}
+
+.uv-sub-line { display: block; margin: 0; }
+.uv-block .canvas-wrap { min-height: 300px; }
+
 /* uv plot internals (drawn on the dark surface) */
 .uv-axis { stroke: #39404b; stroke-width: 1; }
 .uv-grid { stroke: #262c35; stroke-width: 1; }
@@ -1156,14 +1367,17 @@ details.realism > summary { font-size: 13px; font-weight: 600; color: var(--ink)
 /* --------------------------------------------------------- responsive */
 @media (max-width: 960px) {
   .array-layout { grid-template-columns: minmax(0, 1fr); }
-  .results { grid-template-columns: minmax(0, 1fr); }
 }
 
+/* Narrow enough that the command bar wraps to two rows, so the section row
+ * can no longer be pinned under a bar of known height: it scrolls away
+ * with the page instead of covering it. */
 @media (max-width: 760px) {
   .topbar { gap: 8px 12px; padding: 8px 14px; }
   .topbar-right { margin-left: 0; width: 100%; }
   .topbar-right .input { flex: 1; max-width: none; }
-  .section { padding: 14px; }
+  .subbar { position: static; padding: 5px 14px; }
+  .section { padding: 14px; scroll-margin-top: 12px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

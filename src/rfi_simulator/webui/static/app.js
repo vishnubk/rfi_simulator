@@ -1,16 +1,25 @@
 /* Interference simulator console -- vanilla JS, no framework, no network
- * beyond this server's own two endpoints.
+ * beyond this server's own endpoints (defaults, arrays, pointing, simulate,
+ * flag).
  *
  * Shape of the file:
- *   1. constants and small helpers          6. scenario presets
- *   2. state                                7. the run
- *   3. request wrapper                      8. result displays
- *   4. site plan                            9. tooltips
- *   5. source and observation forms        10. wiring and boot
+ *   1. constants and small helpers          7. the run
+ *   2. state                                8. result displays
+ *   3. request wrapper                      9. the flagger overlay
+ *   4. site plan                           10. tabs and navigation
+ *   5. source and observation forms        11. tooltips
+ *   6. scenario presets                    12. wiring and boot
  *
  * Rule of the house: the browser never computes physics. Masks, images,
- * occupancy and warnings all arrive from the server as ground truth; this
- * file only arranges pixels.
+ * scores, occupancies and warnings all arrive from the server as ground
+ * truth; this file only arranges pixels. The one arithmetic it does own is
+ * drawing: colour mapping, data-to-plot coordinate transforms, and scaling
+ * a server-sent grid down into a thumbnail.
+ *
+ * The page is two tabs. Setup is the forms; Results is the three levels the
+ * data passes through -- voltages, visibilities, image -- one panel each,
+ * each showing one plot and one primary toggle with everything else folded
+ * away, because the panels are read far more often than they are adjusted.
  */
 (function () {
   "use strict";
@@ -32,6 +41,17 @@
   var MASK_ALPHA = 0.45;
   var SKY_MARKER = "#74b9ff";
   var TRUTH_MARKER = "#fdcb6e";
+
+  // The flagger overlay's three outcomes. Green is the only place on the
+  // page that means "right"; the red is the same red the ground-truth mask
+  // uses, because a missed cell is exactly a truth cell nobody caught, and
+  // the amber is the page's "look here" colour for a cell wrongly flagged.
+  var FLAG_COLOURS = {
+    caught: "0, 184, 148",
+    missed: "214, 48, 49",
+    false_alarm: "253, 203, 110"
+  };
+  var FLAG_ALPHA = 0.55;
   var AXIS_STROKE = "#39404b";
   var GRID_STROKE = "#262c35";
   var AXIS_TEXT = "#9aa1ac";
@@ -84,6 +104,20 @@
     return Math.min(high, Math.max(low, value));
   }
 
+  // The primary toggles are real buttons carrying their own state, so the
+  // pressed attribute is the state and the class is only what it looks
+  // like. One helper keeps the two from drifting apart.
+  function setPressed(button, on) {
+    button.setAttribute("aria-pressed", String(Boolean(on)));
+  }
+
+  // A score the server could not define -- precision with nothing flagged,
+  // say -- arrives as null. It is printed as a dash, never as "null".
+  function score(value, digits) {
+    if (value === null || value === undefined || !isFinite(value)) { return "—"; }
+    return value.toFixed(digits === undefined ? 3 : digits);
+  }
+
   function fmt(value, digits) {
     if (!isFinite(value)) { return "--"; }
     return value.toFixed(digits === undefined ? 1 : digits);
@@ -133,10 +167,20 @@
     realism: {},
     result: null,
     running: false,
+    abRunning: false,     // the clean comparison is a second server run
+    tab: "setup",         // "setup" or "results"; mirrored in location.hash
+    booted: false,        // false until the first automatic run has landed
     waterfallAntenna: 0,
     waterfallPol: 0,
+    allAntennas: true,    // the thumbnail wall is where a run lands; see below
+    truthVisible: false,  // the voltage panel's master ground-truth switch
     maskVisible: [],
     hatch: false,
+    visTruth: false,      // the visibility panel's own ground-truth switch
+    visBaseline: null,    // `index` of the baseline whose spectra are drawn
+    flagMethods: [],      // which methods the flagger control has ticked
+    flagRunning: false,
+    flagError: false,     // keeps a refusal on screen until something changes
     notices: [],
     history: [],          // last HISTORY_MAX completed runs, oldest first
     historyIndex: -1,     // which of them the result displays are showing
@@ -1949,8 +1993,7 @@
     renderAllForms();
     $("array-load-note").hidden = true;
     $("waterfall-pol").value = "0";
-    $("section-run").scrollIntoView({ behavior: "smooth", block: "start" });
-    run();
+    run();   // which lands on the Results tab when it finishes
   }
 
   /* ------------------------------------------------------------- 7. run */
@@ -2050,18 +2093,15 @@
     };
   }
 
-  // The Run button appears twice -- once in the sticky header, once beside
-  // the results -- so both copies move together.
-  function runButtons() { return [$("run"), $("run-main")]; }
+  // One Run button, in the topbar, so it is reachable from either tab.
+  function runButtons() { return [$("run")]; }
 
-  // Both copies of the status read the same four-state cell: info while
-  // idle, amber while a run is in flight, green when it lands, red when
-  // the server refuses it.
+  // The status reads a four-state cell: info while idle, amber while a run
+  // is in flight, green when it lands, red when the server refuses it.
   function setRunStatus(kind, text) {
-    [$("run-status"), $("run-status-main")].forEach(function (node) {
-      node.className = "status-cell status-" + kind;
-      node.textContent = text;
-    });
+    var node = $("run-status");
+    node.className = "status-cell status-" + kind;
+    node.textContent = text;
   }
 
   function startElapsed() {
@@ -2090,22 +2130,34 @@
     startElapsed();
     $("waterfall-sweep").hidden = state.result === null;
 
+    // The exact payload is kept with the run: the clean comparison and the
+    // flagger both re-send it, and they are only honest if they send the
+    // request this run was made from rather than whatever the forms hold by
+    // the time the user asks.
+    var payload = buildRequest();
     request("/api/simulate?pol=" + state.waterfallPol, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(buildRequest())
+      body: JSON.stringify(payload)
     }).then(function (result) {
       stopElapsed();
-      rememberRun(result);
+      rememberRun(result, payload);
       result.warnings.forEach(function (message) { showNotice("note", message); });
       setRunStatus("ok", "done   " + fmt(result.wall_time_s, 2) + " s");
       $("wall-time").textContent = fmt(result.wall_time_s, 2) + " s wall";
+      // A finished run is a result to look at. The very first run is the
+      // one the page makes for itself on load, and jumping the reader
+      // straight past the forms they have not seen yet would be wrong, so
+      // that one leaves the tab where the hash put it.
+      if (state.booted) { goToTab("results"); }
+      state.booted = true;
     }).catch(function (error) {
       stopElapsed();
       showNotice("error", error.message);
       setRunStatus("error", "failed   " + shorten(error.message, 60));
     }).then(function () {
       state.running = false;
+      state.booted = true;
       runButtons().forEach(function (button) { button.disabled = false; });
       $("waterfall-sweep").hidden = true;
     });
@@ -2123,9 +2175,13 @@
      run appends and jumps to latest. There is no polling: the simulator
      only ever runs when asked. */
 
-  function rememberRun(result) {
+  function rememberRun(result, payload) {
     state.history.push({
       result: result,
+      request: payload,   // what produced it, for the clean twin and the flagger
+      clean: null,        // the interference-free twin, once asked for
+      showClean: false,   // which of the two the image panel is showing
+      flag: null,         // the last flagger response for this run
       at: new Date(),
       n_antennas: state.antennas.length,
       n_sky: state.skySources.length,
@@ -2148,7 +2204,9 @@
     state.waterfallAntenna = clamp(
       state.waterfallAntenna, 0, result.waterfall.antennas.length - 1
     );
+    state.visBaseline = null;   // baseline indices are this run's, not the last one's
     $("waterfall-pol-group").hidden = result.observation.n_pol !== 2;
+    showAbNote("");
     renderRunStrip();
     renderResults();
   }
@@ -2263,6 +2321,17 @@
     var cols = rows ? spec.values[0].length : 0;
     if (!rows || !cols) { return; }
 
+    // Data coordinates to plot pixels. The axes run linearly between the
+    // centre of the first cell and the centre of the last one; everything
+    // drawn on top of the picture goes through these two so that markers,
+    // circles and foreign-grid overlays all agree with the tick labels.
+    function toPlotX(value) {
+      return plot.x + (value - spec.xLow) / (spec.xHigh - spec.xLow) * plot.w;
+    }
+    function toPlotY(value) {
+      return plot.y + plot.h - (value - spec.yLow) / (spec.yHigh - spec.yLow) * plot.h;
+    }
+
     var off = document.createElement("canvas");
     off.width = cols;
     off.height = rows;
@@ -2318,12 +2387,72 @@
       ctx.restore();
     });
 
+    /* An overlay whose grid is not the picture's grid. The flagger decides
+       on its own channels and accumulations, so its cells are placed by the
+       frequency and time they cover rather than by row and column index,
+       and sized from the spacing of its own axes. Anything falling outside
+       the plot rectangle is clipped rather than drawn over the labels. */
+    (spec.coordOverlays || []).forEach(function (overlay) {
+      var freq = overlay.freq_mhz;
+      var time = overlay.time_s;
+      var nRows = freq.length;
+      var nCols = time.length;
+      if (!nRows || !nCols) { return; }
+      var stepF = nRows > 1
+        ? (freq[nRows - 1] - freq[0]) / (nRows - 1)
+        : (spec.yHigh - spec.yLow);
+      var stepT = nCols > 1
+        ? (time[nCols - 1] - time[0]) / (nCols - 1)
+        : (spec.xHigh - spec.xLow);
+      var cellW = Math.max(1, Math.abs(stepT / (spec.xHigh - spec.xLow) * plot.w));
+      var cellH = Math.max(1, Math.abs(stepF / (spec.yHigh - spec.yLow) * plot.h));
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(plot.x, plot.y, plot.w, plot.h);
+      ctx.clip();
+      ctx.fillStyle = "rgba(" + overlay.colour + ", "
+        + (overlay.alpha === undefined ? FLAG_ALPHA : overlay.alpha) + ")";
+      for (var orow = 0; orow < nRows; orow += 1) {
+        var line = overlay.mask[orow];
+        for (var ocol = 0; ocol < nCols; ocol += 1) {
+          if (!line[ocol]) { continue; }
+          ctx.fillRect(
+            toPlotX(time[ocol]) - cellW / 2,
+            toPlotY(freq[orow]) - cellH / 2,
+            cellW,
+            cellH
+          );
+        }
+      }
+      ctx.restore();
+    });
+
+    /* A ring at a radius given in the picture's own units -- the primary
+       beam's half-power circle on the dirty image. The two axes need not
+       share a scale, so each radius is converted on its own axis and the
+       ring is drawn as an ellipse. */
+    (spec.circles || []).forEach(function (circle) {
+      var rx = Math.abs(circle.r / (spec.xHigh - spec.xLow) * plot.w);
+      var ry = Math.abs(circle.r / (spec.yHigh - spec.yLow) * plot.h);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(plot.x, plot.y, plot.w, plot.h);
+      ctx.clip();
+      ctx.strokeStyle = circle.colour || TRUTH_MARKER;
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([5, 4]);
+      ctx.beginPath();
+      ctx.ellipse(toPlotX(circle.x), toPlotY(circle.y), rx, ry, 0, 0, 2 * Math.PI);
+      ctx.stroke();
+      ctx.restore();
+    });
+
     // Markers: every simulated source's true (l, m), drawn as a labelled
     // diamond distinct from the brightest-pixel crosshair below — with RFI
     // present the brightest pixel is not always a real source.
     (spec.truthMarkers || []).forEach(function (truth) {
-      var tx = plot.x + (truth.x - spec.xLow) / (spec.xHigh - spec.xLow) * plot.w;
-      var ty = plot.y + plot.h - (truth.y - spec.yLow) / (spec.yHigh - spec.yLow) * plot.h;
+      var tx = toPlotX(truth.x);
+      var ty = toPlotY(truth.y);
       ctx.save();
       ctx.strokeStyle = TRUTH_MARKER;
       ctx.fillStyle = TRUTH_MARKER;
@@ -2346,8 +2475,8 @@
 
     // Marker: the image's peak, in the sky-source colour.
     if (spec.marker) {
-      var mx = plot.x + (spec.marker.x - spec.xLow) / (spec.xHigh - spec.xLow) * plot.w;
-      var my = plot.y + plot.h - (spec.marker.y - spec.yLow) / (spec.yHigh - spec.yLow) * plot.h;
+      var mx = toPlotX(spec.marker.x);
+      var my = toPlotY(spec.marker.y);
       ctx.save();
       ctx.strokeStyle = SKY_MARKER;
       ctx.lineWidth = 1.2;
@@ -2415,17 +2544,40 @@
     canvas.plotSpec = { plot: plot, rows: rows, cols: cols, spec: spec };
   }
 
+  /* The featured single-antenna waterfall. Two things can be painted over
+     it and they are deliberately separate: the ground-truth mask, which is
+     what the simulator knows, and the flagger overlay, which is what a
+     method decided. The master switch gates the first; the second only
+     appears once a flagger has run on this very antenna and receptor. */
   function renderWaterfall() {
     var canvas = $("waterfall-canvas");
     var result = state.result;
     if (!result) { return; }
     var water = result.waterfall;
     var values = water.antennas[state.waterfallAntenna];
-    var overlays = result.sources.filter(function (source, index) {
-      return state.maskVisible[index];
-    }).map(function (source) {
-      return { mask: source.mask };
-    });
+    var overlays = state.truthVisible
+      ? result.sources.filter(function (source, index) {
+        return state.maskVisible[index];
+      }).map(function (source) {
+        return { mask: source.mask };
+      })
+      : [];
+    var flag = activeFlag();
+    var coordOverlays = [];
+    if (flag) {
+      var chosen = flag.response.methods[flag.active];
+      var grid = flag.response.grid;
+      // Caught first, false alarm next, missed last: where a coarse cell
+      // holds more than one outcome the worst one is what stays visible.
+      ["caught", "false_alarm", "missed"].forEach(function (key) {
+        coordOverlays.push({
+          mask: chosen.overlay[key],
+          freq_mhz: grid.freq_mhz,
+          time_s: grid.time_s,
+          colour: FLAG_COLOURS[key]
+        });
+      });
+    }
 
     drawHeatmap(canvas, {
       values: values,
@@ -2442,6 +2594,7 @@
       yFormat: function (v) { return v.toFixed(2); },
       barFormat: function (v) { return v.toFixed(0); },
       overlays: overlays,
+      coordOverlays: coordOverlays,
       hatch: state.hatch,
       readCell: function (row, col) {
         return "antenna " + state.waterfallAntenna + "\n"
@@ -2459,8 +2612,371 @@
   }
 
   function maskedBy(row, col) {
+    if (!state.truthVisible) { return ""; }
     var names = state.result.sources.filter(function (source, index) {
       return state.maskVisible[index] && source.mask[row][col];
+    }).map(function (source) { return source.name; });
+    return names.length ? "\nflagged: " + names.join(", ") : "";
+  }
+
+  /* --- the thumbnail wall ---------------------------------------------
+   *
+   * The wall is where a run lands, not an extra behind a switch: what an
+   * array does to interference is a per-antenna story -- one antenna
+   * coupling harder than its neighbours, one clipping, one dead -- and none
+   * of that is visible one antenna at a time. Clicking a tile features that
+   * antenna full size, with a way back; the antenna picker does the same
+   * thing for anyone who would rather type a number. The choice sticks for
+   * the session, so re-running while looking at antenna 7 keeps antenna 7.
+   *
+   * Every tile comes from the waterfalls the run already shipped -- the
+   * server sends all of them under one global cell budget, so nothing is
+   * re-requested and the per-antenna resolution falls as the array grows.
+   * Each tile is the same magma ramp on the run's shared vmin/vmax, which
+   * is the whole point: antennas are only comparable stretched identically.
+   * Drawing at cell resolution into an offscreen canvas and letting the
+   * browser scale it up with smoothing off is the only arithmetic here.
+   */
+
+  // How many tiles across. Roughly the square root of the antenna count,
+  // leaned wide because a dynamic spectrum is wider than it is tall: 10
+  // antennas make 5 columns of generous tiles, 32 make 8, and anything
+  // from ~70 up sits at the 12-column floor on tile size. The grid template
+  // is `repeat(var(--ant-cols), minmax(0, 1fr))`, so whatever the count,
+  // the tiles divide the panel width exactly and nothing scrolls sideways.
+  function thumbnailColumns(count) {
+    return Math.round(clamp(Math.sqrt(count) * 1.45, 3, 12));
+  }
+
+  function drawThumbnail(canvas, values, vmin, vmax) {
+    var rows = values.length;
+    var cols = rows ? values[0].length : 0;
+    if (!rows || !cols) { return; }
+    var ratio = window.devicePixelRatio || 1;
+    var rect = canvas.getBoundingClientRect();
+    canvas.width = Math.max(1, Math.round((rect.width || 120) * ratio));
+    canvas.height = Math.max(1, Math.round((rect.height || 64) * ratio));
+
+    var off = document.createElement("canvas");
+    off.width = cols;
+    off.height = rows;
+    var offCtx = off.getContext("2d");
+    var pixels = offCtx.createImageData(cols, rows);
+    var span = vmax - vmin || 1;
+    for (var r = 0; r < rows; r += 1) {
+      var row = values[r];
+      for (var c = 0; c < cols; c += 1) {
+        var colour = magma((row[c] - vmin) / span);
+        var index = (((rows - 1 - r) * cols) + c) * 4;
+        pixels.data[index] = colour[0];
+        pixels.data[index + 1] = colour[1];
+        pixels.data[index + 2] = colour[2];
+        pixels.data[index + 3] = 255;
+      }
+    }
+    offCtx.putImageData(pixels, 0, 0);
+    var ctx = canvas.getContext("2d");
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(off, 0, 0, cols, rows, 0, 0, canvas.width, canvas.height);
+  }
+
+  // The one control that switches between the two views. On the wall it is
+  // a pressed switch; on a featured antenna it is the way back, and says so.
+  function renderAllAntennasControl() {
+    var button = $("all-antennas-toggle");
+    setPressed(button, state.allAntennas);
+    $("all-antennas-label").textContent = state.allAntennas
+      ? "All antennas"
+      : "← All antennas";
+    button.title = state.allAntennas
+      ? "Showing every antenna; click a tile to feature one"
+      : "Back to every antenna";
+  }
+
+  function featureAntenna(index) {
+    state.waterfallAntenna = index;
+    state.allAntennas = false;
+    state.flagError = false;   // the flagger's scores were for another antenna
+    $("waterfall-antenna").value = String(index);
+    renderAllAntennasControl();
+    renderThumbnails();
+    renderFlagger();
+    renderWaterfall();
+  }
+
+  function renderThumbnails() {
+    var panel = $("antenna-thumbnails-panel");
+    panel.hidden = !state.allAntennas;
+    $("waterfall-wrap").hidden = state.allAntennas;
+    var host = $("antenna-thumbnails");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    if (!state.allAntennas || !state.result) { return; }
+
+    var water = state.result.waterfall;
+    // Set before anything is measured: the tiles are sized by the grid, and
+    // each canvas draws itself at whatever width the grid gave it.
+    host.style.setProperty("--ant-cols", String(thumbnailColumns(water.antennas.length)));
+
+    water.antennas.forEach(function (values, index) {
+      // `data-status` is where a per-antenna verdict (clipping, dead) would
+      // tint the tile; nothing sets it yet.
+      var button = el("button", "thumb"
+        + (index === state.waterfallAntenna ? " is-active" : ""));
+      button.type = "button";
+      button.setAttribute("data-status", "ok");
+      button.title = "Feature antenna " + index;
+      button.setAttribute("aria-label", "Feature antenna " + index);
+      var canvas = el("canvas", "thumb-canvas");
+      button.appendChild(canvas);
+      button.appendChild(el("span", "thumb-label mono", String(index)));
+      button.addEventListener("click", function () { featureAntenna(index); });
+      host.appendChild(button);
+      drawThumbnail(canvas, values, water.vmin_db, water.vmax_db);
+    });
+
+    $("antenna-thumbnails-sub").textContent =
+      water.antennas.length + " antennas · " + water.freq_mhz.length + " × "
+      + water.time_s.length + " cells each · pooled over "
+      + water.time_samples_per_cell + " voltage samples per pixel";
+  }
+
+  /* --- level 2: what the correlator sees -------------------------------
+   *
+   * The visibility panel is drawn by the same machinery as the waterfall --
+   * one heatmap, one ground-truth switch -- because the point being made is
+   * that the same interference survives correlation and is still a
+   * time-frequency picture, just a smaller one. The per-baseline spectra
+   * are a line plot rather than a heatmap: phase against frequency is the
+   * quantity a visibility-domain method actually keys on, and it has no
+   * sensible sequential colour.
+   */
+
+  // A stack of small line plots sharing one x axis, in the same axis and
+  // tick idiom as drawHeatmap. No library: each panel is a set of
+  // equal-length series drawn as polylines, autoscaled per panel unless the
+  // caller pins the range.
+  function drawLineStack(canvas, spec) {
+    var surface = prepareCanvas(canvas);
+    var ctx = surface.ctx;
+    ctx.font = PLOT_FONT;
+    if (!spec.x.length || !spec.panels.length) { return; }
+
+    function widest(values, format) {
+      return values.reduce(function (most, value) {
+        return Math.max(most, ctx.measureText(format(value)).width);
+      }, 0);
+    }
+
+    var left = 0;
+    var ranges = spec.panels.map(function (panel) {
+      var low = Infinity;
+      var high = -Infinity;
+      panel.series.forEach(function (series) {
+        series.forEach(function (value) {
+          if (!isFinite(value)) { return; }
+          low = Math.min(low, value);
+          high = Math.max(high, value);
+        });
+      });
+      if (!isFinite(low)) { low = 0; high = 1; }
+      if (high - low < 1e-12) { high = low + 1; }
+      var pad = (high - low) * 0.06;
+      var range = [low - pad, high + pad];
+      left = Math.max(left, widest(ticks(range[0], range[1], 3), panel.yFormat));
+      return range;
+    });
+
+    var margin = { left: Math.ceil(left) + 26, right: 12, top: 10, bottom: 34 };
+    var gap = 26;
+    var plotW = Math.max(10, surface.width - margin.left - margin.right);
+    var plotH = Math.max(
+      10,
+      (surface.height - margin.top - margin.bottom - gap * (spec.panels.length - 1))
+        / spec.panels.length
+    );
+    var xLow = spec.x[0];
+    var xHigh = spec.x[spec.x.length - 1];
+    if (xHigh - xLow === 0) { xHigh = xLow + 1; }
+
+    spec.panels.forEach(function (panel, panelIndex) {
+      var top = margin.top + panelIndex * (plotH + gap);
+      var range = ranges[panelIndex];
+
+      ctx.strokeStyle = GRID_STROKE;
+      ctx.lineWidth = 1;
+      ticks(range[0], range[1], 3).forEach(function (value, i) {
+        var y = top + plotH - (i / 3) * plotH;
+        ctx.beginPath();
+        ctx.moveTo(margin.left, y);
+        ctx.lineTo(margin.left + plotW, y);
+        ctx.stroke();
+      });
+
+      panel.series.forEach(function (series, seriesIndex) {
+        // Bright end of the ramp only: the dark end of magma vanishes into
+        // the plotting surface.
+        var shade = panel.series.length > 1
+          ? seriesIndex / (panel.series.length - 1)
+          : 1;
+        var rgb = magma(0.3 + 0.65 * shade);
+        ctx.strokeStyle = "rgb(" + rgb.join(",") + ")";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        series.forEach(function (value, i) {
+          var x = margin.left + (spec.x[i] - xLow) / (xHigh - xLow) * plotW;
+          var y = top + plotH - (value - range[0]) / (range[1] - range[0]) * plotH;
+          if (i === 0) { ctx.moveTo(x, y); } else { ctx.lineTo(x, y); }
+        });
+        ctx.stroke();
+      });
+
+      ctx.strokeStyle = AXIS_STROKE;
+      ctx.strokeRect(margin.left + 0.5, top + 0.5, plotW - 1, plotH - 1);
+
+      ctx.fillStyle = AXIS_TEXT;
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      ticks(range[0], range[1], 3).forEach(function (value, i) {
+        ctx.fillText(panel.yFormat(value), margin.left - 6, top + plotH - (i / 3) * plotH);
+      });
+      ctx.save();
+      ctx.translate(11, top + plotH / 2);
+      ctx.rotate(-Math.PI / 2);
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      ctx.fillText(panel.yLabel, 0, 0);
+      ctx.restore();
+
+      var last = panelIndex === spec.panels.length - 1;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      ticks(xLow, xHigh, 4).forEach(function (value, i) {
+        ctx.fillText(spec.xFormat(value), margin.left + (i / 4) * plotW, top + plotH + 5);
+      });
+      if (last) {
+        ctx.fillText(spec.xLabel, margin.left + plotW / 2, top + plotH + 18);
+      }
+    });
+  }
+
+  function visBaselines() {
+    var vis = state.result ? state.result.visibilities : null;
+    if (!vis) { return []; }
+    var offered = vis.spectra.baselines;
+    return vis.baselines.filter(function (baseline) {
+      return offered.indexOf(baseline.index) >= 0;
+    });
+  }
+
+  function renderVisBaselineSelect() {
+    var select = $("vis-baseline");
+    while (select.firstChild) { select.removeChild(select.firstChild); }
+    var offered = visBaselines();
+    if (!offered.length) {
+      select.appendChild(el("option", null, "no baselines offered"));
+      select.disabled = true;
+      return;
+    }
+    select.disabled = false;
+    var known = offered.some(function (baseline) {
+      return baseline.index === state.visBaseline;
+    });
+    if (!known) { state.visBaseline = offered[0].index; }
+    offered.forEach(function (baseline) {
+      var option = el("option", null, "baseline " + baseline.ant_1 + "–" + baseline.ant_2
+        + " · " + baseline.length_m.toFixed(1) + " m");
+      option.value = String(baseline.index);
+      select.appendChild(option);
+    });
+    select.value = String(state.visBaseline);
+  }
+
+  function renderVisSpectrum() {
+    if (!state.result || !$("vis-more").open) { return; }
+    var vis = state.result.visibilities;
+    var spectra = vis.spectra;
+    var which = spectra.baselines.indexOf(state.visBaseline);
+    var note = $("vis-spectra-note");
+    if (which < 0) {
+      note.textContent = "no spectra for this baseline";
+      return;
+    }
+    drawLineStack($("vis-spectrum"), {
+      x: spectra.freq_mhz,
+      xLabel: "frequency (MHz)",
+      xFormat: function (v) { return v.toFixed(2); },
+      panels: [
+        {
+          series: spectra.amplitude[which],
+          yLabel: "amplitude (Jy)",
+          yFormat: function (v) { return v.toFixed(1); }
+        },
+        {
+          series: spectra.phase_deg[which],
+          yLabel: "phase (deg)",
+          yFormat: function (v) { return v.toFixed(0); }
+        }
+      ]
+    });
+
+    var lines = ["one line per integration · " + spectra.amplitude[which].length
+      + " integrations × " + spectra.freq_mhz.length + " channels"];
+    if (spectra.integrations_per_bin > 1 || spectra.channels_per_bin > 1) {
+      lines.push("averaged " + spectra.integrations_per_bin + " integrations and "
+        + spectra.channels_per_bin + " channels per point");
+    }
+    if (spectra.n_baselines_offered < vis.n_baselines) {
+      lines.push("spectra offered for " + spectra.n_baselines_offered + " of "
+        + vis.n_baselines + " baselines, shortest first");
+    }
+    note.textContent = lines.join(" · ");
+  }
+
+  function renderVisibilities() {
+    var result = state.result;
+    if (!result || !result.visibilities) { return; }
+    var vis = result.visibilities;
+    var overlays = state.visTruth
+      ? vis.sources.map(function (source) { return { mask: source.mask }; })
+      : [];
+
+    drawHeatmap($("vis-canvas"), {
+      values: vis.amplitude,
+      vmin: vis.vmin_jy,
+      vmax: vis.vmax_jy,
+      xLow: vis.time_s[0],
+      xHigh: vis.time_s[vis.time_s.length - 1],
+      yLow: vis.freq_mhz[0],
+      yHigh: vis.freq_mhz[vis.freq_mhz.length - 1],
+      xLabel: "time (s)",
+      yLabel: "frequency (MHz)",
+      barLabel: "Jy",
+      xFormat: function (v) { return v.toFixed(3); },
+      yFormat: function (v) { return v.toFixed(2); },
+      barFormat: function (v) { return v.toFixed(1); },
+      overlays: overlays,
+      readCell: function (row, col) {
+        return vis.freq_mhz[row].toFixed(3) + " MHz\n"
+          + vis.time_s[col].toFixed(4) + " s\n"
+          + vis.amplitude[row][col].toFixed(3) + " Jy"
+          + visMaskedBy(row, col);
+      }
+    });
+
+    $("vis-sub").textContent = vis.n_baselines + " baselines · "
+      + vis.n_integrations + " integrations of "
+      + (vis.integration_time_s * 1000).toFixed(2) + " ms · peak "
+      + vis.peak_jy.toFixed(1) + " Jy";
+    $("vis-empty").hidden = true;
+
+    renderVisBaselineSelect();
+    renderVisSpectrum();
+  }
+
+  function visMaskedBy(row, col) {
+    if (!state.visTruth) { return ""; }
+    var names = state.result.visibilities.sources.filter(function (source) {
+      return source.mask[row][col];
     }).map(function (source) { return source.name; });
     return names.length ? "\nflagged: " + names.join(", ") : "";
   }
@@ -2478,9 +2994,33 @@
     return best;
   }
 
+  /* --- level 3: what the astronomer gets -------------------------------
+   *
+   * Three honesty devices sit on this panel. The colour-scale ends are
+   * printed, because two runs with different scales look alike and are not.
+   * The primary beam's half-power ring is drawn, because sources outside it
+   * are dimmed by the instrument rather than by the sky. And the clean
+   * comparison re-runs the identical request with the interference removed
+   * and the seed pinned, so the difference between the two images is the
+   * interference and nothing else.
+   */
+
+  // Which result the image panel is showing: the run itself, or its cached
+  // interference-free twin. A/B state lives on the history entry, so
+  // sliding the run strip shows each run's own comparison.
+  function shownEntry() {
+    return state.history[state.historyIndex] || null;
+  }
+
+  function shownImageResult() {
+    var entry = shownEntry();
+    if (entry && entry.showClean && entry.clean) { return entry.clean; }
+    return state.result;
+  }
+
   function renderImage() {
     var canvas = $("image-canvas");
-    var result = state.result;
+    var result = shownImageResult();
     if (!result) { return; }
     var image = result.image;
     var skySources = result.sky_sources || [];
@@ -2505,6 +3045,10 @@
       truthMarkers: inField.map(function (source) {
         return { x: source.l, y: source.m, label: source.name };
       }),
+      // The image axes are direction cosines, so an angular radius enters
+      // as its sine. At these angles the difference is below 1e-4, but the
+      // sine is what the axis actually measures.
+      circles: beamCircle(image),
       readCell: function (row, col) {
         return "l " + image.l[col].toFixed(4) + "\nm " + image.m[row].toFixed(4)
           + "\n" + image.values[row][col].toFixed(3) + " Jy";
@@ -2514,25 +3058,50 @@
     // One row per source that landed in the field: what went in, what came
     // back out, and where it sits. Numbers right-aligned, so the catalog
     // and recovered columns can be read against each other.
+    // The beam-response column only exists when the run had a primary beam;
+    // an empty column of dashes would say nothing.
+    var withBeam = skySources.some(function (source) {
+      return source.beam_response !== null && source.beam_response !== undefined;
+    });
+    var headers = ["source", "catalog Jy", "recovered Jy", "position"];
+    if (withBeam) { headers.splice(3, 0, "beam response"); }
     var rows = inField.map(function (source) {
       var col = nearestIndex(image.l, source.l);
       var row = nearestIndex(image.m, source.m);
-      return [
+      var line = [
         source.name,
         source.flux_jy.toFixed(2),
         image.values[row][col].toFixed(2),
         "l " + source.l.toFixed(4) + ", m " + source.m.toFixed(4)
       ];
+      if (withBeam) {
+        line.splice(3, 0, source.beam_response === null
+          || source.beam_response === undefined
+          ? "—"
+          : source.beam_response.toFixed(2));
+      }
+      return line;
     });
-    fillMetricTable(
-      $("image-recovered"),
-      ["source", "catalog Jy", "recovered Jy", "position"],
-      rows
-    );
+    fillMetricTable($("image-recovered"), headers, rows);
 
     var peakLine = "brightest pixel: " + image.peak.value_jy.toFixed(3) + " Jy at l "
       + image.peak.l.toFixed(4) + ", m " + image.peak.m.toFixed(4);
     $("image-sub").textContent = peakLine;
+
+    $("image-scale").textContent = "scale " + image.vmin_jy.toFixed(2) + " – "
+      + image.vmax_jy.toFixed(2) + " Jy";
+
+    var legend = $("image-beam-legend");
+    var beam = image.beam;
+    if (beam && beam.half_power_rad !== null && beam.half_power_rad !== undefined) {
+      legend.textContent = "dashed circle = primary beam half-power, "
+        + deg(beam.half_power_rad).toFixed(2) + "° radius at band centre";
+      legend.hidden = false;
+    } else {
+      legend.hidden = true;
+    }
+
+    renderAbState();
 
     var outsideNote = $("image-outside");
     if (outside.length) {
@@ -2544,6 +3113,92 @@
     }
 
     $("image-sidelobe-note").hidden = skySources.length < 1;
+  }
+
+  function beamCircle(image) {
+    var beam = image.beam;
+    if (!beam || beam.half_power_rad === null || beam.half_power_rad === undefined) {
+      return [];
+    }
+    return [{ x: 0, y: 0, r: Math.sin(beam.half_power_rad), colour: TRUTH_MARKER }];
+  }
+
+  function renderAbState() {
+    var entry = shownEntry();
+    var button = $("image-ab-toggle");
+    var label = $("image-ab-state");
+    var comparable = Boolean(entry) && entry.result.sources.length > 0;
+    button.disabled = !comparable || state.abRunning;
+    button.title = comparable
+      ? "Re-run this observation with the interference removed and the same seed"
+      : "This run has no interference to remove";
+    setPressed(button, Boolean(entry && entry.showClean));
+    label.textContent = entry && entry.showClean
+      ? "showing: clean, no interference"
+      : "showing: contaminated";
+    label.className = entry && entry.showClean ? "badge badge-amber" : "badge";
+  }
+
+  function showAbNote(text) {
+    var note = $("image-ab-note");
+    if (!text) {
+      note.hidden = true;
+      return;
+    }
+    $("image-ab-note-text").textContent = text;
+    note.hidden = false;
+  }
+
+  /* The clean twin of a run: the same request with the interference list
+     emptied and the same explicit seed, so noise, gains and the sky are
+     bit-for-bit what the contaminated run had and the only difference in
+     the image is the interference. It is computed once per run and cached
+     on that run's history entry; flipping back and forth costs nothing. */
+  function toggleClean() {
+    var entry = shownEntry();
+    if (!entry || state.abRunning) { return; }
+    if (entry.showClean) {
+      entry.showClean = false;
+      showAbNote("");
+      renderImage();
+      return;
+    }
+    if (entry.clean) {
+      entry.showClean = true;
+      showAbNote("");
+      renderImage();
+      return;
+    }
+
+    var payload = JSON.parse(JSON.stringify(entry.request));
+    payload.rfi_sources = [];
+    // The seed is what makes the two runs comparable, so it is asserted
+    // rather than assumed: a request that somehow arrived without one is
+    // pinned to the seed the contaminated run reported using.
+    if (payload.sim.seed === null || payload.sim.seed === undefined
+        || !isFinite(payload.sim.seed)) {
+      payload.sim.seed = entry.result.observation.seed;
+    }
+
+    state.abRunning = true;
+    renderAbState();
+    showAbNote("Running the same observation without interference — same seed, same"
+      + " everything else.");
+    request("/api/simulate?pol=" + entry.result.observation.waterfall_pol, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }).then(function (clean) {
+      entry.clean = clean;
+      entry.showClean = true;
+      showAbNote("");
+    }).catch(function (error) {
+      showNotice("error", "Could not run the clean comparison: " + error.message);
+      showAbNote("");
+    }).then(function () {
+      state.abRunning = false;
+      renderImage();
+    });
   }
 
   function renderUv() {
@@ -2676,12 +3331,344 @@
     if (!state.result) { return; }
     renderAntennaSelect();
     renderMaskToggles();
+    renderAllAntennasControl();
+    renderThumbnails();
+    renderFlagger();
     renderWaterfall();
+    renderVisibilities();
     renderImage();
     renderUv();
   }
 
-  /* -------------------------------------------------------- 9. tooltips */
+  /* ------------------------------------------------------- 9. flagging */
+
+  /* A classical flagger, run on the server against the same voltages the
+   * featured waterfall shows, and scored against the same ground truth an
+   * excision algorithm would be scored against. Two things make this
+   * pedagogy rather than decoration:
+   *
+   *   - the outcome is painted per cell, split into caught / missed / false
+   *     alarm, so a number like "recall 0.45" has a picture attached; and
+   *   - the flagger decides on its own grid, coarser in time than the
+   *     display, so the overlay is placed by frequency and time (see
+   *     drawHeatmap's coordOverlays) and the grid is printed. A method that
+   *     decides on accumulated power is not comparing like with like
+   *     against one that decides on pre-detection voltages, and the panel
+   *     says so instead of hiding it.
+   *
+   * Nothing is computed here: masks, overlays and scores all come back from
+   * the server. Results are cached on the run's history entry and keyed by
+   * the antenna and receptor they were computed for, so featuring another
+   * antenna puts the control back rather than showing a stale overlay.
+   */
+
+  function flaggerSchema() {
+    return (state.defaults && state.defaults.flaggers) || null;
+  }
+
+  function activeFlag() {
+    var entry = shownEntry();
+    if (!entry || !entry.flag) { return null; }
+    if (entry.flag.antenna !== state.waterfallAntenna) { return null; }
+    if (entry.flag.pol !== state.waterfallPol) { return null; }
+    return entry.flag;
+  }
+
+  function renderFlaggerControls() {
+    var schema = flaggerSchema();
+    var panel = $("flagger-controls");
+    if (!schema || !schema.methods.length) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    var host = $("flagger-methods");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+
+    schema.methods.forEach(function (method) {
+      var id = "flagger-method-" + method.value;
+      var wrap = el("div", "flagger-method");
+      var line = el("label", "checkline flagger-method-name");
+      var box = el("input");
+      box.type = "checkbox";
+      box.id = id;
+      box.value = method.value;
+      box.checked = state.flagMethods.indexOf(method.value) >= 0;
+      box.addEventListener("change", function () {
+        var at = state.flagMethods.indexOf(method.value);
+        if (box.checked && at < 0) {
+          state.flagMethods.push(method.value);
+        } else if (!box.checked && at >= 0) {
+          state.flagMethods.splice(at, 1);
+        }
+        syncFlaggerCap();
+      });
+      line.appendChild(box);
+      line.appendChild(document.createTextNode(" " + method.label));
+      wrap.appendChild(line);
+      wrap.appendChild(el("p", "field-hint", method.summary));
+      wrap.appendChild(el("p", "field-hint flagger-method-grid",
+        "decides on: " + method.grid));
+      host.appendChild(wrap);
+    });
+    syncFlaggerCap();
+  }
+
+  // At the cap the unticked boxes go dead rather than silently dropping a
+  // choice, so the limit is visible before the request is refused.
+  function syncFlaggerCap() {
+    var schema = flaggerSchema();
+    if (!schema) { return; }
+    var full = state.flagMethods.length >= schema.max_methods;
+    Array.prototype.forEach.call(
+      $("flagger-methods").querySelectorAll("input[type=checkbox]"),
+      function (box) { box.disabled = full && !box.checked; }
+    );
+    $("flagger-run").disabled = state.flagRunning || state.flagMethods.length === 0;
+  }
+
+  function setFlaggerStatus(kind, text) {
+    var node = $("flagger-status");
+    node.className = "status-cell status-" + kind;
+    node.textContent = text;
+  }
+
+  function runFlagger() {
+    var entry = shownEntry();
+    if (!entry || state.flagRunning || !state.flagMethods.length) { return; }
+    state.flagRunning = true;
+    state.flagError = false;
+    syncFlaggerCap();
+    setFlaggerStatus("warn", "flagging…");
+
+    var antenna = state.waterfallAntenna;
+    var pol = state.waterfallPol;
+    request("/api/flag", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        request: entry.request,
+        methods: state.flagMethods.slice(),
+        antenna: antenna,
+        pol: pol
+      })
+    }).then(function (response) {
+      entry.flag = { antenna: antenna, pol: pol, response: response, active: 0 };
+      response.warnings.forEach(function (message) { showNotice("note", message); });
+      setFlaggerStatus("ok", "done   " + fmt(response.wall_time_s, 2) + " s");
+    }).catch(function (error) {
+      // A refusal (a 422 on the method list or the request) is reported in
+      // full through the page's own notice area, and left standing on the
+      // control's status cell until something about the run changes.
+      state.flagError = true;
+      showNotice("error", error.message);
+      setFlaggerStatus("error", "failed   " + shorten(error.message, 60));
+    }).then(function () {
+      state.flagRunning = false;
+      syncFlaggerCap();
+      renderFlagger();
+      renderWaterfall();
+    });
+  }
+
+  function renderFlaggerPills(flag) {
+    var host = $("flagger-pills");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    var methods = flag ? flag.response.methods : [];
+    // One method needs no chooser; two do, and only ever one is painted.
+    if (methods.length < 2) { return; }
+    methods.forEach(function (method, index) {
+      var pill = el("button", "mask-toggle");
+      pill.type = "button";
+      pill.setAttribute("aria-pressed", String(index === flag.active));
+      pill.appendChild(document.createTextNode(method.label));
+      pill.addEventListener("click", function () {
+        flag.active = index;
+        renderFlaggerPills(flag);
+        renderWaterfall();
+      });
+      host.appendChild(pill);
+    });
+  }
+
+  function renderFlaggerLegend(flag) {
+    var host = $("flagger-legend");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    if (!flag) { return; }
+    [["caught", "caught — interference the method flagged"],
+     ["missed", "missed — interference it left in"],
+     ["false_alarm", "false alarm — clean data it threw away"]].forEach(function (pair) {
+      var item = el("span", "legend-item");
+      var swatch = el("span", "legend-swatch");
+      swatch.style.background = "rgba(" + FLAG_COLOURS[pair[0]] + ", " + FLAG_ALPHA + ")";
+      item.appendChild(swatch);
+      item.appendChild(document.createTextNode(pair[1]));
+      host.appendChild(item);
+    });
+  }
+
+  function renderFlagger() {
+    var schema = flaggerSchema();
+    if (!schema || !schema.methods.length) { return; }
+    var flag = activeFlag();
+    renderFlaggerPills(flag);
+    renderFlaggerLegend(flag);
+    $("flagger-note").hidden = !flag;
+
+    if (!flag) {
+      $("flagger-grid-note").textContent = "";
+      fillMetricTable($("flagger-metrics"), [], []);
+      if (!state.flagRunning && !state.flagError) { setFlaggerStatus("info", "idle"); }
+      return;
+    }
+
+    var grid = flag.response.grid;
+    $("flagger-grid-note").textContent = "flagger grid: " + grid.chan_bins
+      + " ch × " + grid.n_accumulations + " accumulations of " + grid.m
+      + " samples (" + (grid.accumulation_s * 1000).toFixed(1) + " ms) · antenna "
+      + flag.antenna + ", pol " + flag.pol;
+
+    // One column per method, so the head-to-head is one glance -- including
+    // the grid each one decided on, which is the honest caveat on the rest
+    // of the column.
+    var methods = flag.response.methods;
+    var headers = ["metric"].concat(methods.map(function (method) {
+      return method.label;
+    }));
+    var rows = [
+      ["precision", function (s) { return score(s.precision); }],
+      ["recall", function (s) { return score(s.recall); }],
+      ["F1", function (s) { return score(s.f1); }],
+      ["false-positive rate", function (s) { return score(s.false_positive_rate); }],
+      ["truth occupancy", function (s) {
+        return s.truth_occupancy === null || s.truth_occupancy === undefined
+          ? "—"
+          : (s.truth_occupancy * 100).toFixed(2) + "%";
+      }]
+    ].map(function (row) {
+      return [row[0]].concat(methods.map(function (method) {
+        return row[1](method.scores);
+      }));
+    });
+    rows.push(["decides on"].concat(methods.map(function (method) {
+      return method.grid;
+    })));
+    fillMetricTable($("flagger-metrics"), headers, rows);
+  }
+
+  /* ------------------------------------------- 10. tabs and navigation */
+
+  /* Two tabs, Setup and Results, with the hash as the single source of
+   * truth: a reload or a bookmark lands where it left off, and the back
+   * button walks the tabs. The topbar's run controls sit outside both
+   * panels, so a run can be started from either.
+   *
+   * Canvases measure themselves when they draw, and a hidden panel measures
+   * zero, so switching to Results redraws it rather than showing whatever
+   * size it had when it was last visible.
+   */
+  var TABS = ["setup", "results"];
+
+  function tabFromHash() {
+    var name = String(window.location.hash || "").replace("#", "");
+    return TABS.indexOf(name) >= 0 ? name : "setup";
+  }
+
+  function showTab(name) {
+    state.tab = TABS.indexOf(name) >= 0 ? name : "setup";
+    TABS.forEach(function (candidate) {
+      var button = $("tab-" + candidate);
+      var view = $("view-" + candidate);
+      var on = candidate === state.tab;
+      button.classList.toggle("is-active", on);
+      button.setAttribute("aria-selected", String(on));
+      button.tabIndex = on ? 0 : -1;
+      view.hidden = !on;
+    });
+    // The Setup sub-links are a table of contents for the Setup panel only.
+    $("subnav").hidden = state.tab !== "setup";
+    if (state.tab === "results") { renderResults(); }
+  }
+
+  function goToTab(name) {
+    if (window.location.hash === "#" + name) {
+      showTab(name);
+      return;
+    }
+    window.location.hash = "#" + name;   // the hashchange handler does the rest
+  }
+
+  function bindTabs() {
+    TABS.forEach(function (name, index) {
+      var button = $("tab-" + name);
+      button.addEventListener("click", function () { goToTab(name); });
+      button.addEventListener("keydown", function (event) {
+        var step = event.key === "ArrowRight" ? 1 : (event.key === "ArrowLeft" ? -1 : 0);
+        if (!step) { return; }
+        event.preventDefault();
+        var next = TABS[(index + step + TABS.length) % TABS.length];
+        goToTab(next);
+        $("tab-" + next).focus();
+      });
+    });
+    window.addEventListener("hashchange", function () { showTab(tabFromHash()); });
+    showTab(tabFromHash());
+  }
+
+  /* The Setup sub-links are a table of contents for one long panel:
+     clicking one scrolls to its section, and the section you are actually
+     looking at wears the active pill. The pill follows the *topmost*
+     section still inside the band just under the header, which is the one a
+     reader thinks of as "where I am". */
+  function bindNav() {
+    var links = Array.prototype.slice.call(document.querySelectorAll(".navlink-sub"));
+    var sections = links.map(function (link) {
+      return $(link.getAttribute("data-target"));
+    });
+
+    function setActive(link) {
+      links.forEach(function (other) {
+        if (other === link) {
+          other.classList.add("is-active");
+          other.setAttribute("aria-current", "true");
+        } else {
+          other.classList.remove("is-active");
+          other.removeAttribute("aria-current");
+        }
+      });
+    }
+
+    links.forEach(function (link, index) {
+      link.addEventListener("click", function (event) {
+        var section = sections[index];
+        if (!section) { return; }
+        event.preventDefault();
+        section.scrollIntoView({ behavior: "smooth", block: "start" });
+        setActive(link);   // immediate; the observer confirms it on arrival
+      });
+    });
+
+    setActive(links[0]);
+    if (!window.IntersectionObserver) { return; }
+
+    var onScreen = sections.map(function () { return false; });
+    var observer = new window.IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        var index = sections.indexOf(entry.target);
+        if (index >= 0) { onScreen[index] = entry.isIntersecting; }
+      });
+      for (var i = 0; i < onScreen.length; i += 1) {
+        if (onScreen[i]) { setActive(links[i]); return; }
+      }
+      // Nothing in the band (only possible mid-fling): leave the pill be.
+    }, { rootMargin: "-104px 0px -55% 0px", threshold: 0 });
+
+    sections.forEach(function (section) {
+      if (section) { observer.observe(section); }
+    });
+  }
+
+  /* ------------------------------------------------------- 11. tooltips */
 
   function bindTooltip(canvas) {
     var tooltip = $("tooltip");
@@ -2736,7 +3723,7 @@
     svg.addEventListener("mouseleave", function () { $("tooltip").hidden = true; });
   }
 
-  /* ----------------------------------------------------- 10. wiring */
+  /* ----------------------------------------------------- 12. wiring */
 
   function renderSiteMeta() {
     var site = state.site || defaultSite();
@@ -2775,59 +3762,6 @@
       renderSkyCards();
     }).catch(function (error) {
       showNotice("error", "Could not work out where the telescope points: " + error.message);
-    });
-  }
-
-  /* The header links are a table of contents for one long page: clicking
-     one scrolls to its section, and the section you are actually looking
-     at wears the active pill. The pill follows the *topmost* section still
-     inside the band just under the header, which is the one a reader
-     thinks of as "where I am". */
-  function bindNav() {
-    var links = Array.prototype.slice.call(document.querySelectorAll(".navlink"));
-    var sections = links.map(function (link) {
-      return $(link.getAttribute("data-target"));
-    });
-
-    function setActive(link) {
-      links.forEach(function (other) {
-        if (other === link) {
-          other.classList.add("is-active");
-          other.setAttribute("aria-current", "true");
-        } else {
-          other.classList.remove("is-active");
-          other.removeAttribute("aria-current");
-        }
-      });
-    }
-
-    links.forEach(function (link, index) {
-      link.addEventListener("click", function (event) {
-        var section = sections[index];
-        if (!section) { return; }
-        event.preventDefault();
-        section.scrollIntoView({ behavior: "smooth", block: "start" });
-        setActive(link);   // immediate; the observer confirms it on arrival
-      });
-    });
-
-    setActive(links[0]);
-    if (!window.IntersectionObserver) { return; }
-
-    var onScreen = sections.map(function () { return false; });
-    var observer = new window.IntersectionObserver(function (entries) {
-      entries.forEach(function (entry) {
-        var index = sections.indexOf(entry.target);
-        if (index >= 0) { onScreen[index] = entry.isIntersecting; }
-      });
-      for (var i = 0; i < onScreen.length; i += 1) {
-        if (onScreen[i]) { setActive(links[i]); return; }
-      }
-      // Nothing in the band (only possible mid-fling): leave the pill be.
-    }, { rootMargin: "-64px 0px -55% 0px", threshold: 0 });
-
-    sections.forEach(function (section) {
-      if (section) { observer.observe(section); }
     });
   }
 
@@ -2876,10 +3810,51 @@
       button.addEventListener("click", run);
     });
 
+    // Featuring another antenna invalidates nothing on the server, but it
+    // does invalidate the flagger overlay: that was scored on one antenna's
+    // voltages and means nothing on another's. `activeFlag` keys on the
+    // antenna, so the panel puts the control back by itself.
+    // The picker is the typed route to the same thing a tile click does.
     $("waterfall-antenna").addEventListener("change", function (event) {
-      state.waterfallAntenna = Number(event.target.value);
+      featureAntenna(Number(event.target.value));
+    });
+
+    $("all-antennas-toggle").addEventListener("click", function () {
+      state.allAntennas = !state.allAntennas;
+      renderAllAntennasControl();
+      renderThumbnails();
+      if (!state.allAntennas) { renderWaterfall(); }
+    });
+
+    // The master ground-truth switch. The per-source chips inside "More"
+    // choose *which* layers this paints; with the switch off, none of them
+    // paint at all.
+    $("truth-toggle").addEventListener("click", function (event) {
+      state.truthVisible = !state.truthVisible;
+      setPressed(event.currentTarget, state.truthVisible);
       renderWaterfall();
     });
+
+    $("vis-truth-toggle").addEventListener("click", function (event) {
+      state.visTruth = !state.visTruth;
+      setPressed(event.currentTarget, state.visTruth);
+      renderVisibilities();
+    });
+
+    $("vis-baseline").addEventListener("change", function (event) {
+      state.visBaseline = Number(event.target.value);
+      renderVisSpectrum();
+    });
+
+    // A canvas inside a closed fold measures zero, so the spectra are drawn
+    // when the fold opens rather than behind it.
+    $("vis-more").addEventListener("toggle", function () {
+      if ($("vis-more").open) { renderVisSpectrum(); }
+    });
+
+    $("flagger-run").addEventListener("click", runFlagger);
+
+    $("image-ab-toggle").addEventListener("click", toggleClean);
 
     // Which receptor the waterfall shows is a server-side reduction (see
     // simulate.py's `pol` query param), not a client-side redraw, so
@@ -2896,12 +3871,13 @@
 
     $("runs-banner-latest").addEventListener("click", function () {
       showRun(state.history.length - 1);
-      $("section-run").scrollIntoView({ behavior: "smooth", block: "start" });
     });
 
+    bindTabs();
     bindNav();
 
     bindTooltip($("waterfall-canvas"));
+    bindTooltip($("vis-canvas"));
     bindTooltip($("image-canvas"));
     bindUvTooltip();
 
@@ -2926,6 +3902,7 @@
       bindControls();
       renderAllForms();
       renderMaskToggles();
+      renderFlaggerControls();
 
       // The layout catalogue is a convenience, not a prerequisite: a
       // server offering none still runs, with an empty picker.

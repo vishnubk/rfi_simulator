@@ -18,12 +18,12 @@
     RFI Simulator
   </h1>
 
-  <nav class="topnav" id="topnav" aria-label="Sections">
-    <a class="navlink" href="#section-array" data-target="section-array">Array</a>
-    <a class="navlink" href="#section-sky" data-target="section-sky">Sky</a>
-    <a class="navlink" href="#section-rfi" data-target="section-rfi">Interference</a>
-    <a class="navlink" href="#section-realism" data-target="section-realism">Instrument</a>
-    <a class="navlink" href="#section-run" data-target="section-run">Run</a>
+  <nav class="topnav" id="tabnav" role="tablist" aria-label="Views">
+    <button type="button" class="navlink is-active" id="tab-setup" role="tab"
+            aria-selected="true" aria-controls="view-setup" data-tab="setup">Setup</button>
+    <button type="button" class="navlink" id="tab-results" role="tab"
+            aria-selected="false" aria-controls="view-results" tabindex="-1"
+            data-tab="results">Results</button>
   </nav>
 
   <div class="topbar-right">
@@ -34,11 +34,22 @@
   </div>
 </header>
 
+<nav class="subbar" id="subnav" aria-label="Setup sections">
+  <a class="navlink navlink-sub" href="#section-array" data-target="section-array">Array</a>
+  <a class="navlink navlink-sub" href="#section-sky" data-target="section-sky">Sky</a>
+  <a class="navlink navlink-sub" href="#section-rfi" data-target="section-rfi">Interference</a>
+  <a class="navlink navlink-sub" href="#section-realism" data-target="section-realism">Instrument</a>
+  <a class="navlink navlink-sub" href="#section-run" data-target="section-run">Recording</a>
+</nav>
+
 <main class="page">
 
   <p class="page-lead">
     Place antennas, place interference, see what the telescope sees.
   </p>
+
+  <!-- ================================================== the setup tab -->
+  <div class="tab-panel" id="view-setup" role="tabpanel" aria-labelledby="tab-setup" tabindex="-1">
 
   <!-- ---------------------------------------------------------- 1. array -->
   <section class="section" id="section-array" aria-labelledby="array-heading">
@@ -121,8 +132,8 @@
         <button type="button" class="button button-small" id="add-sky">Add a source</button>
       </div>
       <p class="group-intro">
-        Each source is a point on the sky. The dirty image at the bottom of the page
-        should show a peak where you put it.
+        Each source is a point on the sky. The dirty image on the Results tab should
+        show a peak where you put it.
       </p>
       <p class="hint" id="pointing-hint"></p>
       <div id="sky-cards" class="card-stack"></div>
@@ -181,40 +192,31 @@
     </details>
   </section>
 
-  <!-- ------------------------------------------------- 5. run and results -->
+  <!-- ------------------------------------------------------- 5. recording -->
   <section class="section" id="section-run" aria-labelledby="run-heading">
     <div class="section-head">
       <span class="section-number" aria-hidden="true">5</span>
-      <h2 class="section-title" id="run-heading">Run it</h2>
+      <h2 class="section-title" id="run-heading">Recording settings</h2>
     </div>
     <p class="section-intro">
-      How much data to record, and then the run itself. The simulator generates
-      voltages for every antenna, correlates them, and sends back the pictures below.
+      How much data to record. The simulator generates voltages for every antenna,
+      correlates them, and images them; Run sends you to the Results tab.
     </p>
 
-    <div class="group">
-      <div class="group-head">
-        <h3 class="group-title">Recording settings</h3>
-      </div>
-      <div class="field-grid" id="sim-fields"></div>
-      <div class="metric-wrap" id="sim-summary"></div>
-    </div>
+    <div class="field-grid" id="sim-fields"></div>
+    <div class="metric-wrap" id="sim-summary"></div>
+  </section>
 
-    <div class="run-bar">
-      <button type="button" class="button button-run" id="run-main">Run observation</button>
-      <span class="status-cell status-info" id="run-status-main">idle</span>
-      <span class="run-wall mono" id="wall-time"></span>
-    </div>
+  </div>
 
-    <div class="notice-area" id="notices" aria-live="polite"></div>
-
-    <div class="group-head results-head">
-      <h3 class="group-title">Results</h3>
-    </div>
+  <!-- ================================================ the results tab -->
+  <div class="tab-panel" id="view-results" role="tabpanel" aria-labelledby="tab-results"
+       tabindex="-1" hidden>
 
     <div class="runs-strip" id="runs-strip" hidden>
       <div class="runs-dots" id="runs-dots" role="group" aria-label="Recent runs"></div>
       <span class="runs-meta mono" id="runs-meta"></span>
+      <span class="run-wall mono" id="wall-time"></span>
     </div>
 
     <div class="banner" id="runs-banner" hidden>
@@ -223,15 +225,20 @@
       <button type="button" class="button button-small" id="runs-banner-latest">Back to latest</button>
     </div>
 
+    <div class="notice-area" id="notices" aria-live="polite"></div>
+
     <div class="results">
 
-      <figure class="display display-wide" id="waterfall-display">
+      <!-- ------------------------------------------------ level 1: voltages -->
+      <figure class="display" id="panel-voltages">
         <figcaption>
-          <span class="display-title">What one antenna heard</span>
+          <span class="display-title">Voltages — what each antenna records</span>
           <span class="display-sub mono" id="waterfall-sub"></span>
         </figcaption>
         <p class="display-note">
-          Power against time and frequency, for a single antenna. Interference shows
+          Power against time and frequency. Every antenna is shown at once, on one
+          colour scale, so an antenna that couples to a transmitter differently from
+          its neighbours stands out; click one to see it full size. Interference shows
           up as bright stripes, blobs or drifting tracks.
         </p>
 
@@ -247,30 +254,106 @@
               <option value="1">1 (YY)</option>
             </select>
           </span>
+          <button type="button" class="switch" id="all-antennas-toggle" aria-pressed="true">
+            <span class="switch-dot" aria-hidden="true"></span>
+            <span id="all-antennas-label">All antennas</span>
+          </button>
+          <button type="button" class="switch" id="truth-toggle" aria-pressed="false">
+            <span class="switch-dot" aria-hidden="true"></span>Show RFI truth
+          </button>
         </div>
 
-        <div class="truth-bar">
-          <p class="truth-title">
-            Show where the RFI truly is — the labels an algorithm would be scored against
-          </p>
-          <div class="truth-controls">
-            <div class="mask-toggles" id="mask-toggles"></div>
-            <label class="checkline">
-              <input type="checkbox" id="hatch-toggle"> hatch the flagged cells
-            </label>
-          </div>
-        </div>
-
-        <div class="canvas-wrap">
+        <div class="canvas-wrap" id="waterfall-wrap">
           <canvas id="waterfall-canvas"></canvas>
           <div class="sweep" id="waterfall-sweep" hidden></div>
           <p class="display-empty" id="waterfall-empty">Run an observation to fill this in.</p>
         </div>
+
+        <div class="thumb-panel" id="antenna-thumbnails-panel" hidden>
+          <div class="thumb-grid" id="antenna-thumbnails" role="group"
+               aria-label="Every antenna's dynamic spectrum"></div>
+          <p class="display-sub mono thumb-sub" id="antenna-thumbnails-sub"></p>
+        </div>
+
+        <details class="advanced" id="truth-more">
+          <summary>More — which sources, and hatching</summary>
+          <div class="truth-bar">
+            <p class="truth-title">
+              The per-source layers behind the toggle above. They only paint while
+              "Show RFI truth" is on.
+            </p>
+            <div class="truth-controls">
+              <div class="mask-toggles" id="mask-toggles"></div>
+              <label class="checkline">
+                <input type="checkbox" id="hatch-toggle"> hatch the flagged cells
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <details class="advanced" id="flagger-controls">
+          <summary>Run a classical flagger</summary>
+          <p class="display-note">
+            Pick one or two methods and score them against the same ground truth an
+            excision algorithm would be scored against, on the featured antenna.
+          </p>
+          <div class="flagger-methods" id="flagger-methods" role="group"
+               aria-label="Flagging methods"></div>
+          <div class="flagger-run-row">
+            <button type="button" class="button button-accent" id="flagger-run">Flag it</button>
+            <span class="status-cell status-info" id="flagger-status">idle</span>
+          </div>
+          <div class="flagger-pills" id="flagger-pills" role="group"
+               aria-label="Which method's overlay is drawn"></div>
+          <div class="flagger-legend" id="flagger-legend"></div>
+          <p class="display-sub mono flagger-grid-note" id="flagger-grid-note"></p>
+          <div class="metric-wrap" id="flagger-metrics"></div>
+          <p class="muted-line" id="flagger-note" hidden>
+            This is the classical floor an ML method should beat.
+          </p>
+        </details>
       </figure>
 
-      <figure class="display" id="image-display">
+      <!-- -------------------------------------------- level 2: visibilities -->
+      <figure class="display" id="panel-visibilities">
         <figcaption>
-          <span class="display-title">Dirty image</span>
+          <span class="display-title">Visibilities — what the correlator sees</span>
+          <span class="display-sub mono" id="vis-sub"></span>
+        </figcaption>
+        <p class="display-note">
+          This is the data a visibility-domain flagger works on.
+        </p>
+
+        <div class="display-controls">
+          <button type="button" class="switch" id="vis-truth-toggle" aria-pressed="false">
+            <span class="switch-dot" aria-hidden="true"></span>Show RFI truth
+          </button>
+        </div>
+
+        <div class="canvas-wrap">
+          <canvas id="vis-canvas"></canvas>
+          <p class="display-empty" id="vis-empty">Run an observation to fill this in.</p>
+        </div>
+
+        <details class="advanced" id="vis-more">
+          <summary>More — one baseline's spectrum</summary>
+          <div class="display-controls">
+            <span class="control-group">
+              <label class="field-label" for="vis-baseline">Baseline</label>
+              <select id="vis-baseline" class="input input-small"></select>
+            </span>
+          </div>
+          <div class="canvas-wrap canvas-wrap-tall">
+            <canvas id="vis-spectrum"></canvas>
+          </div>
+          <p class="display-sub mono vis-spectra-note" id="vis-spectra-note"></p>
+        </details>
+      </figure>
+
+      <!-- --------------------------------------------------- level 3: image -->
+      <figure class="display" id="panel-image">
+        <figcaption>
+          <span class="display-title">Image — what the astronomer gets</span>
           <span class="display-sub mono" id="image-sub"></span>
         </figcaption>
         <p class="display-note">
@@ -278,33 +361,45 @@
           where a simulated source truly is · + marks the brightest pixel (which,
           with RFI present, may not be a source at all).
         </p>
+
+        <div class="display-controls">
+          <button type="button" class="switch" id="image-ab-toggle" aria-pressed="false">
+            <span class="switch-dot" aria-hidden="true"></span>Compare without interference
+          </button>
+          <span class="badge" id="image-ab-state">showing: contaminated</span>
+          <span class="display-sub mono" id="image-scale"></span>
+        </div>
+
+        <div class="banner" id="image-ab-note" hidden>
+          <span class="banner-kind">Note</span>
+          <span id="image-ab-note-text"></span>
+        </div>
+
         <div class="canvas-wrap">
           <canvas id="image-canvas"></canvas>
         </div>
+        <p class="hint" id="image-beam-legend" hidden></p>
         <div class="metric-wrap" id="image-recovered"></div>
         <p class="hint" id="image-outside" hidden><span class="badge badge-amber" id="image-outside-text"></span></p>
         <p class="hint" id="image-sidelobe-note" hidden>
           Ripples around the sources are sidelobes — the imaging artefact of a
           small array, not extra sources.
         </p>
-      </figure>
 
-      <figure class="display" id="uv-display">
-        <figcaption>
-          <span class="display-title">Baseline coverage</span>
-          <span class="display-sub mono" id="uv-sub"></span>
-        </figcaption>
-        <p class="display-note">
-          Every antenna pair, in wavelengths. This is the sampling pattern that gives
-          the dirty image its shape.
-        </p>
-        <div class="canvas-wrap">
-          <svg id="uv-plot" role="img" aria-label="Baseline coverage in wavelengths"></svg>
+        <div class="uv-block">
+          <p class="display-sub mono uv-sub-line" id="uv-sub"></p>
+          <p class="display-note">
+            Every antenna pair, in wavelengths. This is the sampling pattern that gives
+            the dirty image its shape.
+          </p>
+          <div class="canvas-wrap">
+            <svg id="uv-plot" role="img" aria-label="Baseline coverage in wavelengths"></svg>
+          </div>
         </div>
       </figure>
 
     </div>
-  </section>
+  </div>
 
 </main>
 

@@ -24,19 +24,24 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from rfi_simulator import correlate  # noqa: E402
+from rfi_simulator import GaussianBeam, correlate, spectral_kurtosis_mask  # noqa: E402
+from rfi_simulator.metrics import flag_scores, pool_truth_accumulations  # noqa: E402
 from rfi_simulator.webui.server import (  # noqa: E402
     MAX_REQUEST_BYTES,
     create_app,
 )
 from rfi_simulator.webui.simulate import (  # noqa: E402
+    FLAG_DEFAULT_M,
     MAX_ANTENNAS,
     MAX_COORDINATE_M,
+    MAX_FLAG_METHODS,
     MAX_N_BLOCKS,
     MAX_N_CHAN,
     MAX_TOTAL_SAMPLES,
+    MAX_VIS_SPECTRUM_VALUES,
     MAX_WATERFALL_CELLS,
     N_TIME_PER_BLOCK,
+    VIS_MAX_CHAN_BINS,
     SimulateRequest,
     build_simulator,
     default_array,
@@ -1218,3 +1223,303 @@ def test_a_source_with_no_position_at_all_lands_where_the_page_opens(client):
     default_offset = defaults_payload()["sky_source"]["position"]["default_offset_deg"]
     assert resolved["l"] == pytest.approx(math.sin(math.radians(default_offset[0])), abs=1e-12)
     assert resolved["m"] == pytest.approx(math.sin(math.radians(default_offset[1])), abs=1e-12)
+
+
+# ----------------------------------------------------------------------
+# What the correlator sees
+# ----------------------------------------------------------------------
+def test_the_visibility_waterfall_is_the_librarys_own_average(client):
+    """The amplitude map must be the library's visibilities, not a re-derivation.
+
+    The whole page rests on the rule that the browser draws what the
+    library computed. This re-runs the same request through the library
+    by hand, averages ``|V|`` over the cross-correlation baselines
+    itself, and insists the response holds that number.
+    """
+    body = make_request([{"type": "tower"}])
+    response = client.post("/api/simulate", json=body)
+    assert response.status_code == 200, response.text
+    reported = np.asarray(response.json()["visibilities"]["amplitude"])
+
+    simulator = build_simulator(SimulateRequest.model_validate(body))
+    visibilities = correlate(simulator.blocks())
+    data = visibilities.pol_data[:, :, 0, :]
+    expected = np.abs(data[:, visibilities.cross_mask, :]).mean(axis=1).T
+
+    assert reported.shape == expected.shape
+    assert reported == pytest.approx(expected, rel=1e-4, abs=1e-5)
+
+
+def test_one_baselines_spectrum_is_that_baselines_visibility(client):
+    """The picked baseline's amplitude and phase are its own, unaveraged.
+
+    At this size nothing is binned away -- 32 channels and 2 integrations
+    are both under their budgets -- so the response must hold the
+    library's visibility for that antenna pair exactly.
+    """
+    body = make_request([{"type": "tower"}])
+    block = client.post("/api/simulate", json=body).json()["visibilities"]
+    spectra = block["spectra"]
+    assert spectra["integrations_per_bin"] == 1
+    assert spectra["channels_per_bin"] == 1
+
+    simulator = build_simulator(SimulateRequest.model_validate(body))
+    visibilities = correlate(simulator.blocks())
+
+    position = 2
+    baseline = spectra["baselines"][position]
+    expected = visibilities.pol_data[:, baseline, 0, :]
+    assert np.asarray(spectra["amplitude"][position]) == pytest.approx(
+        np.abs(expected), rel=1e-4, abs=1e-5
+    )
+    assert np.asarray(spectra["phase_deg"][position]) == pytest.approx(
+        np.degrees(np.angle(expected)), abs=1e-2
+    )
+
+
+def test_the_visibility_truth_is_the_librarys_rfi_fraction(client):
+    """The stripes an excision algorithm is scored against are ``rfi_fraction``."""
+    body = make_request([{"type": "tower"}])
+    result = client.post("/api/simulate", json=body).json()
+    reported = result["visibilities"]["sources"]
+    assert len(reported) == 1
+
+    simulator = build_simulator(SimulateRequest.model_validate(body))
+    visibilities = correlate(simulator.blocks())
+    fraction = np.asarray(visibilities.rfi_fraction)[:, 0, :]
+
+    assert reported[0]["name"] == visibilities.rfi_source_names[0]
+    assert np.asarray(reported[0]["mask"], dtype=bool).tolist() == (fraction.T > 0.0).tolist()
+    assert reported[0]["mean_fraction"] == pytest.approx(float(fraction.mean()))
+    assert reported[0]["max_fraction"] == pytest.approx(float(fraction.max()))
+    assert reported[0]["max_fraction"] > 0.0
+
+
+def test_the_visibility_reductions_stay_small(client):
+    """Every visibility product must arrive on a grid the page can draw."""
+    body = make_request([{"type": "tower"}], n_chan=64, n_blocks=3)
+    result = client.post("/api/simulate", json=body).json()
+    block = result["visibilities"]
+
+    amplitude = np.asarray(block["amplitude"])
+    assert amplitude.shape == (min(64, VIS_MAX_CHAN_BINS), 3)
+    assert len(block["freq_mhz"]) == amplitude.shape[0]
+    assert len(block["time_s"]) == amplitude.shape[1]
+    assert block["vmin_jy"] <= block["vmax_jy"] <= block["peak_jy"] * 1.000001
+
+    array = default_array()
+    n_antennas = len(array.antenna_positions_enu_m)
+    assert block["n_baselines"] == n_antennas * (n_antennas - 1) // 2
+    assert len(block["baselines"]) == block["n_baselines"]
+    lengths = [entry["length_m"] for entry in block["baselines"]]
+    assert lengths == sorted(lengths)
+    assert all(entry["ant_1"] < entry["ant_2"] for entry in block["baselines"])
+
+    spectra = block["spectra"]
+    amplitudes = np.asarray(spectra["amplitude"])
+    assert amplitudes.shape == (
+        len(spectra["baselines"]),
+        len(spectra["time_s"]),
+        len(spectra["freq_mhz"]),
+    )
+    assert np.asarray(spectra["phase_deg"]).shape == amplitudes.shape
+    assert abs(np.asarray(spectra["phase_deg"])).max() <= 180.0
+    assert amplitudes.size * 2 <= MAX_VIS_SPECTRUM_VALUES
+    assert set(spectra["baselines"]) <= {entry["index"] for entry in block["baselines"]}
+
+
+def test_a_clean_rerun_of_the_same_seed_carries_no_interference(client):
+    """The A/B comparison: the same run without interference, same realization.
+
+    The page offers a clean/contaminated flip by posting the same body
+    with an empty interference list and the same seed. The clean run must
+    hold no interference truth anywhere, and must still be the same sky.
+    """
+    body = make_request([{"type": "tower"}])
+    contaminated = client.post("/api/simulate", json=body).json()
+
+    clean_body = dict(body, rfi_sources=[])
+    assert clean_body["sim"]["seed"] == body["sim"]["seed"]
+    clean = client.post("/api/simulate", json=clean_body)
+    assert clean.status_code == 200, clean.text
+    clean = clean.json()
+
+    assert clean["sources"] == []
+    assert clean["visibilities"]["sources"] == []
+    assert clean["sky_sources"] == contaminated["sky_sources"]
+    assert clean["image"]["vmax_jy"] != contaminated["image"]["vmax_jy"]
+
+
+# ----------------------------------------------------------------------
+# The primary beam, on the image
+# ----------------------------------------------------------------------
+def test_a_fitted_beam_reports_its_half_power_circle_and_per_source_response(client):
+    """The circle drawn on the image is the beam the sources were dimmed by."""
+    body = make_request()
+    body["primary_beam"] = {"type": "gaussian", "dish_diameter_m": 4.5}
+    result = client.post("/api/simulate", json=body).json()
+
+    beam = result["image"]["beam"]
+    assert beam["type"] == "gaussian"
+    expected = 0.5 * float(GaussianBeam(dish_diameter_m=4.5).fwhm_rad(beam["center_freq_hz"]))
+    assert beam["half_power_rad"] == pytest.approx(expected, rel=1e-6)
+
+    response = result["sky_sources"][0]["beam_response"]
+    assert 0.0 < response < 1.0
+
+
+def test_an_airy_beam_reports_a_wider_half_power_circle_than_a_gaussian(client):
+    """The circle is found on the beam's own response, so the two models differ."""
+    radii = {}
+    for kind in ("gaussian", "airy"):
+        body = make_request()
+        body["primary_beam"] = {"type": kind, "dish_diameter_m": 4.5}
+        result = client.post("/api/simulate", json=body).json()
+        radii[kind] = result["image"]["beam"]["half_power_rad"]
+    assert radii["airy"] > radii["gaussian"] > 0.0
+
+
+def test_no_beam_is_reported_as_absent_not_as_unity(client):
+    """ "Nothing was attenuated" and "attenuated by 1.0" are different claims."""
+    result = client.post("/api/simulate", json=make_request()).json()
+    assert result["image"]["beam"] is None
+    assert result["sky_sources"][0]["beam_response"] is None
+
+
+# ----------------------------------------------------------------------
+# The classical flaggers
+# ----------------------------------------------------------------------
+def flag_body(methods, rfi_sources=({"type": "tower"},), **overrides) -> dict:
+    """A flagging request over a small contaminated run."""
+    body = {
+        "request": make_request(list(rfi_sources)),
+        "methods": list(methods),
+        "antenna": 0,
+        "pol": 0,
+    }
+    body.update(overrides)
+    return body
+
+
+def test_the_defaults_describe_the_flaggers_the_page_offers(defaults):
+    """The method picker is built from the schema, so the schema must be whole."""
+    flaggers = defaults["flaggers"]
+    assert {entry["value"] for entry in flaggers["methods"]} == {"sk", "mad", "sumthreshold"}
+    for entry in flaggers["methods"]:
+        assert entry["label"] and entry["summary"] and entry["grid"]
+    assert flaggers["max_methods"] == MAX_FLAG_METHODS
+    assert flaggers["defaults"]["m"] == FLAG_DEFAULT_M
+
+
+@pytest.mark.parametrize("method", ["sk", "mad", "sumthreshold"])
+def test_every_flagger_returns_masks_and_usable_scores(client, method):
+    """Each method must produce a decision for every cell and score it."""
+    response = client.post("/api/flag", json=flag_body([method]))
+    assert response.status_code == 200, response.text
+    result = response.json()
+
+    grid = result["grid"]
+    assert grid["m"] == FLAG_DEFAULT_M
+    assert grid["n_accumulations"] == SMALL_SIM["n_blocks"] * (N_TIME_PER_BLOCK // grid["m"])
+    assert len(grid["freq_mhz"]) == grid["chan_bins"]
+    assert len(grid["time_s"]) == grid["n_accumulations"]
+
+    assert len(result["methods"]) == 1
+    entry = result["methods"][0]
+    assert entry["method"] == method
+    assert entry["label"] and entry["grid"]
+    for name in ("caught", "missed", "false_alarm"):
+        assert np.asarray(entry["overlay"][name]).shape == (
+            grid["chan_bins"],
+            grid["n_accumulations"],
+        )
+    scores = entry["scores"]
+    assert scores["truth_occupancy"] > 0.0
+    assert scores["tp"] + scores["fn"] > 0
+    for name in ("precision", "recall", "f1", "false_positive_rate"):
+        assert scores[name] is None or 0.0 <= scores[name] <= 1.0
+
+
+def test_the_flagger_scores_are_the_librarys_own(client):
+    """The load-bearing one: re-run the flagger by hand and compare.
+
+    Spectral kurtosis on the same seed, with the truth pooled by
+    `pool_truth_accumulations` -- the partition the estimator itself
+    uses -- must give exactly the numbers the endpoint reports, or the
+    page is scoring something other than what it says it is.
+    """
+    body = flag_body(["sk"])
+    reported = client.post("/api/flag", json=body).json()["methods"][0]
+
+    request = SimulateRequest.model_validate(body["request"])
+    simulator = build_simulator(request)
+    predicted = []
+    truth = []
+    for block in simulator.blocks():
+        predicted.append(spectral_kurtosis_mask(block.pol_data[0, 0], FLAG_DEFAULT_M))
+        truth.append(pool_truth_accumulations(block.rfi_mask.any(axis=0), FLAG_DEFAULT_M))
+    expected = flag_scores(np.concatenate(predicted, axis=1), np.concatenate(truth, axis=1))
+
+    for name, value in expected.items():
+        if math.isnan(value):
+            assert reported["scores"][name] is None
+        else:
+            assert reported["scores"][name] == pytest.approx(value)
+
+
+def test_two_methods_come_back_side_by_side_on_one_grid(client):
+    """The head-to-head: two columns, same cells, same truth."""
+    response = client.post("/api/flag", json=flag_body(["sk", "sumthreshold"]))
+    assert response.status_code == 200, response.text
+    result = response.json()
+
+    assert [entry["method"] for entry in result["methods"]] == ["sk", "sumthreshold"]
+    occupancies = {entry["scores"]["truth_occupancy"] for entry in result["methods"]}
+    assert len(occupancies) == 1
+    shapes = {np.asarray(entry["overlay"]["caught"]).shape for entry in result["methods"]}
+    assert len(shapes) == 1
+
+
+def test_a_flagger_scores_a_clean_run_as_having_nothing_to_find(client):
+    """With no interference there is no recall to have, and it must not be faked."""
+    response = client.post("/api/flag", json=flag_body(["mad"], rfi_sources=()))
+    assert response.status_code == 200, response.text
+    scores = response.json()["methods"][0]["scores"]
+    assert scores["truth_occupancy"] == 0.0
+    assert scores["recall"] is None
+    assert not np.asarray(response.json()["methods"][0]["overlay"]["caught"]).any()
+
+
+def test_the_flagger_follows_the_antenna_and_the_receptor(client):
+    """A per-antenna decision must actually read that antenna's voltages."""
+    body = flag_body(["mad"])
+    first = client.post("/api/flag", json=body).json()
+    body["antenna"] = 3
+    second = client.post("/api/flag", json=body)
+    assert second.status_code == 200, second.text
+    second = second.json()
+    assert second["antenna"] == 3
+    assert second["methods"][0]["overlay"] != first["methods"][0]["overlay"]
+
+
+def test_the_flagger_refuses_an_antenna_this_array_does_not_have(client):
+    body = flag_body(["mad"], antenna=64)
+    response = client.post("/api/flag", json=body)
+    assert response.status_code == 422
+    assert "antenna" in response.json()["detail"][0]["msg"]
+
+
+def test_the_flagger_refuses_an_accumulation_that_straddles_a_block(client):
+    """A block is generated alone, so an accumulation has to fit inside one."""
+    body = flag_body(["sk"], params={"m": 300})
+    response = client.post("/api/flag", json=body)
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "methods",
+    [[], ["sk", "sk"], ["sk", "mad", "sumthreshold"], ["nonesuch"]],
+)
+def test_the_flagger_refuses_a_method_list_it_cannot_answer(client, methods):
+    """One or two named methods, each named once."""
+    assert client.post("/api/flag", json=flag_body(methods)).status_code == 422
