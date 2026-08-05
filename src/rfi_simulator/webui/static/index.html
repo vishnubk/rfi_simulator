@@ -3,39 +3,42 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Interference simulator</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23171A1E'/%3E%3Cpath d='M16 5v22M5 16h22' stroke='%23D98E32' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='16' r='6' fill='none' stroke='%23E4574B' stroke-width='1.6'/%3E%3C/svg%3E">
+<title>RFI Simulator</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232D3436'/%3E%3Cpath d='M16 5v22M5 16h22' stroke='%23FDCB6E' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='16' r='6' fill='none' stroke='%230984E3' stroke-width='1.6'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
 
-<header class="masthead">
-  <div class="masthead-mark" aria-hidden="true">
-    <svg viewBox="0 0 32 32" width="24" height="24">
-      <path d="M16 4v24M4 16h24" stroke="currentColor" stroke-width="1.2"/>
-      <circle cx="16" cy="16" r="7" fill="none" stroke="currentColor" stroke-width="1.2"/>
+<header class="topbar">
+  <h1 class="brand">
+    <svg viewBox="0 0 32 32" width="18" height="18" aria-hidden="true">
+      <path d="M16 4v24M4 16h24" stroke="currentColor" stroke-width="1.6"/>
+      <circle cx="16" cy="16" r="7" fill="none" stroke="currentColor" stroke-width="1.6"/>
     </svg>
-  </div>
-  <div class="masthead-text">
-    <h1>Interference simulator</h1>
-    <p>Place antennas, place interference, see what the telescope sees.</p>
-  </div>
+    RFI Simulator
+  </h1>
 
-  <div class="masthead-preset">
-    <label class="field-label" for="preset">Start from an example</label>
-    <div class="preset-row">
-      <select id="preset" class="input"></select>
-      <button type="button" class="button" id="load-preset">Load</button>
-    </div>
-  </div>
+  <nav class="topnav" id="topnav" aria-label="Sections">
+    <a class="navlink" href="#section-array" data-target="section-array">Array</a>
+    <a class="navlink" href="#section-sky" data-target="section-sky">Sky</a>
+    <a class="navlink" href="#section-rfi" data-target="section-rfi">Interference</a>
+    <a class="navlink" href="#section-realism" data-target="section-realism">Instrument</a>
+    <a class="navlink" href="#section-run" data-target="section-run">Run</a>
+  </nav>
 
-  <div class="masthead-run">
-    <button type="button" class="button button-run" id="run">Run observation</button>
-    <span class="run-status mono" id="run-status"></span>
+  <div class="topbar-right">
+    <select id="preset" class="input" aria-label="Start from an example"></select>
+    <button type="button" class="button" id="load-preset">Load</button>
+    <button type="button" class="button button-run" id="run">Run</button>
+    <span class="status-cell status-info" id="run-status">idle</span>
   </div>
 </header>
 
 <main class="page">
+
+  <p class="page-lead">
+    Place antennas, place interference, see what the telescope sees.
+  </p>
 
   <!-- ---------------------------------------------------------- 1. array -->
   <section class="section" id="section-array" aria-labelledby="array-heading">
@@ -77,7 +80,7 @@
             <select id="array-choice" class="input"></select>
             <button type="button" class="button" id="load-array">Load</button>
           </div>
-          <p class="hint" id="array-load-note" hidden></p>
+          <p class="banner" id="array-load-note" hidden></p>
         </div>
 
         <dl class="site-meta mono" id="site-meta"></dl>
@@ -194,16 +197,31 @@
         <h3 class="group-title">Recording settings</h3>
       </div>
       <div class="field-grid" id="sim-fields"></div>
-      <p class="readout mono" id="sim-summary"></p>
+      <div class="metric-wrap" id="sim-summary"></div>
     </div>
 
     <div class="run-bar">
       <button type="button" class="button button-run" id="run-main">Run observation</button>
-      <span class="run-status mono" id="run-status-main"></span>
+      <span class="status-cell status-info" id="run-status-main">idle</span>
       <span class="run-wall mono" id="wall-time"></span>
     </div>
 
     <div class="notice-area" id="notices" aria-live="polite"></div>
+
+    <div class="group-head results-head">
+      <h3 class="group-title">Results</h3>
+    </div>
+
+    <div class="runs-strip" id="runs-strip" hidden>
+      <div class="runs-dots" id="runs-dots" role="group" aria-label="Recent runs"></div>
+      <span class="runs-meta mono" id="runs-meta"></span>
+    </div>
+
+    <div class="banner" id="runs-banner" hidden>
+      <span class="banner-kind">Note</span>
+      <span id="runs-banner-text">Viewing an earlier run.</span>
+      <button type="button" class="button button-small" id="runs-banner-latest">Back to latest</button>
+    </div>
 
     <div class="results">
 
@@ -220,11 +238,11 @@
         <div class="display-controls">
           <span class="control-group">
             <label class="field-label" for="waterfall-antenna">Antenna</label>
-            <select id="waterfall-antenna" class="input input-dark input-small"></select>
+            <select id="waterfall-antenna" class="input input-small"></select>
           </span>
           <span class="control-group" id="waterfall-pol-group" hidden>
             <label class="field-label" for="waterfall-pol" id="waterfall-pol-label">Polarization</label>
-            <select id="waterfall-pol" class="input input-dark input-small">
+            <select id="waterfall-pol" class="input input-small">
               <option value="0">0 (XX)</option>
               <option value="1">1 (YY)</option>
             </select>
@@ -263,8 +281,8 @@
         <div class="canvas-wrap">
           <canvas id="image-canvas"></canvas>
         </div>
-        <p class="hint mono" id="image-recovered"></p>
-        <p class="hint" id="image-outside" hidden></p>
+        <div class="metric-wrap" id="image-recovered"></div>
+        <p class="hint" id="image-outside" hidden><span class="badge badge-amber" id="image-outside-text"></span></p>
         <p class="hint" id="image-sidelobe-note" hidden>
           Ripples around the sources are sidelobes — the imaging artefact of a
           small array, not extra sources.

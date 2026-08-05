@@ -128,7 +128,7 @@ def test_the_page_and_its_assets_are_served(client):
     """The console is one HTML file and two static assets, all local."""
     index = client.get("/")
     assert index.status_code == 200
-    assert "Interference simulator" in index.text
+    assert "RFI Simulator" in index.text
     # Nothing may be fetched from anywhere but this server.
     assert "//" not in index.text.replace("http://www.w3.org/2000/svg", "")
     for asset in ("/static/app.js", "/static/styles.css"):

@@ -25,19 +25,23 @@
     [254, 201, 141], [252, 253, 191]
   ];
 
-  var MASK_RGB = "228, 87, 75";
+  // Plot-surface colours. These live on the dark canvases, so they are the
+  // dark-surface members of the page palette: mask red = --error-line,
+  // truth marker = --amber, sky swatch = --plot-point.
+  var MASK_RGB = "214, 48, 49";
   var MASK_ALPHA = 0.45;
-  var SKY_MARKER = "#3e8fb0";
-  var TRUTH_MARKER = "#e8b339";
+  var SKY_MARKER = "#74b9ff";
+  var TRUTH_MARKER = "#fdcb6e";
   var AXIS_STROKE = "#39404b";
   var GRID_STROKE = "#262c35";
   var AXIS_TEXT = "#9aa1ac";
-  var PLOT_FONT = '11px "SF Mono", "Cascadia Mono", ui-monospace, monospace';
+  var PLOT_FONT = '11px Menlo, Consolas, ui-monospace, monospace';
 
   var VIEW = 400;          // site-plan internal coordinate box, px
   var SHEET_PAD = 30;      // margin inside it, px
   var MIN_SPACING_M = 5;   // how far apart a dropped antenna tries to land
   var LARGE_ARRAY = 32;    // above this, a loaded layout gets a "slower run" note
+  var HISTORY_MAX = 5;     // completed runs kept in memory for the run strip
   var NICE_STEPS = [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000];
 
   function $(id) { return document.getElementById(id); }
@@ -47,6 +51,33 @@
     if (className) { node.className = className; }
     if (text !== undefined && text !== null) { node.textContent = text; }
     return node;
+  }
+
+  // A readout table: uppercase column heads, monospace right-aligned
+  // values, one hairline per row. `headers` is a list of strings, `rows` a
+  // list of equal-length lists of already-formatted strings. An empty
+  // `rows` empties the host, which CSS then collapses.
+  function fillMetricTable(host, headers, rows) {
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    if (!rows.length) { return; }
+    var table = el("table", "metric-table");
+    var head = el("tr");
+    headers.forEach(function (label) {
+      var cell = el("th", null, label);
+      cell.scope = "col";
+      head.appendChild(cell);
+    });
+    var thead = el("thead");
+    thead.appendChild(head);
+    table.appendChild(thead);
+    var body = el("tbody");
+    rows.forEach(function (values) {
+      var line = el("tr");
+      values.forEach(function (value) { line.appendChild(el("td", null, value)); });
+      body.appendChild(line);
+    });
+    table.appendChild(body);
+    host.appendChild(table);
   }
 
   function clamp(value, low, high) {
@@ -107,6 +138,9 @@
     maskVisible: [],
     hatch: false,
     notices: [],
+    history: [],          // last HISTORY_MAX completed runs, oldest first
+    historyIndex: -1,     // which of them the result displays are showing
+    elapsedTimer: null,
     drag: null
   };
 
@@ -448,6 +482,10 @@
       lines.push("This layout has more antennas than this front end will run ("
         + state.defaults.limits.max_antennas + "); remove some before running.");
     }
+    // A layout that costs real time, was trimmed to fit, or will not run
+    // at all is a warning; anything else is plain information.
+    var warn = n > LARGE_ARRAY || trimmed || !array.runnable;
+    note.className = "banner" + (warn ? " banner-warn" : "");
     note.textContent = lines.join(" ");
     note.hidden = false;
   }
@@ -1580,13 +1618,14 @@
     var duration = state.sim.n_blocks * sim.block_duration_s;
     var bandwidth = state.sim.n_chan * sim.chan_width_hz;
     var half = bandwidth / 2;
-    $("sim-summary").textContent =
-      "This run records " + fmt(duration * 1000, 1) + " ms of data from "
-      + fmt((state.sim.center_freq_hz - half) / 1e6, 3) + " to "
-      + fmt((state.sim.center_freq_hz + half) / 1e6, 3) + " MHz ("
-      + fmt(bandwidth / 1e6, 3) + " MHz in "
-      + fmt(sim.chan_width_hz / 1e3, 2) + " kHz channels), starting "
-      + sim.start_time_utc + " UTC.";
+    fillMetricTable($("sim-summary"), ["this run records", ""], [
+      ["duration", fmt(duration * 1000, 1) + " ms"],
+      ["band", fmt((state.sim.center_freq_hz - half) / 1e6, 3) + " – "
+        + fmt((state.sim.center_freq_hz + half) / 1e6, 3) + " MHz"],
+      ["bandwidth", fmt(bandwidth / 1e6, 3) + " MHz"],
+      ["channel width", fmt(sim.chan_width_hz / 1e3, 2) + " kHz"],
+      ["starts", sim.start_time_utc + " UTC"]
+    ]);
   }
 
   // The realism panel's fields have no server-side schema of their own
@@ -1925,8 +1964,8 @@
     var host = $("notices");
     while (host.firstChild) { host.removeChild(host.firstChild); }
     state.notices.forEach(function (notice) {
-      var node = el("div", "notice" + (notice.kind === "error" ? " notice-error" : ""));
-      node.appendChild(el("span", "notice-kind",
+      var node = el("div", "banner" + (notice.kind === "error" ? " banner-error" : " banner-warn"));
+      node.appendChild(el("span", "banner-kind",
         notice.kind === "error" ? "Problem" : "Note"));
       node.appendChild(el("span", null, notice.text));
       host.appendChild(node);
@@ -2015,10 +2054,31 @@
   // the results -- so both copies move together.
   function runButtons() { return [$("run"), $("run-main")]; }
 
-  function setRunStatus(text) {
+  // Both copies of the status read the same four-state cell: info while
+  // idle, amber while a run is in flight, green when it lands, red when
+  // the server refuses it.
+  function setRunStatus(kind, text) {
     [$("run-status"), $("run-status-main")].forEach(function (node) {
+      node.className = "status-cell status-" + kind;
       node.textContent = text;
     });
+  }
+
+  function startElapsed() {
+    stopElapsed();
+    var started = Date.now();
+    setRunStatus("warn", "running   0 s");
+    state.elapsedTimer = window.setInterval(function () {
+      var seconds = Math.round((Date.now() - started) / 1000);
+      setRunStatus("warn", "running   " + seconds + " s");
+    }, 1000);
+  }
+
+  function stopElapsed() {
+    if (state.elapsedTimer !== null) {
+      window.clearInterval(state.elapsedTimer);
+      state.elapsedTimer = null;
+    }
   }
 
   function run() {
@@ -2027,7 +2087,7 @@
     state.notices = [];
     renderNotices();
     runButtons().forEach(function (button) { button.disabled = true; });
-    setRunStatus("running…");
+    startElapsed();
     $("waterfall-sweep").hidden = state.result === null;
 
     request("/api/simulate?pol=" + state.waterfallPol, {
@@ -2035,24 +2095,126 @@
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(buildRequest())
     }).then(function (result) {
-      state.result = result;
-      state.maskVisible = result.sources.map(function () { return true; });
-      state.waterfallAntenna = clamp(
-        state.waterfallAntenna, 0, result.waterfall.antennas.length - 1
-      );
-      $("waterfall-pol-group").hidden = result.observation.n_pol !== 2;
+      stopElapsed();
+      rememberRun(result);
       result.warnings.forEach(function (message) { showNotice("note", message); });
-      setRunStatus("done in " + fmt(result.wall_time_s, 2) + " s");
+      setRunStatus("ok", "done   " + fmt(result.wall_time_s, 2) + " s");
       $("wall-time").textContent = fmt(result.wall_time_s, 2) + " s wall";
-      renderResults();
     }).catch(function (error) {
+      stopElapsed();
       showNotice("error", error.message);
-      setRunStatus("not run");
+      setRunStatus("error", "failed   " + shorten(error.message, 60));
     }).then(function () {
       state.running = false;
       runButtons().forEach(function (button) { button.disabled = false; });
       $("waterfall-sweep").hidden = true;
     });
+  }
+
+  function shorten(text, limit) {
+    var one = String(text).replace(/\s+/g, " ").trim();
+    return one.length > limit ? one.slice(0, limit - 1) + "…" : one;
+  }
+
+  /* --------------------------------------------- the recent-run strip */
+  /* The last few completed runs are kept in memory -- the response object
+     itself, nothing persisted and nothing re-requested. Sliding back
+     re-renders a stored response into the same three panels; the newest
+     run appends and jumps to latest. There is no polling: the simulator
+     only ever runs when asked. */
+
+  function rememberRun(result) {
+    state.history.push({
+      result: result,
+      at: new Date(),
+      n_antennas: state.antennas.length,
+      n_sky: state.skySources.length,
+      n_rfi: state.rfiSources.length
+    });
+    while (state.history.length > HISTORY_MAX) { state.history.shift(); }
+    showRun(state.history.length - 1);
+  }
+
+  // Point the displays at one stored run. Everything the panels read off
+  // `state` (which masks are shown, which antenna, whether there are two
+  // receptors) is re-derived from that run, not carried over from another.
+  function showRun(index) {
+    if (index < 0 || index >= state.history.length) { return; }
+    var entry = state.history[index];
+    var result = entry.result;
+    state.historyIndex = index;
+    state.result = result;
+    state.maskVisible = result.sources.map(function () { return true; });
+    state.waterfallAntenna = clamp(
+      state.waterfallAntenna, 0, result.waterfall.antennas.length - 1
+    );
+    $("waterfall-pol-group").hidden = result.observation.n_pol !== 2;
+    renderRunStrip();
+    renderResults();
+  }
+
+  function clockOf(date) {
+    function pad(value) { return (value < 10 ? "0" : "") + value; }
+    return pad(date.getHours()) + ":" + pad(date.getMinutes())
+      + ":" + pad(date.getSeconds());
+  }
+
+  function plural(count, word) {
+    return count + " " + word + (count === 1 ? "" : "s");
+  }
+
+  function renderRunStrip() {
+    var strip = $("runs-strip");
+    var dots = $("runs-dots");
+    var total = state.history.length;
+    strip.hidden = total < 2;
+    // The dots are rebuilt on every change, so a keyboard user's place in
+    // them has to be handed back afterwards.
+    var hadFocus = dots.contains(document.activeElement);
+    while (dots.firstChild) { dots.removeChild(dots.firstChild); }
+    if (!total) {
+      $("runs-banner").hidden = true;
+      return;
+    }
+
+    state.history.forEach(function (entry, index) {
+      var dot = el("button", "run-dot" + (index === state.historyIndex ? " is-active" : ""));
+      dot.type = "button";
+      dot.title = "run " + (index + 1) + " of " + total + " — " + clockOf(entry.at);
+      dot.setAttribute("aria-label", dot.title);
+      dot.setAttribute("aria-pressed", String(index === state.historyIndex));
+      dot.addEventListener("click", function () { showRun(index); });
+      dot.addEventListener("keydown", function (event) {
+        // showRun rebuilds the dots and hands focus back to the new one.
+        if (event.key === "ArrowLeft" && index > 0) {
+          event.preventDefault();
+          showRun(index - 1);
+        } else if (event.key === "ArrowRight" && index < total - 1) {
+          event.preventDefault();
+          showRun(index + 1);
+        }
+      });
+      dots.appendChild(dot);
+    });
+    if (hadFocus) { focusDot(state.historyIndex); }
+
+    var current = state.history[state.historyIndex];
+    $("runs-meta").textContent = "run " + (state.historyIndex + 1) + " of " + total
+      + " — " + clockOf(current.at) + ", " + plural(current.n_antennas, "antenna")
+      + ", " + plural(current.n_sky, "source") + ", " + current.n_rfi + " RFI";
+
+    var stale = state.historyIndex < total - 1;
+    $("runs-banner").hidden = !stale;
+    if (stale) {
+      $("runs-banner-text").textContent = "Viewing an earlier run — run "
+        + (state.historyIndex + 1) + " of " + total + ", recorded at "
+        + clockOf(current.at) + ". The panels below show that run, not the newest one.";
+    }
+  }
+
+  function focusDot(index) {
+    var dot = $("runs-dots").children[index];
+    if (dot) { dot.focus(); }
   }
 
   /* -------------------------------------------------------- 8. displays */
@@ -2349,23 +2511,33 @@
       }
     });
 
-    var perSource = inField.map(function (source) {
+    // One row per source that landed in the field: what went in, what came
+    // back out, and where it sits. Numbers right-aligned, so the catalog
+    // and recovered columns can be read against each other.
+    var rows = inField.map(function (source) {
       var col = nearestIndex(image.l, source.l);
       var row = nearestIndex(image.m, source.m);
-      var recovered = image.values[row][col];
-      return source.name + ": " + recovered.toFixed(2) + " Jy recovered (catalog "
-        + source.flux_jy.toFixed(2) + ")";
+      return [
+        source.name,
+        source.flux_jy.toFixed(2),
+        image.values[row][col].toFixed(2),
+        "l " + source.l.toFixed(4) + ", m " + source.m.toFixed(4)
+      ];
     });
+    fillMetricTable(
+      $("image-recovered"),
+      ["source", "catalog Jy", "recovered Jy", "position"],
+      rows
+    );
+
     var peakLine = "brightest pixel: " + image.peak.value_jy.toFixed(3) + " Jy at l "
       + image.peak.l.toFixed(4) + ", m " + image.peak.m.toFixed(4);
-
-    $("image-sub").textContent = perSource.length ? perSource.join(" — ") : peakLine;
-    $("image-recovered").textContent = perSource.length ? peakLine : "";
+    $("image-sub").textContent = peakLine;
 
     var outsideNote = $("image-outside");
     if (outside.length) {
-      outsideNote.textContent = "Outside the imaged field: "
-        + outside.map(function (source) { return source.name; }).join(", ") + ".";
+      $("image-outside-text").textContent = "outside the imaged field: "
+        + outside.map(function (source) { return source.name; }).join(", ");
       outsideNote.hidden = false;
     } else {
       outsideNote.hidden = true;
@@ -2606,6 +2778,59 @@
     });
   }
 
+  /* The header links are a table of contents for one long page: clicking
+     one scrolls to its section, and the section you are actually looking
+     at wears the active pill. The pill follows the *topmost* section still
+     inside the band just under the header, which is the one a reader
+     thinks of as "where I am". */
+  function bindNav() {
+    var links = Array.prototype.slice.call(document.querySelectorAll(".navlink"));
+    var sections = links.map(function (link) {
+      return $(link.getAttribute("data-target"));
+    });
+
+    function setActive(link) {
+      links.forEach(function (other) {
+        if (other === link) {
+          other.classList.add("is-active");
+          other.setAttribute("aria-current", "true");
+        } else {
+          other.classList.remove("is-active");
+          other.removeAttribute("aria-current");
+        }
+      });
+    }
+
+    links.forEach(function (link, index) {
+      link.addEventListener("click", function (event) {
+        var section = sections[index];
+        if (!section) { return; }
+        event.preventDefault();
+        section.scrollIntoView({ behavior: "smooth", block: "start" });
+        setActive(link);   // immediate; the observer confirms it on arrival
+      });
+    });
+
+    setActive(links[0]);
+    if (!window.IntersectionObserver) { return; }
+
+    var onScreen = sections.map(function () { return false; });
+    var observer = new window.IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        var index = sections.indexOf(entry.target);
+        if (index >= 0) { onScreen[index] = entry.isIntersecting; }
+      });
+      for (var i = 0; i < onScreen.length; i += 1) {
+        if (onScreen[i]) { setActive(links[i]); return; }
+      }
+      // Nothing in the band (only possible mid-fling): leave the pill be.
+    }, { rootMargin: "-64px 0px -55% 0px", threshold: 0 });
+
+    sections.forEach(function (section) {
+      if (section) { observer.observe(section); }
+    });
+  }
+
   function bindControls() {
     var presetSelect = $("preset");
     PRESETS.forEach(function (preset) {
@@ -2668,6 +2893,13 @@
       state.hatch = event.target.checked;
       renderWaterfall();
     });
+
+    $("runs-banner-latest").addEventListener("click", function () {
+      showRun(state.history.length - 1);
+      $("section-run").scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+
+    bindNav();
 
     bindTooltip($("waterfall-canvas"));
     bindTooltip($("image-canvas"));
