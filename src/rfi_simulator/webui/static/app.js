@@ -233,7 +233,12 @@
     return fetch(path, options).then(function (response) {
       return response.json().catch(function () { return null; }).then(function (body) {
         if (response.ok) { return body; }
-        throw new Error(readProblem(body, response.status));
+        var error = new Error(readProblem(body, response.status));
+        // The status travels with the error so a caller can tell "the
+        // server is busy, try again" (429) apart from "this request is
+        // wrong" (422/other) without re-parsing the message text.
+        error.status = response.status;
+        throw error;
       });
     });
   }
@@ -2736,8 +2741,16 @@
       state.booted = true;
     }).catch(function (error) {
       stopElapsed();
-      showNotice("error", error.message);
-      setRunStatus("error", "failed   " + shorten(error.message, 60));
+      // A 429 means "the server is busy, not that this request was
+      // wrong" -- amber like an in-progress run, not red like a refusal,
+      // and never retried automatically: the reader presses Run again
+      // once the other one has actually finished.
+      if (error.status === 429) {
+        setRunStatus("warn", shorten(error.message, 60));
+      } else {
+        showNotice("error", error.message);
+        setRunStatus("error", "failed   " + shorten(error.message, 60));
+      }
     }).then(function () {
       state.running = false;
       state.booted = true;

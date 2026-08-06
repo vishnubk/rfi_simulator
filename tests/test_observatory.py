@@ -25,18 +25,25 @@ from astropy.time import Time  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from rfi_simulator.sky import lm_from_radec  # noqa: E402
-from rfi_simulator.webui import skynow  # noqa: E402
+from rfi_simulator.webui import observatory, skynow  # noqa: E402
 from rfi_simulator.webui.observatory import (  # noqa: E402
     CATALOG_SOURCES,
+    DAY_COST_BUDGET,
+    DAY_MAX_CONCURRENT_ENV_VAR,
+    DEFAULT_DAY_MAX_CONCURRENT,
     DEFAULT_DAY_WORKERS,
     JOB_MAX,
     MAX_FRAMES,
     QUIET_SUN_FLUX_JY,
+    DayBusyError,
     DayRequest,
+    _DaySlots,
     _JobStore,
     cancel_day,
     catalog_sources_in_field,
+    day_cost,
     day_frame,
+    day_max_concurrent,
     day_status,
     day_workers,
     jobs,
@@ -204,6 +211,32 @@ def test_a_source_on_the_strip_lands_in_the_field_at_transit():
     assert cyg["flux_jy"] == pytest.approx(1590.0)
     assert abs(cyg["m"]) < 1e-3
     assert abs(cyg["l"]) < 0.5 * 0.04
+
+
+def test_the_marked_transit_instants_are_refined_to_the_hundredth_of_a_degree():
+    """Finding 5: the naive ICRS-vs-apparent-LST estimate is off by ~828''.
+
+    `timeline_payload`'s transit markers must be polished with the same
+    solve `meridian_phase_center` itself uses, not left at the coarse
+    estimate: at the marked instant, the meridian really is at the
+    source's own right ascension, to well under the tolerance the
+    original (unrefined) estimate would have missed by more than twenty
+    times over.
+    """
+    location = EarthLocation.from_geodetic(
+        lon=SITE["longitude_deg"] * u.deg,
+        lat=SITE["latitude_deg"] * u.deg,
+        height=SITE["height_m"] * u.m,
+    )
+    for item in CATALOG_SOURCES:
+        payload = timeline_payload(DATE, item["dec_deg"], **SITE)
+        entry = [source for source in payload["sources"] if source["name"] == item["name"]][0]
+        for instant_str in entry["transits_utc"]:
+            when = Time(instant_str, scale="utc")
+            center = meridian_phase_center(location, when, item["dec_deg"])
+            diff = abs(center.ra.deg - item["ra_deg"]) % 360.0
+            diff = min(diff, 360.0 - diff)
+            assert diff < 0.01, f"{item['name']}: {diff} deg off at {instant_str}"
 
 
 def test_a_source_below_the_horizon_never_enters_the_field():
@@ -518,6 +551,153 @@ def test_the_aircraft_fetch_is_shared_between_callers():
     assert len(calls) == 1
 
 
+# ----------------------------------------------------------------------
+# Out-of-range and malformed feed rows must degrade, never 500 (finding 2)
+# ----------------------------------------------------------------------
+def test_an_out_of_range_latitude_row_is_skipped_not_fatal():
+    payload_dict = {
+        "ac": [
+            dict(CANNED_AIRCRAFT["ac"][0]),  # valid: TEST001
+            {"hex": "0000ff", "flight": "BADLAT", "lat": 91.5, "lon": 10.0, "alt_geom": 10000},
+        ]
+    }
+    payload = sky(aircraft_fetcher=lambda lat, lon: payload_dict)
+    callsigns = [item["callsign"] for item in payload["aircraft"]]
+    assert "TEST001" in callsigns
+    assert "BADLAT" not in callsigns
+    assert payload["layers"]["aircraft"]["status"] == "partial"
+    assert "skipped 1 malformed entry" in payload["layers"]["aircraft"]["note"]
+    # The rest of the sky is untouched by one bad row.
+    assert payload["sun"]["name"] == "Sun"
+
+
+def test_an_out_of_range_altitude_row_is_skipped():
+    payload_dict = {
+        "ac": [
+            dict(CANNED_AIRCRAFT["ac"][0]),
+            {
+                "hex": "0000fe",
+                "flight": "BADALT",
+                "lat": SITE["latitude_deg"],
+                "lon": SITE["longitude_deg"],
+                "alt_geom": 200_000,  # feet -- absurdly high, not a real cruise altitude
+            },
+        ]
+    }
+    payload = sky(aircraft_fetcher=lambda lat, lon: payload_dict)
+    callsigns = [item["callsign"] for item in payload["aircraft"]]
+    assert "BADALT" not in callsigns
+    assert payload["layers"]["aircraft"]["status"] == "partial"
+
+
+def test_a_longitude_outside_the_usual_range_is_normalized_not_skipped():
+    payload_dict = {
+        "ac": [
+            {
+                "hex": "0000fc",
+                "flight": "WRAPPED",
+                "lat": SITE["latitude_deg"],
+                "lon": SITE["longitude_deg"] + 360.0,
+                "alt_geom": 35000,
+            }
+        ]
+    }
+    payload = sky(aircraft_fetcher=lambda lat, lon: payload_dict)
+    callsigns = [item["callsign"] for item in payload["aircraft"]]
+    assert "WRAPPED" in callsigns
+    assert payload["layers"]["aircraft"]["status"] == "ok"
+
+
+def test_a_completely_broken_aircraft_parse_degrades_the_layer_not_the_response(monkeypatch):
+    def boom(payload, site):
+        raise RuntimeError("the feed's schema changed underneath us")
+
+    monkeypatch.setattr(skynow, "_parse_aircraft", boom)
+    payload = sky()
+    assert payload["layers"]["aircraft"]["status"] == "down"
+    assert payload["aircraft"] == []
+    # Ephemeris survives an aircraft-layer exception completely.
+    assert payload["sun"]["name"] == "Sun"
+    assert payload["moon"]["name"] == "Moon"
+    assert len(payload["sources"]) == len(CATALOG_SOURCES)
+
+
+def test_aircraft_parsing_is_capped_before_the_geometry_loop(monkeypatch):
+    """`AIRCRAFT_PARSE_CAP` must be applied before, not after, the per-row work.
+
+    Kept small here so the test itself stays fast; the point is the slice
+    happens ahead of the loop, not the exact number."""
+    monkeypatch.setattr(skynow, "AIRCRAFT_PARSE_CAP", 50)
+    lots = [
+        {
+            "hex": f"{i:06d}",
+            "lat": SITE["latitude_deg"],
+            "lon": SITE["longitude_deg"],
+            "alt_geom": 1000,
+        }
+        for i in range(80)
+    ]
+    lots[60]["flight"] = "PASTCAP"
+    payload = sky(aircraft_fetcher=lambda lat, lon: {"ac": lots})
+    callsigns = [item["callsign"] for item in payload["aircraft"]]
+    assert "PASTCAP" not in callsigns
+
+
+def test_fetch_aircraft_refuses_a_response_over_the_byte_cap(monkeypatch):
+    class _HugeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+        def read(self, size):
+            return b"x" * size  # always fills whatever is asked for
+
+    monkeypatch.setattr(skynow.urllib.request, "urlopen", lambda *a, **k: _HugeResponse())
+    with pytest.raises(ValueError, match="exceeded"):
+        skynow.fetch_aircraft(SITE["latitude_deg"], SITE["longitude_deg"])
+
+
+# ----------------------------------------------------------------------
+# RFI_SIMULATOR_NO_NETWORK disables every outbound fetch (finding 3)
+# ----------------------------------------------------------------------
+def test_no_network_env_var_treats_0_and_false_as_off(monkeypatch):
+    monkeypatch.setenv(skynow.NO_NETWORK_ENV_VAR, "0")
+    assert skynow._network_disabled() is False
+    monkeypatch.setenv(skynow.NO_NETWORK_ENV_VAR, "false")
+    assert skynow._network_disabled() is False
+    monkeypatch.setenv(skynow.NO_NETWORK_ENV_VAR, "1")
+    assert skynow._network_disabled() is True
+
+
+def test_no_network_env_var_blocks_the_aircraft_fetch(monkeypatch):
+    monkeypatch.setenv(skynow.NO_NETWORK_ENV_VAR, "1")
+    with pytest.raises(RuntimeError, match="network disabled"):
+        skynow.fetch_aircraft(SITE["latitude_deg"], SITE["longitude_deg"])
+
+
+def test_no_network_env_var_blocks_the_tle_group_fetch(monkeypatch):
+    monkeypatch.setenv(skynow.TLE_GROUP_ENV_VAR, "gps-ops")
+    monkeypatch.setenv(skynow.NO_NETWORK_ENV_VAR, "1")
+    with pytest.raises(RuntimeError, match="network disabled"):
+        skynow.load_elements()
+
+
+def test_no_network_env_var_degrades_the_monitor_but_keeps_ephemeris(monkeypatch):
+    monkeypatch.setenv(skynow.NO_NETWORK_ENV_VAR, "1")
+    skynow.clear_caches()
+    payload = skynow.sky_now(
+        SITE["latitude_deg"],
+        SITE["longitude_deg"],
+        SITE["height_m"],
+        now=Time("2026-08-05T04:00:00", scale="utc"),
+    )
+    assert payload["layers"]["aircraft"]["status"] == "down"
+    assert payload["sun"]["name"] == "Sun"
+    assert payload["moon"]["name"] == "Moon"
+
+
 def test_a_satellite_below_the_horizon_is_not_drawn():
     from rfi_simulator.satellites import read_tle_file
     from rfi_simulator.webui.simulate import _config_path
@@ -652,6 +832,40 @@ def test_the_monitor_endpoint_takes_the_site_it_is_given(client, monkeypatch):
     assert [item["callsign"] for item in payload["aircraft"]] == ["TEST001", "TEST002"]
 
 
+def test_the_sky_now_endpoint_survives_an_out_of_range_row(client, monkeypatch):
+    bad_payload = {
+        "ac": [
+            dict(CANNED_AIRCRAFT["ac"][0]),
+            {"hex": "0000fb", "flight": "BADLAT2", "lat": 91.5, "lon": 0.0, "alt_geom": 10000},
+        ]
+    }
+    monkeypatch.setattr(skynow, "fetch_aircraft", lambda lat, lon: bad_payload)
+    monkeypatch.setattr(skynow, "load_elements", lambda: [])
+    skynow.clear_caches()
+    response = client.get("/api/sky/now", params=SITE)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["layers"]["aircraft"]["status"] == "partial"
+    callsigns = [item["callsign"] for item in payload["aircraft"]]
+    assert "TEST001" in callsigns
+    assert "BADLAT2" not in callsigns
+
+
+def test_the_sky_now_endpoint_survives_a_totally_broken_aircraft_parse(client, monkeypatch):
+    def boom(payload, site):
+        raise RuntimeError("the feed's schema changed underneath us")
+
+    monkeypatch.setattr(skynow, "fetch_aircraft", lambda lat, lon: CANNED_AIRCRAFT)
+    monkeypatch.setattr(skynow, "load_elements", lambda: [])
+    monkeypatch.setattr(skynow, "_parse_aircraft", boom)
+    skynow.clear_caches()
+    response = client.get("/api/sky/now", params=SITE)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["layers"]["aircraft"]["status"] == "down"
+    assert payload["sun"]["name"] == "Sun"
+
+
 def test_the_page_offers_the_observatory_tab(client):
     page = client.get("/").text
     assert 'data-tab="observatory"' in page
@@ -663,6 +877,168 @@ def test_the_page_offers_the_observatory_tab(client):
 def _clear_day_store():
     yield
     jobs.clear()
+    # A test that fails partway through admission control must not leave
+    # the next test unable to start a day: the slot is process-wide state,
+    # the same way `jobs` is.
+    observatory._day_slots._used = 0
+
+
+# ----------------------------------------------------------------------
+# Admission control and the cost budget (finding 1)
+# ----------------------------------------------------------------------
+def test_day_max_concurrent_respects_the_env_var(monkeypatch):
+    monkeypatch.delenv(DAY_MAX_CONCURRENT_ENV_VAR, raising=False)
+    assert day_max_concurrent() == DEFAULT_DAY_MAX_CONCURRENT
+    monkeypatch.setenv(DAY_MAX_CONCURRENT_ENV_VAR, "3")
+    assert day_max_concurrent() == 3
+    monkeypatch.setenv(DAY_MAX_CONCURRENT_ENV_VAR, "not a number")
+    assert day_max_concurrent() == DEFAULT_DAY_MAX_CONCURRENT
+
+
+def test_the_default_budget_admits_only_one_build_at_a_time():
+    assert DEFAULT_DAY_MAX_CONCURRENT == 1
+    slots = _DaySlots()
+    assert slots.try_acquire() is True
+    assert slots.try_acquire() is False
+    slots.release()
+    assert slots.try_acquire() is True
+
+
+def test_a_second_day_is_refused_while_the_first_is_still_building():
+    """One slot, process-wide: five rapid requests must start one pool, not five.
+
+    A big frame count keeps the first build alive long enough for the
+    second `start_day` call to land while it is still running -- the same
+    approach `test_a_day_can_be_cancelled` uses.
+    """
+    first = start_day(tiny_day(n_frames=MAX_FRAMES), max_workers=2)
+    try:
+        with pytest.raises(DayBusyError, match="already building"):
+            start_day(tiny_day(n_frames=4))
+    finally:
+        cancel_day(first)
+        deadline = time.time() + 120.0
+        while time.time() < deadline:
+            if day_status(first)["state"] != "building":
+                break
+            time.sleep(0.1)
+
+    # Cancelling frees the slot promptly: a fresh build is admitted as
+    # soon as the cancelled one has actually stopped running frames.
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        if observatory._day_slots.try_acquire():
+            observatory._day_slots.release()
+            break
+        time.sleep(0.1)
+    else:
+        raise AssertionError("the slot was never freed after cancelling")
+
+    _, status = run_day(tiny_day(n_frames=4), max_workers=2)
+    assert status["state"] == "done"
+
+
+def test_the_day_endpoint_answers_429_when_a_build_is_already_running(client, monkeypatch):
+    monkeypatch.setenv("RFI_SIMULATOR_DAY_WORKERS", "2")
+    body = {
+        "setup": TINY_SETUP,
+        "date": DATE,
+        "pointing_dec_deg": SITE["latitude_deg"],
+        "n_frames": MAX_FRAMES,
+        "resolution": "coarse",
+    }
+    started = client.post("/api/observatory/day", json=body)
+    assert started.status_code == 200
+    job_id = started.json()["id"]
+    try:
+        # A burst of rapid follow-up requests: exactly the first is
+        # accepted, every other one is refused with a 429 naming the
+        # reason, and none of them started a process pool of its own --
+        # the admission-control slot bounds the child-process ceiling to
+        # one pool's worth, not five.
+        for _ in range(4):
+            busy = client.post("/api/observatory/day", json=dict(body, n_frames=4))
+            assert busy.status_code == 429
+            assert "already building" in busy.json()["detail"][0]["msg"]
+    finally:
+        cancelled = client.post(f"/api/observatory/day/{job_id}/cancel")
+        assert cancelled.status_code == 200
+        deadline = time.time() + 120.0
+        while time.time() < deadline:
+            status = client.get(f"/api/observatory/day/{job_id}").json()
+            if status["state"] != "building":
+                break
+            time.sleep(0.1)
+
+
+def test_day_cost_grows_with_antennas_squared_channels_blocks_and_frames():
+    request = tiny_day(n_frames=4)
+    baseline = day_cost(request)
+    doubled_antennas = tiny_day(
+        setup=dict(TINY_SETUP, antennas=TINY_SETUP["antennas"] + [[5.0, 5.0, 0.0]]), n_frames=4
+    )
+    assert day_cost(doubled_antennas) > baseline
+
+
+def test_the_default_coarse_day_clears_the_budget_easily():
+    request = DayRequest.model_validate(
+        {
+            "setup": {
+                "antennas": [[float(i) * 10.0, 0.0, 0.0] for i in range(10)],
+                "site": SITE,
+                "sky_sources": [],
+                "sim": {"n_chan": 128, "n_blocks": 8, "seed": 1},
+            },
+            "date": DATE,
+            "pointing_dec_deg": SITE["latitude_deg"],
+            "n_frames": 96,
+            "resolution": "coarse",
+        }
+    )
+    cost = day_cost(request)
+    assert cost < DAY_COST_BUDGET
+    assert cost * 10 < DAY_COST_BUDGET  # plenty of headroom, not a hair's width
+
+
+def test_an_oversized_fine_request_is_refused_naming_the_budget():
+    antennas = [[float(i % 16) * 10.0, float(i // 16) * 10.0, 0.0] for i in range(128)]
+    request = DayRequest.model_validate(
+        {
+            "setup": {
+                "antennas": antennas,
+                "site": SITE,
+                "sky_sources": [],
+                "sim": {"n_chan": 512, "n_blocks": 1, "seed": 1},
+            },
+            "date": DATE,
+            "pointing_dec_deg": SITE["latitude_deg"],
+            "n_frames": 288,
+            "resolution": "fine",
+        }
+    )
+    assert day_cost(request) > DAY_COST_BUDGET
+    with pytest.raises(ValueError) as excinfo:
+        start_day(request)
+    assert f"{DAY_COST_BUDGET:,}" in str(excinfo.value)
+
+
+def test_the_day_endpoint_refuses_an_oversized_fine_request_with_422(client):
+    antennas = [[float(i % 16) * 10.0, float(i // 16) * 10.0, 0.0] for i in range(128)]
+    body = {
+        "setup": {
+            "antennas": antennas,
+            "site": SITE,
+            "sky_sources": [],
+            "sim": {"n_chan": 512, "n_blocks": 1, "seed": 1},
+        },
+        "date": DATE,
+        "pointing_dec_deg": SITE["latitude_deg"],
+        "n_frames": 288,
+        "resolution": "fine",
+    }
+    response = client.post("/api/observatory/day", json=body)
+    assert response.status_code == 422
+    assert str(DAY_COST_BUDGET) in response.json()["detail"][0]["msg"].replace(",", "")
 
 
 def test_the_request_model_defends_its_bounds():

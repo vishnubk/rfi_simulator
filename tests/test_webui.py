@@ -28,6 +28,7 @@ from rfi_simulator import GaussianBeam, correlate, spectral_kurtosis_mask  # noq
 from rfi_simulator.metrics import flag_scores, pool_truth_accumulations  # noqa: E402
 from rfi_simulator.webui.server import (  # noqa: E402
     MAX_REQUEST_BYTES,
+    _simulation_slots,
     create_app,
 )
 from rfi_simulator.webui.simulate import (  # noqa: E402
@@ -419,6 +420,48 @@ def test_the_served_defaults_are_within_the_size_budget(defaults):
     )
     assert total <= MAX_TOTAL_SAMPLES
     assert defaults["limits"]["max_total_samples"] == MAX_TOTAL_SAMPLES
+
+
+# ----------------------------------------------------------------------
+# A busy simulation slot is refused, not queued (finding 6)
+# ----------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _release_simulation_slot_between_tests():
+    """A test that fails while holding the slot must not wedge every test after it."""
+    yield
+    try:
+        _simulation_slots.release()
+    except ValueError:
+        pass  # the slot was never taken; a BoundedSemaphore refuses an over-release
+
+
+def test_a_busy_simulation_slot_is_refused_with_429(client):
+    assert _simulation_slots.acquire(blocking=False)
+    try:
+        response = client.post("/api/simulate", json=make_request())
+        assert response.status_code == 429
+        assert "already running" in response.json()["detail"][0]["msg"]
+    finally:
+        _simulation_slots.release()
+    # The slot is free again immediately -- nothing was left queued behind it.
+    ok = client.post("/api/simulate", json=make_request())
+    assert ok.status_code == 200
+
+
+def test_a_busy_simulation_slot_also_refuses_the_flagger(client):
+    body = {
+        "request": make_request(),
+        "methods": ["mad"],
+        "antenna": 0,
+        "pol": 0,
+    }
+    assert _simulation_slots.acquire(blocking=False)
+    try:
+        response = client.post("/api/flag", json=body)
+        assert response.status_code == 429
+        assert "already running" in response.json()["detail"][0]["msg"]
+    finally:
+        _simulation_slots.release()
 
 
 def test_an_oversized_body_is_refused_before_it_is_read(client):

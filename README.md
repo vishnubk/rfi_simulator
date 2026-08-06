@@ -61,7 +61,7 @@ print(flag_scores(runs, truth))   # precision, recall, f1, mcc, false-positive r
 
 ## Web interface
 
-An interactive browser UI for exploring the simulator, built as a thin layer over the library that runs fully offline. It has three tabs.
+An interactive browser UI for exploring the simulator, built as a thin layer over the library. It has three tabs. Setup and Results are fully offline: every asset is served from this process and every computation runs locally, nothing leaves the machine.
 
 ```bash
 pip install -e '.[webui]'
@@ -79,6 +79,8 @@ rfi-simulator-ui --port 8765   # then open http://127.0.0.1:8765
 **Mock Observatory** turns the same setup into a day of drift-scan data: a frame-by-frame movie of the dirty image as the sky transits a fixed declination, built in parallel and scrubbable on a 24-hour timeline that marks when a real source is in the field, plus a live sky monitor charting what is actually above the site right now — ephemeris, satellites, and aircraft — that degrades gracefully to ephemeris-only when offline.
 
 ![Mock Observatory tab showing a day's drift-scan movie with a source in the field and its transit marked on the 24-hour timeline](assets/ui-observatory.png)
+
+The Mock Observatory's live sky monitor is the one part of this interface that is not offline: while that tab is open, the page polls the server every few seconds for what is overhead right now, and the server in turn queries a public ADS-B aggregator ([adsb.lol](https://adsb.lol)) — and, only if explicitly configured with a satellite catalogue group, a TLE service — sending the configured site's coordinates to look up nearby aircraft. Ephemeris (Sun, Moon, the bundled source catalogue) is always computed locally. To avoid the outbound requests entirely: don't open the Mock Observatory tab (the rest of the UI never makes them), or set the environment variable `RFI_SIMULATOR_NO_NETWORK=1` before starting the server, which disables every outbound fetch and lets the live monitor degrade gracefully to its offline layers instead.
 
 Under active development; documentation and datasets will be published as the project matures.
 

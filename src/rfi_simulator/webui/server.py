@@ -36,6 +36,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from rfi_simulator import __version__
 from rfi_simulator.webui.observatory import (
+    DayBusyError,
     DayRequest,
     cancel_day,
     day_frame,
@@ -91,9 +92,24 @@ One run is bounded by the request model's size cap; unbounded concurrency
 would multiply that bound by however many requests happen to arrive, so
 the rest queue instead. Single flight also keeps warning capture correct:
 `warnings.catch_warnings` swaps interpreter-global state, so two runs
-recording at once could attribute one request's warnings to the other."""
+recording at once could attribute one request's warnings to the other.
+
+The slot is taken non-blocking, not queued: a client that cannot get it
+is told so with a 429 rather than parked on a worker thread. Threaded
+servers have a finite thread pool, and a client that queues rather than
+being refused holds one of those threads for as long as the run in front
+of it takes; forty queued clicks was enough to freeze the page behind
+threads that were all just waiting."""
 
 _simulation_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SIMULATIONS)
+
+
+def _busy_response(message: str) -> JSONResponse:
+    """A 429 in the same ``{detail: [...]}`` shape as a 422, for the page."""
+    return JSONResponse(
+        status_code=429,
+        content={"detail": [{"loc": ["body"], "msg": message, "type": "value_error"}]},
+    )
 
 
 class ContentLengthLimitMiddleware:
@@ -296,23 +312,30 @@ def create_app(host: str | None = None, array_dir: str | Path | None = None) -> 
         own message, because it is a fault in the setup the user typed,
         not in the server.
 
-        Runs queue behind `MAX_CONCURRENT_SIMULATIONS`: the request model
-        bounds the memory of one run, and this is what keeps several
-        arriving at once from multiplying that bound.
+        Bounded by `MAX_CONCURRENT_SIMULATIONS`: the request model bounds
+        the memory of one run, and this is what keeps several arriving at
+        once from multiplying that bound. A request that arrives while the
+        slot is taken is refused with a 429 rather than queued, so it never
+        holds a server thread waiting for someone else's run.
 
         `pol` selects which receptor the waterfall display shows for a
         dual-polarization run (``n_pol=2``); it is ignored (fixed to 0)
         for a single-polarization one. The dirty image always images
         Stokes I regardless of `pol` -- see `run_simulation`.
         """
-        with _simulation_slots:
-            try:
-                return run_simulation(request, pol=pol)
-            except ValueError as exc:
-                return JSONResponse(
-                    status_code=422,
-                    content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]},
-                )
+        if not _simulation_slots.acquire(blocking=False):
+            return _busy_response(
+                "a simulation is already running -- wait for it to finish and try again"
+            )
+        try:
+            return run_simulation(request, pol=pol)
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]},
+            )
+        finally:
+            _simulation_slots.release()
 
     @app.post("/api/flag")
     def post_flag(request: FlagRequest) -> Any:
@@ -322,21 +345,28 @@ def create_app(host: str | None = None, array_dir: str | Path | None = None) -> 
         identifier of an earlier one: this server keeps no per-client
         state, and a run is reproducible from its seed, so re-simulating
         is what makes the flagged data provably the same data the page is
-        already showing. It queues behind the same
-        `MAX_CONCURRENT_SIMULATIONS` slot as a run, because it is one.
+        already showing. It shares the same `MAX_CONCURRENT_SIMULATIONS`
+        slot as a run, because it is one, and the same
+        429-rather-than-queue rule: a slot already taken is refused, not
+        waited for.
 
         A `ValueError` -- an antenna that does not exist in this array, an
         accumulation that would build too large a grid, or anything the
         library refuses -- comes back as a 422 with its own message.
         """
-        with _simulation_slots:
-            try:
-                return run_flaggers(request)
-            except ValueError as exc:
-                return JSONResponse(
-                    status_code=422,
-                    content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]},
-                )
+        if not _simulation_slots.acquire(blocking=False):
+            return _busy_response(
+                "a simulation is already running -- wait for it to finish and try again"
+            )
+        try:
+            return run_flaggers(request)
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]},
+            )
+        finally:
+            _simulation_slots.release()
 
     @app.post("/api/observatory/day")
     def post_observatory_day(request: DayRequest) -> Any:
@@ -347,9 +377,16 @@ def create_app(host: str | None = None, array_dir: str | Path | None = None) -> 
         of work, and no browser should hold a request open for that. The
         page polls `get_observatory_day` and reads finished frames one at
         a time.
+
+        Refused with a 422 if the request's cost estimate is over budget
+        (see `rfi_simulator.webui.observatory.DAY_COST_BUDGET`), and with a
+        429 if a day is already building (see `day_max_concurrent`) --
+        cancel it or wait, then try again.
         """
         try:
             job_id = start_day(request)
+        except DayBusyError as exc:
+            return _busy_response(str(exc))
         except ValueError as exc:
             return JSONResponse(
                 status_code=422,

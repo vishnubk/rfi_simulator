@@ -75,8 +75,12 @@ from rfi_simulator.webui.simulate import (
 
 __all__ = [
     "CATALOG_SOURCES",
+    "DAY_COST_BUDGET",
+    "DAY_MAX_CONCURRENT_ENV_VAR",
     "DAY_WORKERS_ENV_VAR",
+    "DEFAULT_DAY_MAX_CONCURRENT",
     "DEFAULT_DAY_WORKERS",
+    "DayBusyError",
     "DayRequest",
     "JOB_MAX",
     "JOB_TTL_S",
@@ -84,7 +88,9 @@ __all__ = [
     "QUIET_SUN_FLUX_JY",
     "cancel_day",
     "catalog_sources_in_field",
+    "day_cost",
     "day_frame",
+    "day_max_concurrent",
     "day_status",
     "day_workers",
     "jobs",
@@ -183,6 +189,99 @@ def day_workers() -> int:
 
 
 # ----------------------------------------------------------------------
+# Admission control -- one day building at a time, by default
+# ----------------------------------------------------------------------
+DAY_MAX_CONCURRENT_ENV_VAR = "RFI_SIMULATOR_DAY_MAX_CONCURRENT"
+"""str: Environment variable overriding `DEFAULT_DAY_MAX_CONCURRENT`."""
+
+DEFAULT_DAY_MAX_CONCURRENT = 1
+"""int: Day builds allowed to run at once, process-wide.
+
+Each running build owns a `ProcessPoolExecutor` of up to `day_workers()`
+processes, so this is what keeps twenty rapid ``POST`` requests from
+starting twenty pools -- `JOB_MAX` bounds how many *finished* days are
+kept in memory, not how many are being built right now, which is the gap
+this closes."""
+
+DAY_COST_BUDGET = 250_000_000
+"""int: Largest `day_cost` a day request may have.
+
+The proxy is ``n_antennas**2 * n_chan * n_blocks * n_frames`` -- antennas
+squared because correlating and imaging scale with the number of
+baselines, not the number of receivers, and everything else because it is
+what the request actually asks a worker to repeat once per frame. Picked
+so that the default 96-frame day at the bundled 10-element array (a few
+hundred thousand) and even a full 288-frame *coarse* day at the largest
+array this front end allows (order 1.5e8) clear it easily, while the
+budget the audit demonstrated -- 288 fine-resolution frames at 128
+antennas and 512 channels, order 2e10 -- misses it by two orders of
+magnitude. ``fine`` stays available for the arrays and frame counts a
+laptop can actually carry."""
+
+
+def day_max_concurrent() -> int:
+    """Day builds allowed at once, honouring `DAY_MAX_CONCURRENT_ENV_VAR`."""
+    raw = os.environ.get(DAY_MAX_CONCURRENT_ENV_VAR)
+    if not raw:
+        return DEFAULT_DAY_MAX_CONCURRENT
+    try:
+        value = int(raw)
+    except ValueError:
+        return DEFAULT_DAY_MAX_CONCURRENT
+    return max(1, value)
+
+
+class DayBusyError(RuntimeError):
+    """Raised by `start_day` when the admission-control slot is taken."""
+
+
+class _DaySlots:
+    """How many days are building at once, independent of the job store.
+
+    A day being built owns a live process pool; a day merely stored is a
+    few megabytes of arrays. `JOB_MAX` bounds the latter. This bounds the
+    former, checked and incremented under one lock so that two racing
+    requests cannot both see a free slot.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._used = 0
+
+    def try_acquire(self) -> bool:
+        with self._lock:
+            if self._used >= day_max_concurrent():
+                return False
+            self._used += 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            self._used = max(0, self._used - 1)
+
+
+_day_slots = _DaySlots()
+
+
+def _effective_chan_blocks(request: DayRequest) -> tuple[int, int]:
+    """The channel and integration counts a frame is actually computed at.
+
+    Mirrors `DayRequest.frame_setup`'s coarse reduction, without building a
+    frame's `SimulateRequest` -- this is called before a day is admitted at
+    all, so it must not do any of the work it is trying to bound."""
+    if request.resolution == "coarse":
+        return min(int(request.setup.sim.n_chan), COARSE_N_CHAN), COARSE_N_BLOCKS
+    return int(request.setup.sim.n_chan), int(request.setup.sim.n_blocks)
+
+
+def day_cost(request: DayRequest) -> int:
+    """The proxy `DAY_COST_BUDGET` is checked against. See its docstring."""
+    n_chan, n_blocks = _effective_chan_blocks(request)
+    n_antennas = len(request.setup.antennas)
+    return n_antennas * n_antennas * n_chan * n_blocks * request.n_frames
+
+
+# ----------------------------------------------------------------------
 # Geometry shared by the movie and the monitor
 # ----------------------------------------------------------------------
 def site_coordinates(request: SimulateRequest | None = None) -> tuple[float, float, float]:
@@ -264,6 +363,35 @@ def meridian_phase_center(location: EarthLocation, time: Time, dec_deg: float) -
         residual = (lst_deg - float(of_date.ra.deg) + 180.0) % 360.0 - 180.0
         ra_deg = (ra_deg + residual) % 360.0
     return SkyCoord(ra=ra_deg * u.deg, dec=dec, frame="icrs")
+
+
+SIDEREAL_SECONDS_PER_DAY = 86164.0905
+"""float: Length of a sidereal day, seconds -- the rate the meridian's
+ICRS right ascension advances at, used to convert an hour-angle residual
+into a time correction in `_refine_transit`."""
+
+
+def _refine_transit(location: EarthLocation, guess: Time, ra_deg: float, dec_deg: float) -> Time:
+    """Polish a transit-time guess to the precision `meridian_phase_center` has.
+
+    The cheap estimate this replaces compares the *ICRS* right ascension
+    against the *apparent* (equator-of-date) sidereal time directly, which
+    is the same precession the module docstring's Newton solve exists to
+    avoid -- left uncorrected here it marks a transit as much as a minute
+    off. This asks `meridian_phase_center` the question it already answers
+    exactly -- which ICRS right ascension is on the meridian at a given
+    time -- and inverts it: the meridian's right ascension advances at
+    very nearly the sidereal rate, so a couple of corrections by
+    ``(target - actual) / rate`` converge to a small fraction of a second
+    of time.
+    """
+    time = guess
+    for _ in range(2):
+        center = meridian_phase_center(location, time, dec_deg)
+        residual_deg = ((ra_deg - center.ra.deg + 180.0) % 360.0) - 180.0
+        seconds = residual_deg / 360.0 * SIDEREAL_SECONDS_PER_DAY
+        time = time + TimeDelta(seconds, format="sec")
+    return time
 
 
 def _altitude_deg(coord: SkyCoord, time: Time, location: EarthLocation) -> np.ndarray:
@@ -601,54 +729,60 @@ def _release_pool(pool: ProcessPoolExecutor | None) -> None:
 
 
 def _drive(job: _DayJob, max_workers: int) -> None:
-    """Compute every frame of `job` in a pool, filling slots as they land."""
+    """Compute every frame of `job` in a pool, filling slots as they land.
+
+    Always releases the admission-control slot `start_day` took, in a
+    ``finally``: whatever else goes wrong, the next request must be able
+    to build a day."""
     spec = job.request.model_dump()
     pool: ProcessPoolExecutor | None = None
     try:
-        pool = ProcessPoolExecutor(max_workers=max_workers, mp_context=_worker_context())
-        futures = {pool.submit(compute_frame, spec, index): index for index in range(job.total)}
-        # Frames are collected as they land rather than in order, so
-        # the progress the page shows is the work actually finished.
-        for future in as_completed(futures):
-            index = futures[future]
-            if job.cancelled.is_set():
-                for pending in futures:
-                    pending.cancel()
-                break
-            try:
-                frame = future.result()
-            except Exception as exc:  # noqa: BLE001 - a worker that died
-                frame = {
-                    "index": index,
-                    "utc": None,
-                    "sources": [],
-                    "image": None,
-                    "vmin_jy": None,
-                    "vmax_jy": None,
-                    "rms_jy": None,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
+        try:
+            pool = ProcessPoolExecutor(max_workers=max_workers, mp_context=_worker_context())
+            futures = {pool.submit(compute_frame, spec, index): index for index in range(job.total)}
+            # Frames are collected as they land rather than in order, so
+            # the progress the page shows is the work actually finished.
+            for future in as_completed(futures):
+                index = futures[future]
+                if job.cancelled.is_set():
+                    for pending in futures:
+                        pending.cancel()
+                    break
+                try:
+                    frame = future.result()
+                except Exception as exc:  # noqa: BLE001 - a worker that died
+                    frame = {
+                        "index": index,
+                        "utc": None,
+                        "sources": [],
+                        "image": None,
+                        "vmin_jy": None,
+                        "vmax_jy": None,
+                        "rms_jy": None,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                with jobs.lock:
+                    job.frames[index] = frame
+                    job.done += 1
+                    if frame.get("error"):
+                        job.failed += 1
+        except Exception as exc:  # noqa: BLE001 - the pool itself failed
             with jobs.lock:
-                job.frames[index] = frame
-                job.done += 1
-                if frame.get("error"):
-                    job.failed += 1
-    except Exception as exc:  # noqa: BLE001 - the pool itself failed
+                job.state = "failed"
+                job.error = f"{type(exc).__name__}: {exc}"
+            return
+        # The day is finished the moment its last frame is in hand. Settling
+        # the state here rather than after the pool has been joined is the
+        # whole point of `_release_pool`: a worker that lingers must not be
+        # able to leave a finished day reading "building".
         with jobs.lock:
-            job.state = "failed"
-            job.error = f"{type(exc).__name__}: {exc}"
+            if job.cancelled.is_set():
+                job.state = "cancelled"
+            elif job.state == "building":
+                job.state = "done"
+    finally:
         _release_pool(pool)
-        return
-    # The day is finished the moment its last frame is in hand. Settling
-    # the state here rather than after the pool has been joined is the
-    # whole point of `_release_pool`: a worker that lingers must not be
-    # able to leave a finished day reading "building".
-    with jobs.lock:
-        if job.cancelled.is_set():
-            job.state = "cancelled"
-        elif job.state == "building":
-            job.state = "done"
-    _release_pool(pool)
+        _day_slots.release()
 
 
 def start_day(request: DayRequest, *, max_workers: int | None = None) -> str:
@@ -666,14 +800,43 @@ def start_day(request: DayRequest, *, max_workers: int | None = None) -> str:
     -------
     str
         The job identifier to poll.
+
+    Raises
+    ------
+    ValueError
+        The request's `day_cost` exceeds `DAY_COST_BUDGET`.
+    DayBusyError
+        A day is already building; `day_max_concurrent` (default one)
+        builds are allowed at once. Cancelling the running day, or
+        waiting for it to finish, frees the slot.
     """
-    job = _DayJob(uuid.uuid4().hex, request)
-    jobs.add(job)
-    workers = day_workers() if max_workers is None else max(1, int(max_workers))
-    thread = threading.Thread(
-        target=_drive, args=(job, min(workers, job.total)), name=f"day-{job.id[:8]}", daemon=True
-    )
-    thread.start()
+    cost = day_cost(request)
+    if cost > DAY_COST_BUDGET:
+        raise ValueError(
+            f"this day would cost about {cost:,} (antennas squared x channels x "
+            f"integrations x frames, at the requested resolution), more than the "
+            f"{DAY_COST_BUDGET:,} this server budgets for one day: reduce n_frames, "
+            "switch to coarse resolution, or use fewer antennas, channels or integrations"
+        )
+    if not _day_slots.try_acquire():
+        raise DayBusyError(
+            "a day is already building -- cancel it or wait for it to finish before "
+            "starting another"
+        )
+    try:
+        job = _DayJob(uuid.uuid4().hex, request)
+        jobs.add(job)
+        workers = day_workers() if max_workers is None else max(1, int(max_workers))
+        thread = threading.Thread(
+            target=_drive,
+            args=(job, min(workers, job.total)),
+            name=f"day-{job.id[:8]}",
+            daemon=True,
+        )
+        thread.start()
+    except Exception:
+        _day_slots.release()
+        raise
     return job.id
 
 
@@ -929,12 +1092,24 @@ def timeline_payload(
         # ascension. Sidereal time runs fast against the clock by the ratio
         # of the solar to the sidereal day, so a calendar day holds one
         # transit, or two when the first falls in the first four minutes.
+        # This first pass compares the ICRS right ascension against the
+        # *apparent* sidereal time directly, which is off by the same
+        # precession `meridian_phase_center` exists to solve for -- honest
+        # only as a coarse guess, which `_refine_transit` then polishes.
         offset_deg = (item["ra_deg"] - lst_start_deg) % 360.0
         first_hours = offset_deg / 360.0 * SIDEREAL_DAY_HOURS
         transits_hours = [first_hours]
         if first_hours + SIDEREAL_DAY_HOURS < 24.0:
             transits_hours.append(first_hours + SIDEREAL_DAY_HOURS)
-        instants = [start + TimeDelta(hours * 3600.0, format="sec") for hours in transits_hours]
+        instants = [
+            _refine_transit(
+                location,
+                start + TimeDelta(hours * 3600.0, format="sec"),
+                item["ra_deg"],
+                item["dec_deg"],
+            )
+            for hours in transits_hours
+        ]
         # At transit the source sits at l = 0, so whether the strip ever
         # sees it is entirely a question of declination.
         separation_deg = abs(item["dec_deg"] - float(dec_deg))

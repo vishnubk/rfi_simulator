@@ -61,10 +61,13 @@ from rfi_simulator.webui.observatory import (
 
 __all__ = [
     "AIRCRAFT_CACHE_S",
+    "AIRCRAFT_MAX_RESPONSE_BYTES",
+    "AIRCRAFT_PARSE_CAP",
     "AIRCRAFT_RADIUS_NM",
     "AIRCRAFT_URL",
     "MAX_AIRCRAFT",
     "NETWORK_TIMEOUT_S",
+    "NO_NETWORK_ENV_VAR",
     "TLE_CACHE_S",
     "TLE_GROUP_ENV_VAR",
     "fetch_aircraft",
@@ -115,12 +118,45 @@ MAX_SATELLITES = 60
 
 FEET_TO_M = 0.3048
 
+AIRCRAFT_MAX_RESPONSE_BYTES = 2_000_000
+"""int: Largest aircraft-feed response read. A well-formed reply near a
+busy airport is a few hundred kilobytes; a reply anywhere near this limit
+is either a corridor with tens of thousands of reports or something that
+is not the expected feed at all, and either way this process should read
+it as "unusable" rather than as however many bytes it feels like sending.
+The read is capped rather than trusted to stop on its own -- `read(n)`
+with an explicit `n`, not a bare `read()`."""
+
+AIRCRAFT_PARSE_CAP = 2_000
+"""int: Most aircraft entries parsed out of one feed response, before the
+per-entry geometry (an `EarthLocation` and a frame rotation each). A
+corridor feed can list on the order of ten thousand aircraft; parsing all
+of them before keeping only the nearest `MAX_AIRCRAFT` costs tens of
+seconds of a worker thread for a number the chart never shows. The slice
+happens before the geometry loop, not after, for that reason -- it trades
+"exactly the nearest `MAX_AIRCRAFT`" for "bounded work per request", which
+is the only one of those two a monitor refreshed every few seconds can
+afford."""
+
+NO_NETWORK_ENV_VAR = "RFI_SIMULATOR_NO_NETWORK"
+"""str: Set (to anything but ``""``, ``"0"`` or ``"false"``) to refuse
+every outbound fetch this module makes -- the aircraft feed and, if
+`TLE_GROUP_ENV_VAR` names one, the element-set catalogue -- without
+attempting the network call at all. For a shared or offline host where
+even a fast-failing outbound request is unwelcome."""
+
+
+def _network_disabled() -> bool:
+    return os.environ.get(NO_NETWORK_ENV_VAR, "").strip().lower() not in ("", "0", "false")
+
 
 # ----------------------------------------------------------------------
 # Fetchers -- everything that can touch the network, in one place
 # ----------------------------------------------------------------------
 def fetch_aircraft(latitude_deg: float, longitude_deg: float) -> dict[str, Any]:
     """One live transponder query. Raises on any network trouble."""
+    if _network_disabled():
+        raise RuntimeError(f"outbound network disabled ({NO_NETWORK_ENV_VAR} is set)")
     url = AIRCRAFT_URL.format(
         lat=f"{float(latitude_deg):.4f}",
         lon=f"{float(longitude_deg):.4f}",
@@ -128,7 +164,13 @@ def fetch_aircraft(latitude_deg: float, longitude_deg: float) -> dict[str, Any]:
     )
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
     with urllib.request.urlopen(request, timeout=NETWORK_TIMEOUT_S) as response:  # noqa: S310
-        return json.loads(response.read().decode("utf-8"))
+        raw = response.read(AIRCRAFT_MAX_RESPONSE_BYTES + 1)
+    if len(raw) > AIRCRAFT_MAX_RESPONSE_BYTES:
+        raise ValueError(
+            f"aircraft feed response exceeded {AIRCRAFT_MAX_RESPONSE_BYTES} bytes; refusing "
+            "a truncated read"
+        )
+    return json.loads(raw.decode("utf-8"))
 
 
 def load_elements() -> list[Any]:
@@ -142,6 +184,8 @@ def load_elements() -> list[Any]:
 
     group = os.environ.get(TLE_GROUP_ENV_VAR, "").strip()
     if group:
+        if _network_disabled():
+            raise RuntimeError(f"outbound network disabled ({NO_NETWORK_ENV_VAR} is set)")
         cache_dir = os.environ.get(TLE_CACHE_DIR_ENV_VAR) or "~/.cache/rfi-simulator-tles"
         return fetch_tles(group, cache_dir, timeout_s=NETWORK_TIMEOUT_S)
 
@@ -239,25 +283,60 @@ def _aircraft_altaz(
     return _enu_to_altaz(enu_from_ecef_offset(delta, site))
 
 
-def _parse_aircraft(payload: dict[str, Any], site: EarthLocation) -> list[dict[str, Any]]:
+MIN_AIRCRAFT_ALTITUDE_M = -500.0
+"""float: Below the lowest dry land on Earth, with margin -- a barometric
+reading a good deal below this is a bad report, not a real aircraft."""
+
+MAX_AIRCRAFT_ALTITUDE_M = 30_000.0
+"""float: Well above any civil traffic (cruise is under 13 km); a reading
+past this is a bad report, not an aircraft, and must not reach
+`EarthLocation.from_geodetic` at all -- see finding 2 in the audit that
+put this cap here: an out-of-range latitude reached that call unguarded
+and 500'd the whole endpoint, poisoning the response cache with it."""
+
+
+def _parse_aircraft(
+    payload: dict[str, Any], site: EarthLocation
+) -> tuple[list[dict[str, Any]], int]:
     """Turn one aggregator response into horizon coordinates.
 
     Defensive throughout: the feed is somebody else's schema, entries with
-    no position or a non-numeric one are skipped rather than trusted, and
-    ``"ground"`` -- which the feed uses instead of a number for an
-    aircraft that is not flying -- becomes zero.
+    no position, a non-numeric one, or one outside a physically sane range
+    are skipped rather than trusted, and ``"ground"`` -- which the feed
+    uses instead of a number for an aircraft that is not flying -- becomes
+    zero. Only the first `AIRCRAFT_PARSE_CAP` entries are looked at, so
+    that a feed reporting far more aircraft than this chart can draw costs
+    a bounded amount of work rather than one pass over everything it sent.
+
+    Returns
+    -------
+    tuple of (list of dict, int)
+        The parsed entries, nearest first, and how many raw entries were
+        skipped as malformed or out of range.
     """
     entries: list[dict[str, Any]] = []
-    for item in payload.get("ac") or []:
+    skipped = 0
+    for item in (payload.get("ac") or [])[:AIRCRAFT_PARSE_CAP]:
         if not isinstance(item, dict):
+            skipped += 1
             continue
         try:
             latitude = float(item["lat"])
             longitude = float(item["lon"])
         except (KeyError, TypeError, ValueError):
+            skipped += 1
             continue
         if not (math.isfinite(latitude) and math.isfinite(longitude)):
+            skipped += 1
             continue
+        if not (-90.0 <= latitude <= 90.0):
+            skipped += 1
+            continue
+        # A longitude outside +/-180 is not malformed the way an
+        # out-of-range latitude is -- it is the same meridian written a
+        # multiple of a full turn away -- so it is normalized rather than
+        # dropped.
+        longitude = ((longitude + 180.0) % 360.0) - 180.0
         altitude_ft = item.get("alt_geom", item.get("alt_baro"))
         if altitude_ft == "ground" or altitude_ft is None:
             altitude_m = 0.0
@@ -266,6 +345,9 @@ def _parse_aircraft(payload: dict[str, Any], site: EarthLocation) -> list[dict[s
                 altitude_m = float(altitude_ft) * FEET_TO_M
             except (TypeError, ValueError):
                 altitude_m = 0.0
+        if not (MIN_AIRCRAFT_ALTITUDE_M <= altitude_m <= MAX_AIRCRAFT_ALTITUDE_M):
+            skipped += 1
+            continue
         altitude_deg, azimuth_deg, distance_m = _aircraft_altaz(
             site, latitude, longitude, altitude_m
         )
@@ -286,7 +368,7 @@ def _parse_aircraft(payload: dict[str, Any], site: EarthLocation) -> list[dict[s
             }
         )
     entries.sort(key=lambda entry: entry["range_km"])
-    return entries[:MAX_AIRCRAFT]
+    return entries[:MAX_AIRCRAFT], skipped
 
 
 def _satellites(elements: list[Any], now: Time, site: EarthLocation) -> list[dict[str, Any]]:
@@ -412,12 +494,29 @@ def sky_now(
             "detail": aircraft_error,
         }
     else:
-        aircraft = _parse_aircraft(payload if isinstance(payload, dict) else {}, site)
-        layers["aircraft"] = {
-            "status": "ok",
-            "note": f"{len(aircraft)} within {AIRCRAFT_RADIUS_NM} nautical miles",
-            "age_s": round(aircraft_age, 1),
-        }
+        # The fetch already succeeded, but parsing it is not trusted
+        # either: the feed is somebody else's schema, and a row this
+        # process cannot make sense of must degrade the layer, never the
+        # whole response. `_parse_aircraft` already skips what it can
+        # recognise as bad; this catches whatever it cannot.
+        try:
+            aircraft, skipped = _parse_aircraft(payload if isinstance(payload, dict) else {}, site)
+        except Exception as exc:  # noqa: BLE001 - any failure is "layer down"
+            aircraft = []
+            layers["aircraft"] = {
+                "status": "down",
+                "note": "live aircraft feed could not be read",
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
+        else:
+            note = f"{len(aircraft)} within {AIRCRAFT_RADIUS_NM} nautical miles"
+            if skipped:
+                note += f" (skipped {skipped} malformed {'entry' if skipped == 1 else 'entries'})"
+            layers["aircraft"] = {
+                "status": "partial" if skipped else "ok",
+                "note": note,
+                "age_s": round(aircraft_age, 1),
+            }
 
     zone = resolve_zone(float(latitude_deg), float(longitude_deg))
     return {
