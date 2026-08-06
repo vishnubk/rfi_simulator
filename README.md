@@ -61,12 +61,24 @@ print(flag_scores(runs, truth))   # precision, recall, f1, mcc, false-positive r
 
 ## Web interface
 
-An interactive browser UI for exploring the simulator — edit the antenna layout on a site plan, add sky and RFI sources, and view per-antenna waterfalls (with ground-truth RFI mask overlays), the dirty image, and uv coverage. It is a thin layer over the library and runs fully offline.
+An interactive browser UI for exploring the simulator, built as a thin layer over the library that runs fully offline. It has three tabs.
 
 ```bash
 pip install -e '.[webui]'
 rfi-simulator-ui --port 8765   # then open http://127.0.0.1:8765
 ```
+
+![Results tab showing per-antenna dynamic spectra, a ground-truth RFI overlay, and classical-flagger scoring](assets/ui-results.png)
+
+**Setup** is where the observation is built: an array editor with a clickable site plan of dish markers, presets for common layouts, and compact cards for adding sky sources and each kind of interference (a narrowband tower, a satellite pass, an aircraft, broadband bursts, a harmonic comb). Instrument imperfections — antenna gains, bandpass shape, quantization, channelizer response, dual polarization, calibration errors, primary beam — are each an explicit toggle, all off by default so the ideal instrument is always one switch away.
+
+![Setup tab showing the site plan with dish markers, sky and interference source cards, and instrument toggles](assets/ui-setup.png)
+
+**Results** shows the run at three levels: per-antenna dynamic spectra and bandpass after channelization, visibility amplitudes and per-baseline spectra after correlation, and the dirty image with its uv coverage. Ground-truth interference and spectral-line masks can be overlaid at every level, alongside chips for the classical flaggers (spectral kurtosis, sigma clipping, SumThreshold) scored against that same ground truth.
+
+**Mock Observatory** turns the same setup into a day of drift-scan data: a frame-by-frame movie of the dirty image as the sky transits a fixed declination, built in parallel and scrubbable on a 24-hour timeline that marks when a real source is in the field, plus a live sky monitor charting what is actually above the site right now — ephemeris, satellites, and aircraft — that degrades gracefully to ephemeris-only when offline.
+
+![Mock Observatory tab showing a day's drift-scan movie with a source in the field and its transit marked on the 24-hour timeline](assets/ui-observatory.png)
 
 Under active development; documentation and datasets will be published as the project matures.
 
