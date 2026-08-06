@@ -13,9 +13,14 @@ status and the page says which is which.
   the set it used is.
 * **Aircraft** come from a public transponder aggregator over the
   network, which is the only thing here that can be down. It is fetched
-  with a hard timeout and cached for a few seconds across every client,
-  and when it fails the layer is simply absent with a status saying so.
-  The chart still draws.
+  with a hard timeout and cached for a few seconds across every client at
+  a coarsened coordinate (see `AIRCRAFT_CACHE_PRECISION_DEG`), and a
+  separate global gate (`AIRCRAFT_FETCH_MIN_INTERVAL_S`) limits how often
+  this process fetches at all, regardless of coordinate -- so this server
+  cannot become an unthrottled prober against someone else's API just
+  because clients ask about different sites. A layer whose fetch failed
+  or was throttled comes back empty with a status saying which. The chart
+  still draws.
 
 Degrading honestly is the whole design: a failed layer is reported as
 failed, never as an empty sky.
@@ -60,7 +65,9 @@ from rfi_simulator.webui.observatory import (
 )
 
 __all__ = [
+    "AIRCRAFT_CACHE_PRECISION_DEG",
     "AIRCRAFT_CACHE_S",
+    "AIRCRAFT_FETCH_MIN_INTERVAL_S",
     "AIRCRAFT_MAX_RESPONSE_BYTES",
     "AIRCRAFT_PARSE_CAP",
     "AIRCRAFT_RADIUS_NM",
@@ -91,6 +98,38 @@ refreshes every ten seconds must never block for longer than a refresh."""
 AIRCRAFT_CACHE_S = 10.0
 """float: How long one aircraft fetch is shared for. Matches the page's
 poll interval, so N browsers cost one request per interval, not N."""
+
+AIRCRAFT_CACHE_PRECISION_DEG = 1
+"""int: Decimal places the aircraft cache key is rounded to.
+
+A tenth of a degree is about 11 km at the equator -- well under
+`AIRCRAFT_RADIUS_NM` (100 nautical miles, ~185 km) -- so two viewers that
+close in practice see the same feed anyway; sharing one fetch between them
+is not an approximation the chart's radius can tell apart. Rounding any
+finer than this (the previous key was three decimal places, ~110 m) meant
+a client could force a fresh outbound fetch on every poll just by jittering
+its coordinate a few metres, defeating `AIRCRAFT_CACHE_S` entirely and
+turning this process into an unthrottled prober against someone else's
+API -- see `AIRCRAFT_FETCH_MIN_INTERVAL_S` for the other half of that
+fix, which holds even across different cache keys."""
+
+AIRCRAFT_FETCH_MIN_INTERVAL_S = 5.0
+"""float: Minimum time between OUTBOUND aircraft fetches, across every
+cache key, process-wide.
+
+`_aircraft_cache` (keyed on the coordinate, coarsened to
+`AIRCRAFT_CACHE_PRECISION_DEG`) already dedupes repeated requests for one
+site. This is what stops that from being sidestepped by requesting a
+*different* site every time: without it, a client moving the query
+coordinate by more than the cache's rounding grid on every poll could
+force a fresh fetch each time, same as before the key was coarsened. A
+request that misses the cache within this window of the last actual
+fetch is answered "throttled" -- an empty aircraft layer with a status
+saying so -- rather than by fetching anyway. That is the simplest option
+that is still honest: it never invents aircraft, and it never hides that
+a poll was skipped; it costs a viewer at a genuinely different, rapidly
+changing site a delayed update rather than an unbounded number of them
+each costing one outbound request."""
 
 TLE_CACHE_S = 6.0 * 3600.0
 """float: How long a parsed element set is reused for. Elements are
@@ -241,10 +280,48 @@ _aircraft_cache = _TimedCache(AIRCRAFT_CACHE_S)
 _element_cache = _TimedCache(TLE_CACHE_S)
 
 
+class _AircraftThrottled(RuntimeError):
+    """Raised instead of fetching, when the global outbound gate is shut."""
+
+
+class _AircraftFetchGate:
+    """The global, cross-key throttle on outbound aircraft fetches.
+
+    Reserves the next fetch slot itself, before the network call is made:
+    two threads racing a cache miss for two different keys must not both
+    see the gate open and both fetch, which checking the timestamp without
+    reserving it first would allow.
+    """
+
+    def __init__(self, min_interval_s: float) -> None:
+        self.min_interval_s = min_interval_s
+        self._lock = threading.Lock()
+        self._last_fetch = 0.0
+
+    def call(self, fetcher: Callable[[float, float], dict[str, Any]], lat: float, lon: float):
+        with self._lock:
+            now = _time.time()
+            if now - self._last_fetch < self.min_interval_s:
+                raise _AircraftThrottled(
+                    f"outbound aircraft fetches are limited to one every "
+                    f"{self.min_interval_s:g}s; try again shortly"
+                )
+            self._last_fetch = now
+        return fetcher(lat, lon)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._last_fetch = 0.0
+
+
+_aircraft_fetch_gate = _AircraftFetchGate(AIRCRAFT_FETCH_MIN_INTERVAL_S)
+
+
 def clear_caches() -> None:
     """Forget both cached fetches. For tests, and for a site change."""
     _aircraft_cache.clear()
     _element_cache.clear()
+    _aircraft_fetch_gate.reset()
 
 
 # ----------------------------------------------------------------------
@@ -482,17 +559,28 @@ def sky_now(
 
     # --- aircraft -----------------------------------------------------
     fetcher = fetch_aircraft if aircraft_fetcher is None else aircraft_fetcher
-    key = (round(float(latitude_deg), 3), round(float(longitude_deg), 3))
+    key = (
+        round(float(latitude_deg), AIRCRAFT_CACHE_PRECISION_DEG),
+        round(float(longitude_deg), AIRCRAFT_CACHE_PRECISION_DEG),
+    )
     payload, aircraft_error, aircraft_age = _aircraft_cache.get(
-        key, lambda: fetcher(float(latitude_deg), float(longitude_deg))
+        key,
+        lambda: _aircraft_fetch_gate.call(fetcher, float(latitude_deg), float(longitude_deg)),
     )
     if aircraft_error is not None:
         aircraft: list[dict[str, Any]] = []
-        layers["aircraft"] = {
-            "status": "down",
-            "note": "live aircraft feed unreachable",
-            "detail": aircraft_error,
-        }
+        if aircraft_error.startswith(f"{_AircraftThrottled.__name__}:"):
+            layers["aircraft"] = {
+                "status": "throttled",
+                "note": "live aircraft feed was not re-fetched so soon after the last request",
+                "detail": aircraft_error,
+            }
+        else:
+            layers["aircraft"] = {
+                "status": "down",
+                "note": "live aircraft feed unreachable",
+                "detail": aircraft_error,
+            }
     else:
         # The fetch already succeeded, but parsing it is not trusted
         # either: the feed is somebody else's schema, and a row this

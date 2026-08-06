@@ -76,6 +76,7 @@ from rfi_simulator.webui.simulate import (
 __all__ = [
     "CATALOG_SOURCES",
     "DAY_COST_BUDGET",
+    "DAY_MAX_CONCURRENT_CEILING",
     "DAY_MAX_CONCURRENT_ENV_VAR",
     "DAY_WORKERS_ENV_VAR",
     "DEFAULT_DAY_MAX_CONCURRENT",
@@ -177,15 +178,22 @@ FRAME_IMAGE_DECIMALS = 5
 
 
 def day_workers() -> int:
-    """Processes to compute a day in, honouring `DAY_WORKERS_ENV_VAR`."""
+    """Processes to compute a day in, honouring `DAY_WORKERS_ENV_VAR`.
+
+    Clamped to this host's reported CPU count (never below 1): a worker
+    count above that buys nothing but oversubscription, and an operator
+    (or a misconfigured environment) must not be able to ask this process
+    to fork more workers than the host has cores for.
+    """
+    ceiling = max(1, os.cpu_count() or 1)
     raw = os.environ.get(DAY_WORKERS_ENV_VAR)
     if not raw:
-        return DEFAULT_DAY_WORKERS
+        return min(DEFAULT_DAY_WORKERS, ceiling)
     try:
         value = int(raw)
     except ValueError:
-        return DEFAULT_DAY_WORKERS
-    return max(1, value)
+        return min(DEFAULT_DAY_WORKERS, ceiling)
+    return min(max(1, value), ceiling)
 
 
 # ----------------------------------------------------------------------
@@ -201,7 +209,17 @@ Each running build owns a `ProcessPoolExecutor` of up to `day_workers()`
 processes, so this is what keeps twenty rapid ``POST`` requests from
 starting twenty pools -- `JOB_MAX` bounds how many *finished* days are
 kept in memory, not how many are being built right now, which is the gap
-this closes."""
+this closes.
+
+This is a deliberately separate admission-control pool from
+`rfi_simulator.webui.server._simulation_slots`, the semaphore gating
+``/api/simulate`` and ``/api/flag``: a day build owning a slot there for
+its whole run -- minutes -- would starve every interactive request behind
+it, which is worse than letting the two run side by side. With both at
+their defaults the combined worst case a host has to carry at once is one
+interactive run (`MAX_CONCURRENT_SIMULATIONS` = 1 there) plus one day
+build's process pool (`day_workers()` processes here, itself bounded by
+`DAY_COST_BUDGET`) -- bounded and intended, not an oversight."""
 
 DAY_COST_BUDGET = 250_000_000
 """int: Largest `day_cost` a day request may have.
@@ -219,8 +237,19 @@ magnitude. ``fine`` stays available for the arrays and frame counts a
 laptop can actually carry."""
 
 
+DAY_MAX_CONCURRENT_CEILING = 8
+"""int: Largest `day_max_concurrent` an operator may set.
+
+Each concurrent build owns its own `ProcessPoolExecutor`; an environment
+override with no ceiling could start an unbounded number of those pools at
+once, which is exactly the failure mode this admission control exists to
+prevent."""
+
+
 def day_max_concurrent() -> int:
-    """Day builds allowed at once, honouring `DAY_MAX_CONCURRENT_ENV_VAR`."""
+    """Day builds allowed at once, honouring `DAY_MAX_CONCURRENT_ENV_VAR`.
+
+    Clamped to `DAY_MAX_CONCURRENT_CEILING`."""
     raw = os.environ.get(DAY_MAX_CONCURRENT_ENV_VAR)
     if not raw:
         return DEFAULT_DAY_MAX_CONCURRENT
@@ -228,7 +257,7 @@ def day_max_concurrent() -> int:
         value = int(raw)
     except ValueError:
         return DEFAULT_DAY_MAX_CONCURRENT
-    return max(1, value)
+    return max(1, min(value, DAY_MAX_CONCURRENT_CEILING))
 
 
 class DayBusyError(RuntimeError):

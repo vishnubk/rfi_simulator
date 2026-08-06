@@ -12,6 +12,7 @@ mocked executor would not show.
 """
 
 import math
+import os
 import time
 
 import numpy as np
@@ -29,6 +30,7 @@ from rfi_simulator.webui import observatory, skynow  # noqa: E402
 from rfi_simulator.webui.observatory import (  # noqa: E402
     CATALOG_SOURCES,
     DAY_COST_BUDGET,
+    DAY_MAX_CONCURRENT_CEILING,
     DAY_MAX_CONCURRENT_ENV_VAR,
     DEFAULT_DAY_MAX_CONCURRENT,
     DEFAULT_DAY_WORKERS,
@@ -429,11 +431,27 @@ def test_the_store_drops_a_day_that_has_expired():
 
 def test_the_worker_count_is_a_fraction_of_the_host(monkeypatch):
     monkeypatch.delenv("RFI_SIMULATOR_DAY_WORKERS", raising=False)
-    assert day_workers() == DEFAULT_DAY_WORKERS
+    assert day_workers() == min(DEFAULT_DAY_WORKERS, max(1, os.cpu_count() or 1))
     monkeypatch.setenv("RFI_SIMULATOR_DAY_WORKERS", "3")
     assert day_workers() == 3
     monkeypatch.setenv("RFI_SIMULATOR_DAY_WORKERS", "not a number")
-    assert day_workers() == DEFAULT_DAY_WORKERS
+    assert day_workers() == min(DEFAULT_DAY_WORKERS, max(1, os.cpu_count() or 1))
+
+
+def test_the_worker_count_is_clamped_to_the_hosts_cpus(monkeypatch):
+    """An operator override above the host's core count buys nothing but
+    oversubscription, so it is clamped rather than honoured verbatim."""
+    monkeypatch.setattr(observatory.os, "cpu_count", lambda: 4)
+    monkeypatch.delenv("RFI_SIMULATOR_DAY_WORKERS", raising=False)
+    assert day_workers() == 4  # below DEFAULT_DAY_WORKERS (12)
+    monkeypatch.setenv("RFI_SIMULATOR_DAY_WORKERS", "99")
+    assert day_workers() == 4
+    monkeypatch.setenv("RFI_SIMULATOR_DAY_WORKERS", "2")
+    assert day_workers() == 2
+
+    monkeypatch.setattr(observatory.os, "cpu_count", lambda: None)
+    monkeypatch.delenv("RFI_SIMULATOR_DAY_WORKERS", raising=False)
+    assert day_workers() == 1
 
 
 def test_a_frame_that_fails_does_not_take_the_day_down():
@@ -548,6 +566,42 @@ def test_the_aircraft_fetch_is_shared_between_callers():
 
     sky(aircraft_fetcher=counting)
     sky(aircraft_fetcher=counting)
+    assert len(calls) == 1
+
+
+def test_nearby_coordinates_share_one_aircraft_fetch():
+    """Jittering the query coordinate by less than the cache's rounding
+    grid must not force a second outbound fetch -- that would defeat
+    `AIRCRAFT_CACHE_S` for any client willing to vary its coordinate a
+    little on every poll. 37.20 and 37.25 both round to the same
+    `AIRCRAFT_CACHE_PRECISION_DEG`-place key (37.2)."""
+    calls = []
+
+    def counting(lat, lon):
+        calls.append((lat, lon))
+        return CANNED_AIRCRAFT
+
+    sky(aircraft_fetcher=counting, latitude_deg=37.20)
+    sky(aircraft_fetcher=counting, latitude_deg=37.25)
+    assert len(calls) == 1
+
+
+def test_rapid_distinct_coordinates_do_not_multiply_aircraft_fetches():
+    """A cache miss at a genuinely different site is still gated by the
+    global outbound-fetch throttle: only the first of several rapid,
+    distinct-coordinate requests actually reaches the network."""
+    calls = []
+
+    def counting(lat, lon):
+        calls.append((lat, lon))
+        return CANNED_AIRCRAFT
+
+    for step in range(5):
+        payload = sky(aircraft_fetcher=counting, latitude_deg=SITE["latitude_deg"] + step * 2.0)
+        if step == 0:
+            assert payload["layers"]["aircraft"]["status"] != "throttled"
+        else:
+            assert payload["layers"]["aircraft"]["status"] == "throttled"
     assert len(calls) == 1
 
 
@@ -893,6 +947,17 @@ def test_day_max_concurrent_respects_the_env_var(monkeypatch):
     assert day_max_concurrent() == 3
     monkeypatch.setenv(DAY_MAX_CONCURRENT_ENV_VAR, "not a number")
     assert day_max_concurrent() == DEFAULT_DAY_MAX_CONCURRENT
+
+
+def test_day_max_concurrent_is_clamped_to_its_ceiling(monkeypatch):
+    """Each concurrent build owns a process pool -- an override must not
+    be able to ask for an unbounded number of those at once."""
+    monkeypatch.setenv(DAY_MAX_CONCURRENT_ENV_VAR, str(DAY_MAX_CONCURRENT_CEILING + 100))
+    assert day_max_concurrent() == DAY_MAX_CONCURRENT_CEILING
+    monkeypatch.setenv(DAY_MAX_CONCURRENT_ENV_VAR, str(DAY_MAX_CONCURRENT_CEILING))
+    assert day_max_concurrent() == DAY_MAX_CONCURRENT_CEILING
+    monkeypatch.setenv(DAY_MAX_CONCURRENT_ENV_VAR, "-5")
+    assert day_max_concurrent() == 1
 
 
 def test_the_default_budget_admits_only_one_build_at_a_time():

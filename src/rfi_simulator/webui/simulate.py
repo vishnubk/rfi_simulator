@@ -1109,12 +1109,17 @@ class SkySource(BaseModel):
     than one is an error rather than a silent precedence rule:
 
     ``offset_deg``
-        ``[east_deg, north_deg]`` from the pointing centre, on the tangent
-        plane: ``l = sin(east_deg * pi / 180)``, ``m = sin(north_deg *
-        pi / 180)``. The exact sine, not the small-angle approximation --
-        they agree to a part in ten thousand over the imaged field, and
-        using the sine means the number a user types is the angle the
-        source really lands at.
+        ``[east_deg, north_deg]`` from the pointing centre, as a rigorous
+        tangent-plane offset: `~astropy.coordinates.SkyCoord.spherical_offsets_by`
+        moves the phase centre by those two angles, and the result is
+        projected to ``(l, m)`` by the same `rfi_simulator.sky.lm_from_radec`
+        `radec_deg` uses. This is *not* the independent-sine shortcut
+        (``l = sin(east_deg)``, ``m = sin(north_deg)``) -- that shortcut is
+        exact only along a single axis (one of the two offsets zero); with
+        both nonzero it and the rigorous answer diverge at a nonzero
+        declination, by an amount of order ``east * north * tan(dec)``.
+        Going through the same projection `radec_deg` uses means the two
+        notations agree exactly by construction, not approximately.
     ``radec_deg``
         ``[ra_deg, dec_deg]``, absolute ICRS, projected onto the same
         tangent plane by `rfi_simulator.sky.lm_from_radec` -- the
@@ -1195,7 +1200,16 @@ class SkySource(BaseModel):
             DEFAULT_OFFSET_EAST_DEG,
             DEFAULT_OFFSET_NORTH_DEG,
         )
-        return (math.sin(math.radians(east_deg)), math.sin(math.radians(north_deg)))
+        # Rigorous, and deliberately routed through the same projection
+        # `radec_deg` uses: an offset applied independently on each axis
+        # (`l = sin(east)`, `m = sin(north)`) is only exact when one of the
+        # two is zero, and quietly diverges from the true tangent-plane
+        # position once both are nonzero at a nonzero declination. Going
+        # through an actual sky position first is what makes the two
+        # notations agree exactly rather than approximately.
+        offset_coord = phase_center.spherical_offsets_by(east_deg * u.deg, north_deg * u.deg)
+        l_dir, m_dir = lm_from_radec(phase_center, offset_coord)
+        return (float(l_dir), float(m_dir))
 
     def build(self, phase_center: SkyCoord) -> PointSource:
         """This source as a library `PointSource`.

@@ -99,7 +99,20 @@ is told so with a 429 rather than parked on a worker thread. Threaded
 servers have a finite thread pool, and a client that queues rather than
 being refused holds one of those threads for as long as the run in front
 of it takes; forty queued clicks was enough to freeze the page behind
-threads that were all just waiting."""
+threads that were all just waiting.
+
+Deliberately NOT shared with the observatory day pool
+(`rfi_simulator.webui.observatory._day_slots`, gating
+``POST /api/observatory/day``): a day build is minutes of work in a
+background process pool, and making an interactive run wait behind it --
+which is what one shared semaphore would do -- would be worse than the
+alternative. The day pool has its own, independent admission control
+(`day_max_concurrent`, default one build at a time) plus its own cost
+budget (`DAY_COST_BUDGET`) bounding what one build may cost. The two
+pools' worst case is therefore not unbounded: it is one interactive run
+here plus one day build there, each bounded on its own terms, running at
+once. See `DEFAULT_DAY_MAX_CONCURRENT` for the other half of this
+accounting."""
 
 _simulation_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SIMULATIONS)
 

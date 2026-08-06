@@ -62,6 +62,15 @@ class ZoneInfoResult:
 # fixed-offset stand-in, so DST is handled correctly.
 _US_BANDS: tuple[tuple[float, float, float, float, str], ...] = (
     # (lon_min, lon_max, lat_min, lat_max, IANA key)
+    # Adjacent bands share an edge (e.g. both -125..-114 and -114..-102
+    # include -114.0 itself); `_lookup_table` returns the first match in
+    # this tuple's order, so a longitude landing exactly on a shared edge
+    # resolves to whichever band is listed first here (Los_Angeles before
+    # Denver, and so on west to east). That is an arbitrary tie-break, not
+    # a meaningful one -- real zone boundaries do not run along these
+    # meridians anyway, so a site placed exactly on the line is already
+    # inside this table's stated approximation, not a case it is trying to
+    # get exactly right.
     (-161.0, -154.0, 18.0, 23.0, "Pacific/Honolulu"),
     (-170.0, -129.0, 51.0, 72.0, "America/Anchorage"),
     (-125.0, -114.0, 24.0, 50.0, "America/Los_Angeles"),

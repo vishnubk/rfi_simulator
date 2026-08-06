@@ -17,6 +17,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from astropy import units as u
+from astropy.coordinates import SkyCoord
 
 # The front end is an optional extra: without it installed these tests
 # have nothing to exercise and skip rather than break collection.
@@ -26,6 +28,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from rfi_simulator import GaussianBeam, correlate, spectral_kurtosis_mask  # noqa: E402
 from rfi_simulator.metrics import flag_scores, pool_truth_accumulations  # noqa: E402
+from rfi_simulator.sky import lm_from_radec  # noqa: E402
 from rfi_simulator.webui.server import (  # noqa: E402
     MAX_REQUEST_BYTES,
     _simulation_slots,
@@ -1137,15 +1140,29 @@ def test_the_pointing_endpoint_agrees_with_the_image_grid(client):
 
 
 def test_a_source_can_be_placed_in_degrees_from_the_pointing(client):
-    """`offset_deg` is the exact sine of the angle, in the library's l and m."""
+    """`offset_deg` is a rigorous tangent-plane offset, not independent sines.
+
+    The expectation is computed the same way `resolve_lm` computes it --
+    an astropy spherical offset from the phase centre, projected by the
+    library's own `lm_from_radec` -- rather than re-derived from the two
+    sines independently, which is precisely the shortcut this notation no
+    longer takes (see `test_a_combined_offset_agrees_with_its_own_radec`).
+    """
+    pointing = client.get("/api/pointing").json()
+    phase_center = SkyCoord(
+        ra=pointing["ra_deg"] * u.deg, dec=pointing["dec_deg"] * u.deg, frame="icrs"
+    )
+    offset_coord = phase_center.spherical_offsets_by(0.5 * u.deg, -0.3 * u.deg)
+    expected_l, expected_m = lm_from_radec(phase_center, offset_coord)
+
     body = make_request()
     body["sky_sources"] = [{"name": "target", "offset_deg": [0.5, -0.3], "flux_jy": 5.0}]
     response = client.post("/api/simulate", json=body)
     assert response.status_code == 200, response.text
     resolved = response.json()["sky_sources"][0]
 
-    assert resolved["l"] == pytest.approx(math.sin(math.radians(0.5)), abs=1e-12)
-    assert resolved["m"] == pytest.approx(math.sin(math.radians(-0.3)), abs=1e-12)
+    assert resolved["l"] == pytest.approx(float(expected_l), abs=1e-9)
+    assert resolved["m"] == pytest.approx(float(expected_m), abs=1e-9)
     assert resolved["in_field"] is True
     # East is towards increasing right ascension, north towards increasing
     # declination -- the convention `PointSource.from_lm` documents.
@@ -1209,6 +1226,31 @@ def test_an_absolute_position_images_where_the_offset_one_does(client):
     assert offset["dec_deg"] > pointing["dec_deg"]
 
 
+def test_a_combined_offset_agrees_with_its_own_radec(client):
+    """A two-axis `offset_deg` and the `radec_deg` it lands on are the same place.
+
+    An offset applied as two independent sines (``l = sin(east)``,
+    ``m = sin(north)``) is only exact when one axis is zero; with both
+    nonzero at this site's nonzero declination it would disagree with the
+    absolute position it actually resolved to. Because `resolve_lm` now
+    routes `offset_deg` through an astropy spherical offset and the same
+    `lm_from_radec` projection `radec_deg` uses, the two must agree not
+    approximately but to floating-point precision.
+    """
+    body = make_request()
+    body["sky_sources"] = [{"name": "a", "offset_deg": [0.5, 0.4], "flux_jy": 5.0}]
+    offset = client.post("/api/simulate", json=body).json()["sky_sources"][0]
+
+    body2 = make_request()
+    body2["sky_sources"] = [
+        {"name": "b", "radec_deg": [offset["ra_deg"], offset["dec_deg"]], "flux_jy": 5.0}
+    ]
+    absolute = client.post("/api/simulate", json=body2).json()["sky_sources"][0]
+
+    assert absolute["l"] == pytest.approx(offset["l"], abs=1e-12)
+    assert absolute["m"] == pytest.approx(offset["m"], abs=1e-12)
+
+
 def test_a_source_far_outside_the_field_is_reported_as_such(client):
     """Out of the image is not an error: it is simulated, and labelled."""
     body = make_request()
@@ -1257,15 +1299,24 @@ def test_a_position_that_is_not_a_number_is_refused(client, position):
 
 def test_a_source_with_no_position_at_all_lands_where_the_page_opens(client):
     """No position given is the page's own default offset, not the origin."""
+    pointing = client.get("/api/pointing").json()
+    phase_center = SkyCoord(
+        ra=pointing["ra_deg"] * u.deg, dec=pointing["dec_deg"] * u.deg, frame="icrs"
+    )
+    default_offset = defaults_payload()["sky_source"]["position"]["default_offset_deg"]
+    offset_coord = phase_center.spherical_offsets_by(
+        default_offset[0] * u.deg, default_offset[1] * u.deg
+    )
+    expected_l, expected_m = lm_from_radec(phase_center, offset_coord)
+
     body = make_request()
     body["sky_sources"] = [{"name": "target", "flux_jy": 5.0}]
     response = client.post("/api/simulate", json=body)
     assert response.status_code == 200, response.text
     resolved = response.json()["sky_sources"][0]
 
-    default_offset = defaults_payload()["sky_source"]["position"]["default_offset_deg"]
-    assert resolved["l"] == pytest.approx(math.sin(math.radians(default_offset[0])), abs=1e-12)
-    assert resolved["m"] == pytest.approx(math.sin(math.radians(default_offset[1])), abs=1e-12)
+    assert resolved["l"] == pytest.approx(float(expected_l), abs=1e-9)
+    assert resolved["m"] == pytest.approx(float(expected_m), abs=1e-9)
 
 
 # ----------------------------------------------------------------------
