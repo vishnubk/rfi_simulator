@@ -1411,15 +1411,21 @@ def test_a_fitted_beam_reports_its_half_power_circle_and_per_source_response(cli
     assert 0.0 < response < 1.0
 
 
-def test_an_airy_beam_reports_a_wider_half_power_circle_than_a_gaussian(client):
-    """The circle is found on the beam's own response, so the two models differ."""
+def test_the_gaussian_beam_reports_a_wider_half_power_circle_than_an_airy(client):
+    """The circle is found on the beam's own response, so the two models differ.
+
+    The Gaussian model represents a taper-illuminated feed (FWHM 1.2
+    lambda/D by default) while the Airy model is the uniformly illuminated
+    aperture (~1.02 lambda/D), so the Gaussian's half-power circle is the
+    wider of the two.
+    """
     radii = {}
     for kind in ("gaussian", "airy"):
         body = make_request()
         body["primary_beam"] = {"type": kind, "dish_diameter_m": 4.5}
         result = client.post("/api/simulate", json=body).json()
         radii[kind] = result["image"]["beam"]["half_power_rad"]
-    assert radii["airy"] > radii["gaussian"] > 0.0
+    assert radii["gaussian"] > radii["airy"] > 0.0
 
 
 def test_no_beam_is_reported_as_absent_not_as_unity(client):

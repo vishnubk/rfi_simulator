@@ -86,17 +86,17 @@ __all__ = ["AiryBeam", "GaussianBeam", "PrimaryBeam", "bessel_j1"]
 
 _LN2 = np.log(2.0)
 
-#: Coefficient relating a filled circular aperture's FWHM to lambda/D.
-#: 1.02 is the standard engineering approximation for a uniformly
-#: illuminated circular aperture (the Airy pattern's FWHM is ~1.03 lambda/D;
-#: 1.02 is the commonly quoted rounded value for a real, mildly tapered
-#: illumination, e.g. the ALMA/VLA convention) and is used here, rather than
-#: the Gaussian-beam-fit-to-Airy value of ~1.028 lambda/D, because it is the
-#: number radio-astronomy documentation for real dishes almost universally
-#: quotes; the difference between candidate coefficients here (1.02 vs
-#: 1.03) is well under the accuracy this simulator claims for a beam model
-#: in the first place.
-GAUSSIAN_FWHM_COEFF = 1.02
+#: Default coefficient relating a dish's FWHM to lambda/D.
+#: A *uniformly illuminated* circular aperture (the Airy pattern) has FWHM
+#: ~1.02 lambda/D, but no real feed illuminates uniformly: practical feeds
+#: taper the illumination toward the dish rim (to control spillover), which
+#: widens the main lobe to roughly 1.15-1.25 lambda/D and suppresses the
+#: sidelobes -- which is also why a Gaussian (sidelobe-free) main-lobe model
+#: pairs naturally with the tapered value. 1.2 is the standard engineering
+#: approximation radio-astronomy documentation quotes for real dishes, and
+#: is the default here; pass `fwhm_coefficient` to match a specific feed
+#: (e.g. 1.02 to mimic the uniform-illumination `AiryBeam` main lobe).
+DEFAULT_GAUSSIAN_FWHM_COEFF = 1.2
 
 
 def _validate_theta_rad(theta_rad) -> np.ndarray:
@@ -189,13 +189,18 @@ class GaussianBeam(PrimaryBeam):
     r"""A circularly symmetric Gaussian primary beam.
 
     The frequency-dependent full width at half maximum is the standard
-    diffraction-limited approximation for a filled circular aperture,
+    engineering approximation for a real (taper-illuminated) dish,
 
     .. math::
 
-        \mathrm{FWHM}(f) = \mathtt{GAUSSIAN\_FWHM\_COEFF}
-            \, \frac{\lambda}{D} = \mathtt{GAUSSIAN\_FWHM\_COEFF}
+        \mathrm{FWHM}(f) = \mathtt{fwhm\_coefficient}
+            \, \frac{\lambda}{D} = \mathtt{fwhm\_coefficient}
             \, \frac{c}{f D},
+
+    with ``fwhm_coefficient`` defaulting to
+    `DEFAULT_GAUSSIAN_FWHM_COEFF` = 1.2 (real feeds taper their
+    illumination, widening the main lobe past the uniform-aperture Airy
+    value of ~1.02; see the constant's note),
 
     and the power pattern is the Gaussian with that FWHM,
 
@@ -218,19 +223,30 @@ class GaussianBeam(PrimaryBeam):
     ----------
     dish_diameter_m : float
         Aperture (dish) diameter, meters. Must be finite and positive.
+    fwhm_coefficient : float, optional
+        FWHM in units of ``lambda / D``. Default
+        `DEFAULT_GAUSSIAN_FWHM_COEFF` (1.2, a real tapered feed); must be
+        finite and positive.
 
     Raises
     ------
     ValueError
-        If `dish_diameter_m` is not finite and positive.
+        If `dish_diameter_m` or `fwhm_coefficient` is not finite and
+        positive.
     """
 
     dish_diameter_m: float
+    fwhm_coefficient: float = DEFAULT_GAUSSIAN_FWHM_COEFF
 
     def __post_init__(self) -> None:
         self.dish_diameter_m = float(self.dish_diameter_m)
         if not np.isfinite(self.dish_diameter_m) or self.dish_diameter_m <= 0.0:
             raise ValueError(f"dish_diameter_m must be finite and > 0, got {self.dish_diameter_m}")
+        self.fwhm_coefficient = float(self.fwhm_coefficient)
+        if not np.isfinite(self.fwhm_coefficient) or self.fwhm_coefficient <= 0.0:
+            raise ValueError(
+                f"fwhm_coefficient must be finite and > 0, got {self.fwhm_coefficient}"
+            )
 
     def fwhm_rad(self, freq_hz) -> np.ndarray:
         """Frequency-dependent FWHM, radians.
@@ -247,7 +263,7 @@ class GaussianBeam(PrimaryBeam):
         """
         freq = _validate_freq_hz(freq_hz)
         wavelength_m = SPEED_OF_LIGHT_M_S / freq
-        return GAUSSIAN_FWHM_COEFF * wavelength_m / self.dish_diameter_m
+        return self.fwhm_coefficient * wavelength_m / self.dish_diameter_m
 
     def power_response(self, theta_rad, freq_hz) -> np.ndarray:
         theta = _validate_theta_rad(theta_rad)
