@@ -60,11 +60,11 @@
     <div class="section-head">
       <span class="section-number" aria-hidden="true">1</span>
       <h2 class="section-title" id="array-heading">Array</h2>
+      <div class="stat-strip" id="array-summary" aria-live="off"></div>
     </div>
     <p class="section-intro">
-      Where the antennas stand on the ground. Positions are metres east and north of
-      the array centre; every pair of antennas makes one baseline, and the longest
-      baseline sets how sharp the image can be.
+      Where the antennas stand, in metres east and north of the array centre — the
+      longest baseline sets how sharp the image can be.
     </p>
 
     <div class="array-layout">
@@ -82,8 +82,6 @@
       </div>
 
       <div class="array-side">
-        <p class="readout mono" id="array-summary"></p>
-
         <div class="array-add">
           <button type="button" class="button button-accent" id="add-antenna">+ Add an antenna</button>
           <span class="hint hint-inline">drops one on free ground; drag it where you want it</span>
@@ -126,36 +124,32 @@
       <h2 class="section-title" id="sky-heading">Sky model</h2>
     </div>
     <p class="section-intro">
-      What the telescope is meant to be looking at. These are the real astronomical
-      signals — the things an interference-removal algorithm must leave intact.
+      The real astronomical signal — what an interference-removal algorithm must
+      leave intact.
     </p>
 
     <div class="group">
       <div class="group-head">
         <h3 class="group-title">Point sources</h3>
-        <button type="button" class="button button-small" id="add-sky">Add a source</button>
+        <span class="group-note" id="sky-count"></span>
       </div>
       <p class="group-intro">
-        Each source is a point on the sky. The dirty image on the Results tab should
-        show a peak where you put it.
+        Each is a point on the sky; the dirty image should peak where you put it.
       </p>
       <p class="hint" id="pointing-hint"></p>
-      <div id="sky-cards" class="card-stack"></div>
-      <p class="empty-note" id="sky-empty" hidden>No sources — the image will show noise only.</p>
+      <div id="sky-cards" class="cell-grid"></div>
     </div>
 
     <div class="group">
       <div class="group-head">
         <h3 class="group-title">Spectral lines</h3>
-        <button type="button" class="button button-small" id="add-line">Add a line</button>
+        <span class="group-note" id="line-count"></span>
       </div>
       <p class="group-intro">
-        A narrow emission line, added to every antenna. It is celestial signal, not
-        interference: it is labelled that way in the ground truth, so an algorithm
-        that flags it is being scored as wrong.
+        A narrow emission line on every antenna — celestial signal, labelled that way
+        in the ground truth, so flagging it scores as wrong.
       </p>
-      <div id="line-cards" class="card-stack"></div>
-      <p class="empty-note" id="line-empty" hidden>No spectral lines in this run.</p>
+      <div id="line-cards" class="cell-grid"></div>
     </div>
   </section>
 
@@ -166,16 +160,18 @@
       <h2 class="section-title" id="rfi-heading">Interference</h2>
     </div>
     <p class="section-intro">
-      Human-made transmitters that reach the antennas. Tick the kinds you want and the
-      simulator records exactly which time–frequency cells they touched — that record
-      is the ground truth an excision algorithm gets scored against.
+      Human-made transmitters reaching the antennas. Every time–frequency cell they
+      touch is recorded as the ground truth an excision algorithm is scored against.
     </p>
 
     <p class="field-label kind-legend" id="rfi-kinds-legend">Tick the kinds of interference to add</p>
     <div class="kind-grid" id="rfi-kinds" role="group" aria-labelledby="rfi-kinds-legend"></div>
 
-    <div id="rfi-cards" class="card-stack"></div>
-    <p class="empty-note" id="rfi-empty" hidden>No interference — a clean observation.</p>
+    <div class="group-head">
+      <h3 class="group-title">In this run</h3>
+      <span class="group-note" id="rfi-count"></span>
+    </div>
+    <div id="rfi-cards" class="cell-grid"></div>
   </section>
 
   <!-- ---------------------------------------------------- 4. imperfection -->
@@ -185,15 +181,11 @@
       <h2 class="section-title" id="realism-heading">Instrument</h2>
     </div>
     <p class="section-intro">
-      Until you open this, the simulator is an ideal instrument: identical antennas,
-      perfect calibration, no digitisation loss. Everything in here makes it worse
-      on purpose, in the ways real telescopes are worse.
+      Switch on the ways a real telescope departs from an ideal one.
+      <span class="muted-inline">Ideal by default — everything here is off.</span>
     </p>
 
-    <details class="realism" id="realism-details">
-      <summary>Make the instrument imperfect — all off by default</summary>
-      <div id="realism-fields"></div>
-    </details>
+    <div class="cell-grid cell-grid-effects" id="realism-cells"></div>
   </section>
 
   <!-- ------------------------------------------------------- 5. recording -->
@@ -203,8 +195,8 @@
       <h2 class="section-title" id="run-heading">Recording settings</h2>
     </div>
     <p class="section-intro">
-      How much data to record. The simulator generates voltages for every antenna,
-      correlates them, and images them; Run sends you to the Results tab.
+      How much data to record. Run generates the voltages, correlates them, images
+      them, and lands on the Results tab.
     </p>
 
     <div class="field-grid" id="sim-fields"></div>

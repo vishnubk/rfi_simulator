@@ -16,7 +16,10 @@
  * drawing: colour mapping, data-to-plot coordinate transforms, and scaling
  * a server-sent grid down into a thumbnail.
  *
- * The page is two tabs. Setup is the forms; Results is the three levels the
+ * The page is two tabs. Setup is a grid of small cells -- one per source,
+ * per line, per transmitter, per instrument effect -- each showing the two
+ * or three numbers it is about and expanding in place to its full form;
+ * Results is the three levels the
  * data passes through -- voltages, visibilities, image -- one panel each,
  * each showing one plot and one primary toggle with everything else folded
  * away, because the panels are read far more often than they are adjusted.
@@ -180,9 +183,14 @@
     arrays: [],           // catalogue from /api/arrays
     loadedArray: null,    // JSON of the antennas as last loaded or reset
     skySources: [],
+    // Whether each setup cell's "More" fold is showing, by position in
+    // the list it belongs to; see `buildCell`.
+    skyOpen: [],
     rfiSources: [],
-    rfiOpen: [],         // whether each rfi card's "More details" fold is open
+    rfiOpen: [],
     spectralLines: [],
+    lineOpen: [],
+    realismOpen: [],
     sim: {},
     realism: {},
     result: null,
@@ -275,10 +283,70 @@
     return node;
   }
 
+  /* --- the antenna glyph ----------------------------------------------
+   *
+   * One radio dish, drawn once into <defs> and stamped with <use> for
+   * every antenna: a foreshortened circular aperture (the reflector),
+   * the feed on its boom, and the pedestal it turns on. Neither fill nor
+   * stroke is set inside the symbol, so both are inherited from the
+   * <use> element and the whole glyph takes its colours from CSS --
+   * which is what lets hover and drag light it amber.
+   *
+   * Below DISH_DETAIL_PX of drawn size the boom and pedestal stop being
+   * legible and only muddy the plan, so a second symbol carries the
+   * reflector outline alone; at ninety-six antennas that is what is
+   * stamped. Both are 24 x 24 with the mount at the foot, so the two are
+   * interchangeable and an antenna sits at the same place either way.
+   */
+  var DISH_DETAIL_PX = 15;
+
+  function dishDefs() {
+    var defs = svgNode("defs", {});
+
+    var full = svgNode("symbol", { id: "dish-glyph", viewBox: "0 0 24 24" });
+    // Pedestal first, so the reflector's fill covers where they meet.
+    full.appendChild(svgNode("path", {
+      d: "M11.5 20.6 L11.5 12.4 M7.6 20.6 L15.4 20.6",
+      "stroke-linecap": "round", fill: "none"
+    }));
+    full.appendChild(svgNode("path", {
+      d: "M11.5 10.2 L8.1 4.7", "stroke-linecap": "round", fill: "none"
+    }));
+    full.appendChild(svgNode("circle", { cx: 7.6, cy: 4, r: 1.3 }));
+    full.appendChild(svgNode("ellipse", {
+      cx: 11.5, cy: 10.2, rx: 8.3, ry: 4,
+      transform: "rotate(-32 11.5 10.2)"
+    }));
+    defs.appendChild(full);
+
+    var plain = svgNode("symbol", { id: "dish-glyph-small", viewBox: "0 0 24 24" });
+    plain.appendChild(svgNode("path", {
+      d: "M12 20.8 L12 13", "stroke-linecap": "round", fill: "none"
+    }));
+    plain.appendChild(svgNode("ellipse", {
+      cx: 12, cy: 10.6, rx: 8.8, ry: 4.3,
+      transform: "rotate(-32 12 10.6)"
+    }));
+    defs.appendChild(plain);
+    return defs;
+  }
+
+  // How big one dish is drawn, in plan units. A ten-element array gets a
+  // comfortable glyph; a ninety-six-element one gets a smaller, plainer
+  // one so the dishes stay apart instead of merging into a smear.
+  function dishSize() {
+    var n = state.antennas.length;
+    if (n <= 16) { return 22; }
+    if (n <= 40) { return 17; }
+    if (n <= 72) { return 13; }
+    return 11;
+  }
+
   function renderSitePlan() {
     var svg = $("site-plan");
     svg.setAttribute("viewBox", "0 0 " + VIEW + " " + VIEW);
     while (svg.firstChild) { svg.removeChild(svg.firstChild); }
+    svg.appendChild(dishDefs());
 
     var extent = extentMetres();
     // Labelled interval first, then five fine divisions inside it, so the
@@ -354,26 +422,37 @@
     rose.appendChild(east);
     svg.appendChild(rose);
 
-    // Antennas: a theodolite cross inside a ring.
+    // Antennas: one dish each, standing on its position.
+    var size = dishSize();
+    var detailed = size >= DISH_DETAIL_PX;
+    var glyph = detailed ? "#dish-glyph" : "#dish-glyph-small";
+    var grab = Math.max(7, size * 0.42);
     state.antennas.forEach(function (antenna, index) {
       var p = toView(antenna[0], antenna[1]);
       var group = svgNode("g", {
         "class": "antenna" + (state.drag && state.drag.index === index ? " dragging" : ""),
         "data-index": index
       });
-      group.appendChild(svgNode("circle", { cx: p[0], cy: p[1], r: 9, "class": "antenna-hit" }));
-      group.appendChild(svgNode("line", {
-        x1: p[0] - 7, y1: p[1], x2: p[0] + 7, y2: p[1], "class": "antenna-cross"
-      }));
-      group.appendChild(svgNode("line", {
-        x1: p[0], y1: p[1] - 7, x2: p[0], y2: p[1] + 7, "class": "antenna-cross"
-      }));
       group.appendChild(svgNode("circle", {
-        cx: p[0], cy: p[1], r: 3.1, "class": "antenna-ring"
+        cx: p[0], cy: p[1], r: grab, "class": "antenna-hit"
       }));
-      var label = svgNode("text", { x: p[0] + 8, y: p[1] - 6, "class": "antenna-label" });
-      label.textContent = index;
-      group.appendChild(label);
+      // The glyph's foot is its position on the ground, so the box is
+      // hung above the point rather than centred on it.
+      var dish = svgNode("use", {
+        x: p[0] - size / 2, y: p[1] - size * 0.86,
+        width: size, height: size,
+        "class": "antenna-dish" + (detailed ? "" : " antenna-dish-small")
+      });
+      dish.setAttribute("href", glyph);
+      group.appendChild(dish);
+      // Numbering ninety-six dishes writes more ink than it reads.
+      if (state.antennas.length <= 40) {
+        var label = svgNode("text", {
+          x: p[0] + size * 0.42, y: p[1] - size * 0.72, "class": "antenna-label"
+        });
+        label.textContent = index;
+        group.appendChild(label);
+      }
       svg.appendChild(group);
     });
 
@@ -394,12 +473,21 @@
     return longest;
   }
 
+  // Three numbers that describe an array, in the section's own header:
+  // how many antennas, how many baselines they make, and how long the
+  // longest of those is -- which is what sets the resolution.
   function renderArraySummary() {
+    var host = $("array-summary");
     var n = state.antennas.length;
-    var baselines = n * (n - 1) / 2;
-    $("array-summary").textContent =
-      n + " antennas make " + baselines + " baselines; the longest is "
-      + fmt(longestBaseline(), 1) + " m.";
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    [[String(n), n === 1 ? "antenna" : "antennas"],
+     [String(n * (n - 1) / 2), "baselines"],
+     [fmt(longestBaseline(), 1) + " m", "longest"]].forEach(function (pair) {
+      var stat = el("span", "stat");
+      stat.appendChild(el("span", "stat-value mono", pair[0]));
+      stat.appendChild(el("span", "stat-label", pair[1]));
+      host.appendChild(stat);
+    });
   }
 
   function renderAntennaTable() {
@@ -1079,7 +1167,9 @@
     }
   }
 
-  function positionBlock(source) {
+  // `onMove` is called whenever a position number changes, so the cell's
+  // own compact readout can be kept in step without a re-render.
+  function positionBlock(source, onMove) {
     var block = el("div", "position-block");
     var modeField = el("div", "field");
     var modeLabel = el("label", "field-label", "Position given as");
@@ -1120,6 +1210,7 @@
         if (isFinite(parsed)) {
           source[key] = parsed;
           describePosition(source, note);
+          if (onMove) { onMove(); }
         }
       });
       field.appendChild(label);
@@ -1138,43 +1229,268 @@
     return block;
   }
 
+  /* --- the setup grids -------------------------------------------------
+   *
+   * Everything a run is built out of -- sky sources, spectral lines,
+   * interference, instrument effects -- is one small cell in a grid: a
+   * name, the two or three numbers that thing is really about, and a
+   * "More" button. More expands that cell across the grid and shows the
+   * full form, which is the same schema-driven form as before: nothing
+   * is unreachable, it is simply not all on screen at once.
+   *
+   * Which cells are open is remembered in `state.*Open`, so a re-render
+   * (a preset, a units switch, a value edit) does not shut a fold the
+   * reader opened.
+   */
+
+  // A signed number for a compact readout: the sign is information here
+  // -- east or west, north or south of the pointing -- so it is always
+  // printed, with a real minus rather than a hyphen.
+  function signed(value, digits) {
+    if (!isFinite(value)) { return "--"; }
+    var text = Math.abs(value).toFixed(digits);
+    return (value < 0 ? "−" : "+") + text;
+  }
+
+  // One small SVG glyph per kind of thing, so a grid of cells is read by
+  // shape before it is read by word. Drawn in a 24 x 24 box, inheriting
+  // fill and stroke from CSS like the site plan's dishes do.
+  var CELL_GLYPHS = {
+    star: "M12 3.5 L13.9 9.6 L20.2 9.6 L15.1 13.4 L17 19.5 L12 15.7"
+      + " L7 19.5 L8.9 13.4 L3.8 9.6 L10.1 9.6 Z",
+    line: "M3 19 L8.5 19 L10.2 6 L12 19 L13.8 6 L15.5 19 L21 19",
+    tower: "M12 21 L12 9 M7 21 L12 9 L17 21 M8.6 15 L15.4 15"
+      + " M5.6 7.3 A 9 9 0 0 1 18.4 7.3",
+    satellite: "M12 12 m-3 0 a3 3 0 1 0 6 0 a3 3 0 1 0 -6 0"
+      + " M3 8.5 L8 8.5 L8 15.5 L3 15.5 Z M16 8.5 L21 8.5 L21 15.5 L16 15.5 Z",
+    aircraft: "M12 3 L13.6 11 L21 15 L21 17 L13.6 15 L13.2 19.5"
+      + " L15.8 21.2 L15.8 22 L12 21 L8.2 22 L8.2 21.2 L10.8 19.5"
+      + " L10.4 15 L3 17 L3 15 L10.4 11 Z",
+    burst: "M12 2.5 L12 21.5 M4.5 6 L19.5 18 M19.5 6 L4.5 18"
+      + " M2.5 12 L21.5 12",
+    comb: "M3 21 L3 13 M7 21 L7 5 M11 21 L11 15 M15 21 L15 8"
+      + " M19 21 L19 12 M2 21 L21 21",
+    // one per instrument effect, drawn as the thing it does to the data
+    gains: "M2.5 20.5 L21.5 20.5 M6 20.5 L6 13 M12 20.5 L12 6.5 M18 20.5 L18 16",
+    bandpass: "M2.5 15.5 C 6 7.5, 8.5 7.5, 12 12 S 18 18.5, 21.5 8.5",
+    quantize: "M2.5 19.5 L7 19.5 L7 14.5 L11.5 14.5 L11.5 9.5"
+      + " L16 9.5 L16 5 L21.5 5",
+    channelizer: "M2.5 19 C 4.5 6.5, 8.5 6.5, 10.5 19"
+      + " M13.5 19 C 15.5 6.5, 19.5 6.5, 21.5 19",
+    dualpol: "M12 12 m-8.5 0 a8.5 8.5 0 1 0 17 0 a8.5 8.5 0 1 0 -17 0"
+      + " M6.5 6.5 L17.5 17.5 M17.5 6.5 L6.5 17.5",
+    calibration: "M12 12 m-8.5 0 a8.5 8.5 0 1 0 17 0 a8.5 8.5 0 1 0 -17 0"
+      + " M12 12 m-3 0 a3 3 0 1 0 6 0 a3 3 0 1 0 -6 0"
+      + " M12 1.8 L12 5.5 M12 18.5 L12 22.2",
+    beam: "M12 21 C 3.5 15, 3.5 5, 12 2.5 C 20.5 5, 20.5 15, 12 21"
+      + " M12 21 L12 2.5",
+    effect: "M12 3.2 A 8.8 8.8 0 0 1 12 20.8 A 8.8 8.8 0 0 1 12 3.2"
+      + " M3.2 12 L20.8 12 M12 3.2 L12 20.8"
+  };
+
+  // `tint` is the colour that kind of thing wears on the plots -- sky
+  // blue for celestial signal, mask red for interference -- so a cell and
+  // its marks in the results read as the same thing.
+  function cellGlyph(name, tint) {
+    var svg = svgNode("svg", {
+      viewBox: "0 0 24 24", width: 17, height: 17, "class": "cell-glyph",
+      "aria-hidden": "true", focusable: "false"
+    });
+    if (tint) { svg.style.stroke = tint; }
+    svg.appendChild(svgNode("path", { d: CELL_GLYPHS[name] || CELL_GLYPHS.effect }));
+    return svg;
+  }
+
+  // The compact face of a cell: label/value pairs, printed rather than
+  // editable. The same quantity has a real control inside the fold, and
+  // two live inputs on one value would disagree the moment either was
+  // typed into.
+  function cellLines(pairs) {
+    var list = el("dl", "cell-lines mono");
+    pairs.forEach(function (pair) {
+      if (pair[1] === null || pair[1] === undefined) { return; }
+      list.appendChild(el("dt", null, pair[0]));
+      list.appendChild(el("dd", null, pair[1]));
+    });
+    return list;
+  }
+
+  /* One cell. `spec` carries what it shows and what its buttons do:
+   *   glyph     key into CELL_GLYPHS, or null
+   *   tint      colour the glyph wears, or null
+   *   kind      what this cell holds, for the label a screen reader reads
+ *   kindLine  print that kind under the name as well
+   *   name      {value, label, onChange} for the inline name box, or null
+   *   title     plain text instead of a name box, or null
+   *   lines     [[label, value], ...] for the compact face
+   *   open      whether the fold is showing
+   *   onToggle  called with the new open state
+   *   onRemove  called when the × is pressed, or null
+   *   detail    () -> node, built only while the cell is open
+   *   control   an extra node in the head, e.g. an on/off switch
+   */
+  function buildCell(spec) {
+    var cell = el("div", "cell" + (spec.open ? " is-open" : "")
+      + (spec.on ? " is-on" : ""));
+    cell.tabIndex = 0;
+    cell.setAttribute("role", "group");
+    cell.setAttribute("aria-label", (spec.kind || "Setting") + ": "
+      + (spec.title || (spec.name && spec.name.value) || ""));
+
+    var head = el("div", "cell-head");
+    if (spec.glyph) { head.appendChild(cellGlyph(spec.glyph, spec.tint)); }
+    if (spec.name) {
+      var name = el("input", "cell-name");
+      name.value = spec.name.value;
+      name.setAttribute("aria-label", spec.name.label);
+      name.addEventListener("change", function () { spec.name.onChange(name.value); });
+      head.appendChild(name);
+    } else {
+      head.appendChild(el("span", "cell-title", spec.title || ""));
+    }
+    if (spec.control) { head.appendChild(spec.control); }
+    if (spec.onRemove) {
+      var remove = el("button", "cell-remove", "×");
+      remove.type = "button";
+      remove.setAttribute("aria-label", "Remove " + (spec.title
+        || (spec.name && spec.name.value) || "this entry"));
+      remove.addEventListener("click", spec.onRemove);
+      head.appendChild(remove);
+    }
+    cell.appendChild(head);
+
+    if (spec.kindLine) { cell.appendChild(el("p", "cell-kind", spec.kind)); }
+    if (spec.blurb) { cell.appendChild(el("p", "cell-blurb", spec.blurb)); }
+    if (spec.lines && spec.lines.length) { cell.appendChild(cellLines(spec.lines)); }
+
+    if (spec.detail) {
+      var more = el("button", "cell-more", spec.open ? "Less" : "More");
+      more.type = "button";
+      more.setAttribute("aria-expanded", spec.open ? "true" : "false");
+      more.addEventListener("click", function () { spec.onToggle(!spec.open); });
+      cell.appendChild(more);
+
+      // Enter on the cell itself is the same press as its More button; a
+      // keystroke inside the name box or a control in the fold is not.
+      cell.addEventListener("keydown", function (event) {
+        if (event.key !== "Enter" || event.target !== cell) { return; }
+        event.preventDefault();
+        spec.onToggle(!spec.open);
+      });
+    }
+
+    if (spec.open && spec.detail) {
+      var detail = el("div", "cell-detail");
+      detail.appendChild(spec.detail());
+      cell.appendChild(detail);
+    }
+    return cell;
+  }
+
+  // The last cell in every grid: a dashed outline that adds another of
+  // whatever the grid holds, so adding stays inside the cell metaphor.
+  function ghostCell(text, onAdd) {
+    var cell = el("button", "cell cell-ghost");
+    cell.type = "button";
+    cell.appendChild(el("span", "cell-ghost-plus", "+"));
+    cell.appendChild(el("span", null, text));
+    cell.addEventListener("click", onAdd);
+    return cell;
+  }
+
+  function countNote(host, count, singular, plural, empty) {
+    $(host).textContent = count === 0
+      ? empty
+      : count + " " + (count === 1 ? singular : plural);
+  }
+
+  // Where a sky source sits, in the notation the reader picked, short
+  // enough for a cell: the long form with all three notations is still
+  // under the position controls inside the fold.
+  function compactPosition(source) {
+    if (source.mode === "radec") {
+      return "RA " + fmt(source.ra_deg, 3) + "°  Dec " + signed(source.dec_deg, 3) + "°";
+    }
+    if (source.mode === "lm") {
+      return "l " + signed(source.l, 4) + "  m " + signed(source.m, 4);
+    }
+    return "E " + signed(source.east_deg, 2) + "°  N " + signed(source.north_deg, 2) + "°";
+  }
+
+  // Editing a value inside an open fold repaints that cell's own compact
+  // face rather than the whole grid: rebuilding the grid under a control
+  // that is being typed into would take the focus away from it.
+  function refreshSkyLines(index) {
+    var cell = $("sky-cards").children[index];
+    var source = state.skySources[index];
+    if (!cell || !source) { return; }
+    var values = cell.querySelectorAll(".cell-lines dd");
+    if (values.length < 2) { return; }
+    values[0].textContent = compactPosition(source);
+    values[1].textContent = fmt(source.flux_jy, 2) + " Jy";
+  }
+
   function renderSkyCards() {
     var host = $("sky-cards");
     while (host.firstChild) { host.removeChild(host.firstChild); }
-    $("sky-empty").hidden = state.skySources.length > 0;
+    while (state.skyOpen.length < state.skySources.length) { state.skyOpen.push(false); }
+    state.skyOpen.length = state.skySources.length;
+    countNote("sky-count", state.skySources.length, "source", "sources",
+      "none — the image will show noise only");
 
     state.skySources.forEach(function (source, index) {
-      var card = el("div", "card");
-      var head = el("div", "card-head");
-      var swatch = el("span", "card-swatch");
-      swatch.style.background = SKY_MARKER;
-      head.appendChild(swatch);
-      head.appendChild(el("span", "card-kind", "Sky source"));
-      var name = el("input", "input card-name");
-      name.value = source.name;
-      name.setAttribute("aria-label", "Sky source name");
-      name.addEventListener("change", function () { source.name = name.value; });
-      head.appendChild(name);
-      var remove = el("button", "card-remove", "×");
-      remove.type = "button";
-      remove.setAttribute("aria-label", "Remove this sky source");
-      remove.addEventListener("click", function () {
-        state.skySources.splice(index, 1);
-        renderSkyCards();
-      });
-      head.appendChild(remove);
-      card.appendChild(head);
-
-      var body = el("div", "card-body");
-      body.appendChild(positionBlock(source));
-      var grid = el("div", "field-grid");
-      state.defaults.sky_source.fields.forEach(function (descriptor) {
-        grid.appendChild(buildField(descriptor, source, null, FIELD_COPY.sky));
-      });
-      body.appendChild(grid);
-      card.appendChild(body);
-      host.appendChild(card);
+      host.appendChild(buildCell({
+        glyph: "star",
+        tint: SKY_MARKER,
+        kind: "Sky source",
+        open: Boolean(state.skyOpen[index]),
+        name: {
+          value: source.name,
+          label: "Sky source name",
+          onChange: function (value) { source.name = value; }
+        },
+        lines: [
+          ["direction", compactPosition(source)],
+          ["flux", fmt(source.flux_jy, 2) + " Jy"]
+        ],
+        onToggle: function (open) {
+          state.skyOpen[index] = open;
+          renderSkyCards();
+        },
+        onRemove: function () {
+          state.skySources.splice(index, 1);
+          state.skyOpen.splice(index, 1);
+          renderSkyCards();
+        },
+        detail: function () {
+          var body = el("div");
+          body.appendChild(positionBlock(source, function () {
+            refreshSkyLines(index);
+          }));
+          var grid = el("div", "field-grid");
+          state.defaults.sky_source.fields.forEach(function (descriptor) {
+            grid.appendChild(buildField(descriptor, source, function () {
+              refreshSkyLines(index);
+            }, FIELD_COPY.sky));
+          });
+          body.appendChild(grid);
+          return body;
+        }
+      }));
     });
+
+    host.appendChild(ghostCell("Add a source", addSkySource));
+  }
+
+  function addSkySource() {
+    if (state.skySources.length >= state.defaults.limits.max_sky_sources) {
+      showNotice("error", "That is the most sky sources one run takes ("
+        + state.defaults.limits.max_sky_sources + ").");
+      return;
+    }
+    state.skySources.push(newSkySource());
+    state.skyOpen.push(false);
+    renderSkyCards();
   }
 
   function rfiType(typeName) {
@@ -1323,10 +1639,28 @@
     return String(Math.round(value * 1e6) / 1e6);
   }
 
-  function fillKeyNumbers(source, host) {
-    while (host.firstChild) { host.removeChild(host.firstChild); }
+  /* A cell has room for a word, not for "Fraction of the time it
+   * transmits". These are the same quantities as the fold's own labels,
+   * named the way an operator would say them out loud; anything not
+   * listed falls back to the full front-end label. */
+  var KEY_LABELS = {
+    center_freq_hz: "freq",
+    carrier_freq_hz: "freq",
+    fundamental_hz: "fundamental",
+    received_power_jy: "power",
+    duty_cycle: "duty",
+    min_elevation_deg: "min elev",
+    message_rate_hz: "rate",
+    rate_hz: "rate",
+    pulse_width_samples: "width"
+  };
+
+  // The two or three numbers a kind of interference is really about, as
+  // [label, printed value] pairs for a cell's compact face.
+  function keyNumbers(source) {
     var descriptors = rfiType(source.type).fields;
     var copy = FIELD_COPY[source.type] || {};
+    var pairs = [];
     rfiKind(source.type).keys.forEach(function (name) {
       var descriptor = descriptors.filter(function (entry) {
         return entry.name === name;
@@ -1336,50 +1670,83 @@
       var shown = descriptor.kind === "number"
         ? showNumber(source[name] / (descriptor.factor || 1))
         : String(source[name]);
-      host.appendChild(el("dt", null, words.label || descriptor.label));
-      host.appendChild(el("dd", null, shown + (descriptor.unit ? " " + descriptor.unit : "")));
+      pairs.push([
+        KEY_LABELS[name] || words.label || descriptor.label,
+        shown + (descriptor.unit ? " " + descriptor.unit : "")
+      ]);
     });
+    return pairs;
   }
 
   // A spectral line is ground truth labelled "celestial", not "rfi" (see
   // rfi_simulator.sky.SpectralLineForeground); its card follows the same
   // pattern as a sky source's, just with its own field list and colour.
+  function refreshLineLines(index) {
+    var cell = $("line-cards").children[index];
+    var source = state.spectralLines[index];
+    if (!cell || !source) { return; }
+    var values = cell.querySelectorAll(".cell-lines dd");
+    if (values.length < 2) { return; }
+    values[0].textContent = fmt(source.center_freq_hz / 1e6, 3) + " MHz";
+    values[1].textContent = fmt(source.line_flux_jy, 2) + " Jy";
+  }
+
   function renderLineCards() {
     var host = $("line-cards");
     while (host.firstChild) { host.removeChild(host.firstChild); }
-    $("line-empty").hidden = state.spectralLines.length > 0;
+    while (state.lineOpen.length < state.spectralLines.length) { state.lineOpen.push(false); }
+    state.lineOpen.length = state.spectralLines.length;
+    countNote("line-count", state.spectralLines.length, "line", "lines",
+      "none in this run");
 
     state.spectralLines.forEach(function (source, index) {
-      var card = el("div", "card");
-      var head = el("div", "card-head");
-      var swatch = el("span", "card-swatch");
-      swatch.style.background = SKY_MARKER;
-      head.appendChild(swatch);
-      head.appendChild(el("span", "card-kind", "Spectral line"));
-      var name = el("input", "input card-name");
-      name.value = source.name;
-      name.setAttribute("aria-label", "Spectral line name");
-      name.addEventListener("change", function () { source.name = name.value; });
-      head.appendChild(name);
-      var remove = el("button", "card-remove", "×");
-      remove.type = "button";
-      remove.setAttribute("aria-label", "Remove this spectral line");
-      remove.addEventListener("click", function () {
-        state.spectralLines.splice(index, 1);
-        renderLineCards();
-      });
-      head.appendChild(remove);
-      card.appendChild(head);
-
-      var body = el("div", "card-body");
-      var grid = el("div", "field-grid");
-      state.defaults.spectral_line.fields.forEach(function (descriptor) {
-        grid.appendChild(buildField(descriptor, source, null, FIELD_COPY.line));
-      });
-      body.appendChild(grid);
-      card.appendChild(body);
-      host.appendChild(card);
+      host.appendChild(buildCell({
+        glyph: "line",
+        tint: SKY_MARKER,
+        kind: "Spectral line",
+        open: Boolean(state.lineOpen[index]),
+        name: {
+          value: source.name,
+          label: "Spectral line name",
+          onChange: function (value) { source.name = value; }
+        },
+        lines: [
+          ["centre", fmt(source.center_freq_hz / 1e6, 3) + " MHz"],
+          ["peak", fmt(source.line_flux_jy, 2) + " Jy"]
+        ],
+        onToggle: function (open) {
+          state.lineOpen[index] = open;
+          renderLineCards();
+        },
+        onRemove: function () {
+          state.spectralLines.splice(index, 1);
+          state.lineOpen.splice(index, 1);
+          renderLineCards();
+        },
+        detail: function () {
+          var grid = el("div", "field-grid");
+          state.defaults.spectral_line.fields.forEach(function (descriptor) {
+            grid.appendChild(buildField(descriptor, source, function () {
+              refreshLineLines(index);
+            }, FIELD_COPY.line));
+          });
+          return grid;
+        }
+      }));
     });
+
+    host.appendChild(ghostCell("Add a line", addSpectralLine));
+  }
+
+  function addSpectralLine() {
+    if (state.spectralLines.length >= state.defaults.limits.max_spectral_lines) {
+      showNotice("error", "That is the most spectral lines one run takes ("
+        + state.defaults.limits.max_spectral_lines + ").");
+      return;
+    }
+    state.spectralLines.push(newSpectralLine());
+    state.lineOpen.push(false);
+    renderLineCards();
   }
 
   function newSpectralLine() {
@@ -1551,14 +1918,32 @@
     return fold;
   }
 
-  /* One card per interference source: a compact face with the two or
-   * three numbers that kind is about, and the whole schema-driven form
-   * -- every field, plus the Advanced coupling and polarization fold --
-   * behind "More details". Which folds are open is remembered in
-   * `state.rfiOpen`, so re-rendering does not shut a card the user had
-   * opened. Nothing about what is sent changes here: every control still
-   * writes into the same source object, under the same field name, that
-   * `buildRequest` serializes. */
+  var KIND_GLYPHS = {
+    tower: "tower",
+    satellite: "satellite",
+    aircraft: "aircraft",
+    impulsive: "burst",
+    comb: "comb"
+  };
+
+  function refreshRfiLines(index) {
+    var cell = $("rfi-cards").children[index];
+    var source = state.rfiSources[index];
+    if (!cell || !source) { return; }
+    var values = cell.querySelectorAll(".cell-lines dd");
+    keyNumbers(source).forEach(function (pair, which) {
+      if (values[which]) { values[which].textContent = pair[1]; }
+    });
+  }
+
+  /* One cell per interference source, whatever its kind, in the order
+   * they were added: a compact face with the two or three numbers that
+   * kind is about, and the whole schema-driven form -- every field, plus
+   * the Advanced coupling and polarization folds -- behind More. Which
+   * cells are open is remembered in `state.rfiOpen`, so re-rendering
+   * does not shut one the user had opened. Nothing about what is sent
+   * changes here: every control still writes into the same source
+   * object, under the same field name, that `buildRequest` serializes. */
   function renderRfiCards() {
     var host = $("rfi-cards");
     while (host.firstChild) { host.removeChild(host.firstChild); }
@@ -1566,76 +1951,61 @@
     // state is squared up against it here rather than at every writer.
     while (state.rfiOpen.length < state.rfiSources.length) { state.rfiOpen.push(false); }
     state.rfiOpen.length = state.rfiSources.length;
-    $("rfi-empty").hidden = state.rfiSources.length > 0;
+    countNote("rfi-count", state.rfiSources.length, "source", "sources",
+      "none — a clean observation");
 
     state.rfiSources.forEach(function (source, index) {
       var descriptorSet = rfiType(source.type);
       var kind = rfiKind(source.type);
-      var card = el("div", "card");
-      var head = el("div", "card-head");
-      var swatch = el("span", "card-swatch");
-      swatch.style.background = "rgba(" + MASK_RGB + ", 1)";
-      head.appendChild(swatch);
-      head.appendChild(el("span", "card-kind", kind.title));
-      var name = el("input", "input card-name");
-      name.value = source.name;
-      name.setAttribute("aria-label", "Interference source name");
-      name.addEventListener("change", function () {
-        source.name = name.value;
-      });
-      head.appendChild(name);
-      var remove = el("button", "card-remove", "×");
-      remove.type = "button";
-      remove.setAttribute("aria-label", "Remove this interference source");
-      remove.addEventListener("click", function () {
-        state.rfiSources.splice(index, 1);
-        state.rfiOpen.splice(index, 1);
-        renderRfi();
-      });
-      head.appendChild(remove);
-      card.appendChild(head);
+      host.appendChild(buildCell({
+        glyph: KIND_GLYPHS[source.type] || "effect",
+        tint: "rgba(" + MASK_RGB + ", 1)",
+        kind: kind.title,
+        kindLine: true,
+        open: Boolean(state.rfiOpen[index]),
+        name: {
+          value: source.name,
+          label: "Interference source name",
+          onChange: function (value) { source.name = value; }
+        },
+        lines: keyNumbers(source),
+        onToggle: function (open) {
+          state.rfiOpen[index] = open;
+          renderRfiCards();
+        },
+        onRemove: function () {
+          state.rfiSources.splice(index, 1);
+          state.rfiOpen.splice(index, 1);
+          renderRfi();
+        },
+        detail: function () {
+          var body = el("div");
+          body.appendChild(el("p", "cell-intro", descriptorSet.summary));
+          var grid = el("div", "field-grid");
+          descriptorSet.fields.forEach(function (descriptor) {
+            // The pasted element set only matters when it is to be used.
+            if (descriptor.name === "tle_text" && source.tle_source !== "custom") { return; }
+            grid.appendChild(buildField(descriptor, source, function () {
+              if (descriptor.name === "tle_source") { renderRfi(); return; }
+              refreshRfiLines(index);
+            }, FIELD_COPY[source.type]));
+          });
+          body.appendChild(grid);
+          body.appendChild(buildRfiExtras(source));
 
-      var body = el("div", "card-body");
-      body.appendChild(el("p", "card-intro", descriptorSet.summary));
-      var numbers = el("dl", "card-summary mono");
-      fillKeyNumbers(source, numbers);
-      body.appendChild(numbers);
-      card.appendChild(body);
-
-      var fold = el("details", "card-details");
-      fold.open = Boolean(state.rfiOpen[index]);
-      fold.appendChild(el("summary", null, "More details"));
-      fold.addEventListener("toggle", function () {
-        state.rfiOpen[index] = fold.open;
-      });
-
-      var detail = el("div", "card-body");
-      var grid = el("div", "field-grid");
-      descriptorSet.fields.forEach(function (descriptor) {
-        // The pasted element set only matters when it is going to be used.
-        if (descriptor.name === "tle_text" && source.tle_source !== "custom") { return; }
-        grid.appendChild(buildField(descriptor, source, function () {
-          if (descriptor.name === "tle_source") { renderRfi(); return; }
-          fillKeyNumbers(source, numbers);
-        }, FIELD_COPY[source.type]));
-      });
-      detail.appendChild(grid);
-      fold.appendChild(detail);
-      fold.appendChild(buildRfiExtras(source));
-
-      var foot = el("div", "card-foot");
-      var another = el("button", "button button-small",
-        "+ Add another " + kind.title.toLowerCase());
-      another.type = "button";
-      another.addEventListener("click", function () {
-        addRfiSource(source.type);
-        renderRfi();
-      });
-      foot.appendChild(another);
-      fold.appendChild(foot);
-
-      card.appendChild(fold);
-      host.appendChild(card);
+          var foot = el("div", "cell-foot");
+          var another = el("button", "button button-small",
+            "+ Add another " + kind.title.toLowerCase());
+          another.type = "button";
+          another.addEventListener("click", function () {
+            addRfiSource(source.type);
+            renderRfi();
+          });
+          foot.appendChild(another);
+          body.appendChild(foot);
+          return body;
+        }
+      }));
     });
   }
 
@@ -1809,37 +2179,216 @@
       help: "Sets the beam width: a bigger dish sees a narrower patch of sky." }
   ];
 
-  function renderRealismFields() {
-    var host = $("realism-fields");
-    while (host.firstChild) { host.removeChild(host.firstChild); }
-    var grid = null;
-    var advancedGrid = null;
+  function realismField(name) {
+    return REALISM_FIELDS.filter(function (entry) { return entry.name === name; })[0];
+  }
 
-    REALISM_FIELDS.forEach(function (descriptor) {
-      if (descriptor.section) {
-        var block = el("div", "realism-section");
-        block.appendChild(el("h4", "subgroup-label", descriptor.section));
-        if (descriptor.sectionIntro) {
-          block.appendChild(el("p", "group-intro", descriptor.sectionIntro));
+  /* --- the instrument grid ---------------------------------------------
+   *
+   * One cell per way a real telescope departs from an ideal one: a
+   * switch, a line of plain language, and every number that effect has
+   * behind More. All off is an ideal instrument, which is the default.
+   *
+   * `on` and `set` read and write the request state the page already
+   * keeps -- `buildRequest` is untouched, and still sends a group only
+   * when its `*_enabled` flag is true. Two of the cells share one flag:
+   * the library has a single instrument model covering both per-antenna
+   * gains and passband shape, so "Antenna gains" and "Bandpass shape"
+   * both switch `instrument_enabled` on, and switching one off zeroes
+   * only its own numbers, leaving the flag up while the other is still
+   * wanted. A group whose numbers are all zero changes nothing, so the
+   * two read independently even though one flag carries them.
+   */
+  function anyPositive(names) {
+    return names.some(function (name) { return state.realism[name] > 0; });
+  }
+
+  function restoreDefaults(names) {
+    if (anyPositive(names)) { return; }
+    var first = realismField(names[0]);
+    state.realism[names[0]] = first.default > 0 ? first.default : 0.4;
+  }
+
+  var GAIN_NUMBERS = ["gain_scatter_db"];
+  var BANDPASS_NUMBERS = ["bandpass_ripple_db", "band_slope_db", "subband_scatter_db"];
+
+  function gainsOn() {
+    return Boolean(state.realism.instrument_enabled)
+      && (anyPositive(GAIN_NUMBERS) || state.realism.phase_offsets !== "zero");
+  }
+
+  function bandpassOn() {
+    return Boolean(state.realism.instrument_enabled) && anyPositive(BANDPASS_NUMBERS);
+  }
+
+  function zero(names) {
+    names.forEach(function (name) { state.realism[name] = 0; });
+  }
+
+  var EFFECTS = [
+    {
+      title: "Antenna gains",
+      glyph: "gains",
+      blurb: "Every antenna a little more, or less, sensitive than its neighbours.",
+      fields: ["gain_scatter_db", "phase_offsets"],
+      on: gainsOn,
+      set: function (want) {
+        if (want) {
+          // Switching this one on raises the shared flag, which would
+          // also give the passband its default ripple; the cell next
+          // door is off, so its numbers go to zero and stay silent.
+          if (!bandpassOn()) { zero(BANDPASS_NUMBERS); }
+          state.realism.instrument_enabled = true;
+          restoreDefaults(GAIN_NUMBERS);
+        } else {
+          zero(GAIN_NUMBERS);
+          state.realism.phase_offsets = "zero";
+          state.realism.instrument_enabled = bandpassOn();
         }
-        grid = el("div", "field-grid");
-        block.appendChild(grid);
-        var fold = el("details", "advanced");
-        fold.appendChild(el("summary", null, "Advanced"));
-        advancedGrid = el("div", "field-grid");
-        fold.appendChild(advancedGrid);
-        block.appendChild(fold);
-        host.appendChild(block);
       }
-      (descriptor.advanced ? advancedGrid : grid)
-        .appendChild(buildField(descriptor, state.realism));
-    });
+    },
+    {
+      title: "Bandpass shape",
+      glyph: "bandpass",
+      blurb: "The passband is not flat: a ripple across it, a tilt, steps between"
+        + " sub-bands.",
+      fields: ["bandpass_ripple_db", "band_slope_db", "subband_scatter_db", "n_subbands"],
+      on: bandpassOn,
+      set: function (want) {
+        if (want) {
+          if (!gainsOn()) {
+            zero(GAIN_NUMBERS);
+            state.realism.phase_offsets = "zero";
+          }
+          state.realism.instrument_enabled = true;
+          restoreDefaults(BANDPASS_NUMBERS);
+        } else {
+          zero(BANDPASS_NUMBERS);
+          state.realism.instrument_enabled = gainsOn();
+        }
+      }
+    },
+    {
+      title: "4-bit quantization",
+      glyph: "quantize",
+      blurb: "Samples written with a few bits, so a loud transmitter spills across"
+        + " the whole band.",
+      flag: "quantization_enabled",
+      fields: ["quant_target_counts"]
+    },
+    {
+      title: "Channelizer response",
+      glyph: "channelizer",
+      blurb: "A real filterbank instead of a perfect transform: channels leak into"
+        + " their neighbours.",
+      flag: "channelizer_enabled",
+      fields: ["n_taps", "window", "sinc_bandwidth"]
+    },
+    {
+      title: "Dual polarization",
+      glyph: "dualpol",
+      blurb: "Record both receptors, so a polarized transmitter looks different in"
+        + " each of them.",
+      fields: [],
+      on: function () { return Number(state.realism.n_pol) === 2; },
+      set: function (want) { state.realism.n_pol = want ? "2" : "1"; }
+    },
+    {
+      title: "Calibration errors",
+      glyph: "calibration",
+      blurb: "What calibration leaves behind: a phase slip, a delay, a gain error"
+        + " per antenna.",
+      flag: "calibration_enabled",
+      fields: ["phase_error_deg_rms", "delay_error_ns_rms", "amplitude_error_db_rms"]
+    },
+    {
+      title: "Primary beam",
+      glyph: "beam",
+      blurb: "A dish sees best straight ahead, so celestial sources off axis are"
+        + " dimmed. Interference is not.",
+      flag: "beam_enabled",
+      fields: ["beam_type", "dish_diameter_m"]
+    }
+  ];
 
-    // A section with nothing expert-only in it should not advertise a fold.
-    Array.prototype.forEach.call(host.querySelectorAll("details.advanced"),
-      function (fold) {
-        if (!fold.querySelector(".field")) { fold.hidden = true; }
+  function effectIsOn(effect) {
+    return effect.on ? effect.on() : Boolean(state.realism[effect.flag]);
+  }
+
+  function setEffect(effect, want) {
+    if (effect.set) { effect.set(want); } else { state.realism[effect.flag] = want; }
+  }
+
+  function renderRealismFields() {
+    var host = $("realism-cells");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+
+    EFFECTS.forEach(function (effect, index) {
+      var on = effectIsOn(effect);
+      var toggle = el("button", "switch cell-switch");
+      toggle.type = "button";
+      toggle.setAttribute("aria-pressed", on ? "true" : "false");
+      toggle.appendChild(el("span", "switch-dot"));
+      toggle.appendChild(el("span", null, on ? "on" : "off"));
+      toggle.setAttribute("aria-label", effect.title + (on ? ": on" : ": off"));
+      toggle.addEventListener("click", function () {
+        setEffect(effect, !effectIsOn(effect));
+        renderRealismFields();
       });
+
+      // The two cells that share one flag read their state off their own
+      // numbers, so zeroing them all switches that cell off. Only the
+      // switch is repainted: rebuilding the grid under the control being
+      // typed into would take the focus away from it.
+      var cell = null;
+      function syncSwitch() {
+        var now = effectIsOn(effect);
+        toggle.setAttribute("aria-pressed", now ? "true" : "false");
+        toggle.setAttribute("aria-label", effect.title + (now ? ": on" : ": off"));
+        toggle.lastChild.textContent = now ? "on" : "off";
+        if (cell) { cell.classList.toggle("is-on", now); }
+      }
+
+      var plain = effect.fields.filter(function (name) {
+        return !realismField(name).advanced;
+      });
+      var advanced = effect.fields.filter(function (name) {
+        return realismField(name).advanced;
+      });
+
+      cell = buildCell({
+        glyph: effect.glyph || "effect",
+        title: effect.title,
+        blurb: effect.blurb,
+        on: on,
+        control: toggle,
+        open: Boolean(state.realismOpen[index]),
+        onToggle: function (open) {
+          state.realismOpen[index] = open;
+          renderRealismFields();
+        },
+        detail: effect.fields.length ? function () {
+          var body = el("div");
+          var grid = el("div", "field-grid");
+          plain.forEach(function (name) {
+            grid.appendChild(buildField(realismField(name), state.realism, syncSwitch));
+          });
+          body.appendChild(grid);
+          if (advanced.length) {
+            var fold = el("details", "advanced");
+            fold.appendChild(el("summary", null, "Advanced"));
+            var deep = el("div", "field-grid");
+            advanced.forEach(function (name) {
+              deep.appendChild(buildField(realismField(name), state.realism, syncSwitch));
+            });
+            fold.appendChild(deep);
+            body.appendChild(fold);
+          }
+          return body;
+        } : null
+      });
+      host.appendChild(cell);
+    });
   }
 
   function defaultRealism() {
@@ -1998,9 +2547,12 @@
     // Cleared first: `newSkySource` counts what is already there.
     state.skySources = [];
     state.skySources.push(newSkySource());
+    state.skyOpen = [];
     state.rfiSources = [];
     state.rfiOpen = [];
     state.spectralLines = [];
+    state.lineOpen = [];
+    state.realismOpen = [];
     state.realism = defaultRealism();
     state.waterfallPol = 0;
   }
@@ -5572,28 +6124,9 @@
       loadArray(arraySelect.value);
     });
 
-    // The interference tick boxes bind themselves as they are drawn
-    // (see `renderRfiKinds`), since the grid is rebuilt on every change.
-
-    $("add-sky").addEventListener("click", function () {
-      if (state.skySources.length >= state.defaults.limits.max_sky_sources) {
-        showNotice("error", "That is the most sky sources one run takes ("
-          + state.defaults.limits.max_sky_sources + ").");
-        return;
-      }
-      state.skySources.push(newSkySource());
-      renderSkyCards();
-    });
-
-    $("add-line").addEventListener("click", function () {
-      if (state.spectralLines.length >= state.defaults.limits.max_spectral_lines) {
-        showNotice("error", "That is the most spectral lines one run takes ("
-          + state.defaults.limits.max_spectral_lines + ").");
-        return;
-      }
-      state.spectralLines.push(newSpectralLine());
-      renderLineCards();
-    });
+    // The interference tick boxes, and the grids' own add / remove / More
+    // controls, bind themselves as they are drawn (see `renderRfiKinds`
+    // and `buildCell`), since each grid is rebuilt on every change.
 
     runButtons().forEach(function (button) {
       button.addEventListener("click", run);

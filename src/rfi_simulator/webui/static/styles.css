@@ -1,9 +1,11 @@
 /* Interference simulator.
  *
- * Two tabs. Setup is one long form, read top to bottom: array, sky,
- * interference, instrument, recording. Results is three stacked level
- * panels -- voltages, visibilities, image -- each showing one plot and one
- * primary switch, with everything else folded away.
+ * Two tabs. Setup is five sections read top to bottom -- array, sky,
+ * interference, instrument, recording -- and inside them a grid of small
+ * cells, one per thing the run is made of, each expanding in place to its
+ * full form. Results is three stacked level panels -- voltages,
+ * visibilities, image -- each showing one plot and one primary switch,
+ * with everything else folded away.
  *
  * A control-room skin: charcoal command bar, white cards on a cool grey
  * ground, monospace readouts, and a four-state status colour system
@@ -250,6 +252,37 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
   font-size: 13px;
 }
 
+.muted-inline { color: var(--ink-faint); }
+
+/* Three numbers in a section's own header -- what the section adds up
+ * to, read without scrolling into it. */
+.stat-strip {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+
+.stat {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.stat-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.stat-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-faint);
+}
+
 .hint {
   margin: 8px 0 0;
   font-size: 12.5px;
@@ -461,12 +494,27 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 .compass-needle { stroke: var(--ink); stroke-width: 1.2; }
 .compass-text { fill: var(--ink-soft); font-family: var(--font-mono); font-size: 9px; }
 
+/* One dish per antenna, stamped from a <symbol> (see dishDefs in app.js).
+ * Fill and stroke are inherited properties, so setting them on the <use>
+ * reaches the shapes inside the symbol -- which is what lets one rule
+ * light the whole glyph amber while it is hovered or dragged. */
 .antenna { cursor: grab; }
 .antenna.dragging { cursor: grabbing; }
-.antenna-cross { stroke: var(--ink); stroke-width: 1.1; }
-.antenna-ring { fill: var(--surface); stroke: var(--ink); stroke-width: 1.1; }
-.antenna:hover .antenna-ring,
-.antenna.dragging .antenna-ring { fill: var(--amber); stroke: var(--ink); }
+
+.antenna-dish {
+  fill: var(--surface);
+  stroke: var(--ink);
+  stroke-width: 1.4;
+  stroke-linejoin: round;
+}
+
+/* Below the size at which the boom and pedestal read, the outline is
+ * drawn a touch heavier so a small dish keeps its shape. */
+.antenna-dish-small { stroke-width: 1.7; }
+
+.antenna:hover .antenna-dish,
+.antenna.dragging .antenna-dish { fill: var(--amber); stroke: var(--amber-line); }
+
 .antenna-hit { fill: transparent; }
 .antenna-label { fill: var(--ink-faint); font-family: var(--font-mono); font-size: 8.5px; }
 
@@ -538,6 +586,12 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 
 .group-head .button { margin-left: auto; }
 
+.group-note {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
 .group-intro {
   margin: 8px 0 12px;
   max-width: 74ch;
@@ -545,46 +599,201 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
   font-size: 13px;
 }
 
-/* --------------------------------------------------------------- cards */
-.card-stack { display: flex; flex-direction: column; gap: 10px; }
+/* --------------------------------------------------------------- cells */
+/* Everything a run is made of -- a sky source, a spectral line, a
+ * transmitter, an instrument effect -- is one small cell in a grid: a
+ * name, the two or three numbers it is really about, and a More button.
+ * More expands that cell across the whole grid, in place, and shows the
+ * full form; nothing is unreachable, it is simply not all on screen at
+ * once. Density is the point, so the cells are plain: white, a hairline,
+ * and a lift on hover that says "this is a thing you can open". */
+.cell-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 10px;
+  align-items: start;
+}
 
-.card {
+.cell {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  padding: 9px 11px 10px;
   background: var(--surface);
   border: 1px solid var(--edge);
   border-radius: var(--radius-card);
+  transition: box-shadow 0.12s ease, transform 0.12s ease, border-color 0.12s ease;
 }
 
-.card-head {
+.cell:hover {
+  border-color: var(--info-line);
+  box-shadow: var(--shadow-card);
+  transform: translateY(-1px);
+}
+
+/* An open cell takes the whole row and stops pretending to be small. */
+.cell.is-open {
+  grid-column: 1 / -1;
+  border-color: var(--info-line);
+  box-shadow: var(--shadow-card);
+  transform: none;
+}
+
+/* A switched-on instrument effect wears the amber edge every other
+ * "this one is active" on the page wears. */
+.cell.is-on { border-left: 3px solid var(--amber-line); background: var(--amber-wash); }
+
+/* Aligned to the top rather than the middle, so a title that wraps to
+ * two lines keeps its glyph and its switch beside the first of them. */
+.cell-head {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 12px;
-  border-bottom: 1px solid var(--hairline);
-  background: var(--hairline-strong);
-  border-radius: var(--radius-card) var(--radius-card) 0 0;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
 }
 
-.card-kind {
-  font-size: 11px;
+.cell-glyph {
+  flex: none;
+  margin-top: 1px;
+  fill: none;
+  stroke: var(--ink-soft);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.cell.is-on .cell-glyph { stroke: var(--amber-line); }
+
+/* The name is editable where it is read, so it reads as a label until
+ * it is pointed at. */
+.cell-name {
+  flex: 1;
+  min-width: 0;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  padding: 2px 4px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: none;
+}
+
+.cell-name:hover { border-color: var(--edge); }
+.cell-name:focus { border-color: var(--action); background: var(--surface); outline: none; }
+
+.cell-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.cell-kind {
+  margin: -2px 0 0;
+  font-size: 10.5px;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--ink-soft);
+  letter-spacing: 0.07em;
+  color: var(--ink-faint);
   font-weight: 600;
 }
 
-.card-head .card-name {
-  margin-left: auto;
-  width: 160px;
+.cell-blurb {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--ink-soft);
 }
 
-.card-swatch {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
+.cell-lines {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 1px 10px;
+  margin: 0;
+  font-size: 11.5px;
+}
+
+.cell-lines dt { color: var(--ink-faint); }
+.cell-lines dd { margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+
+.cell-remove {
   flex: none;
+  border: 0;
+  background: none;
+  color: var(--ink-faint);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 2px 3px;
 }
 
-.card-body { padding: 12px; }
+.cell-remove:hover { color: var(--error-line); }
+
+.cell-switch { flex: none; padding: 2px 9px 2px 7px; }
+
+.cell-more {
+  align-self: flex-start;
+  margin-top: auto;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--action);
+  cursor: pointer;
+}
+
+.cell-more:hover { text-decoration: underline; }
+
+.cell-detail {
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+  animation: cell-open 0.14s ease-out;
+}
+
+@keyframes cell-open {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: none; }
+}
+
+.cell-intro {
+  margin: 0 0 10px;
+  max-width: 74ch;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.cell-foot { margin-top: 12px; }
+
+/* The last cell in a grid: the way another one is added, in the same
+ * shape as the things it makes. */
+.cell-ghost {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 64px;
+  padding: 9px 11px;
+  border: 1px dashed var(--info-line);
+  border-radius: var(--radius-card);
+  background: none;
+  font-family: inherit;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+
+.cell-ghost:hover {
+  border-color: var(--action);
+  color: var(--action);
+  background: var(--surface);
+}
+
+.cell-ghost-plus { font-size: 15px; line-height: 1; }
 
 /* the sky source's position: one quantity, three ways of writing it */
 .position-block {
@@ -616,25 +825,6 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; }
   border-radius: 0 3px 3px 0;
   padding: 5px 9px;
 }
-
-.card-intro {
-  margin: 0 0 12px;
-  max-width: 74ch;
-  color: var(--ink-soft);
-  font-size: 13px;
-}
-
-.card-remove {
-  border: 0;
-  background: none;
-  color: var(--ink-faint);
-  cursor: pointer;
-  font-size: 16px;
-  line-height: 1;
-  padding: 2px 4px;
-}
-
-.card-remove:hover { color: var(--error-line); }
 
 /* -------------------------------------------------------------- fields */
 .field-grid {
@@ -764,88 +954,31 @@ textarea.input { resize: vertical; min-height: 72px; line-height: 1.35; }
   color: var(--ink-soft);
 }
 
-/* the compact face of a source card: the few numbers that kind is about */
-.card-summary {
-  display: grid;
-  grid-template-columns: auto auto;
-  gap: 2px 12px;
-  justify-content: start;
-  margin: 0;
-  color: var(--ink);
-}
-
-.card-summary dt { color: var(--ink-faint); }
-.card-summary dd { margin: 0; }
-
-details.card-details { border-top: 1px solid var(--hairline); }
-
-details.card-details > summary {
-  cursor: pointer;
-  padding: 8px 12px;
-  font-size: 12.5px;
-  color: var(--ink-soft);
-  list-style: revert;
-}
-
-details.card-details > summary:hover { color: var(--ink); }
-details.card-details > .card-body { padding-top: 4px; }
-
-.card-foot { padding: 0 12px 12px; }
-
-.empty-note {
-  margin: 0;
-  font-size: 12.5px;
-  color: var(--ink-faint);
-  font-style: italic;
-}
-
 /* ------------------------------------------------ progressive disclosure */
-details.advanced,
-details.realism {
+details.advanced {
   margin-top: 14px;
   border-top: 1px solid var(--hairline);
   padding-top: 10px;
 }
 
-details.advanced > summary,
-details.realism > summary {
+details.advanced > summary {
   cursor: pointer;
   font-size: 12.5px;
   color: var(--ink-soft);
   list-style: revert;
 }
 
-details.advanced > summary:hover,
-details.realism > summary:hover { color: var(--ink); }
+details.advanced > summary:hover { color: var(--ink); }
 
-details.advanced[open] > summary,
-details.realism[open] > summary { margin-bottom: 12px; }
-
-details.realism { margin-top: 0; border-top: 0; padding-top: 0; }
-details.realism > summary { font-size: 13px; font-weight: 600; color: var(--ink); }
+details.advanced[open] > summary { margin-bottom: 12px; }
 
 .advanced-card {
-  margin: 0;
-  padding: 10px 12px;
+  margin: 14px 0 0;
+  padding: 10px 0 0;
   border-top: 1px solid var(--hairline);
 }
 
-.realism-section {
-  padding: 16px 0;
-  border-bottom: 1px solid var(--hairline);
-}
-
-.realism-section:last-child { border-bottom: 0; padding-bottom: 0; }
-
-.subgroup-label {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  font-weight: 600;
-  color: var(--ink-soft);
-}
-
-/* per-source extras inside a card's Advanced fold */
+/* per-source extras inside a cell's Advanced fold */
 .card-extras {
   display: flex;
   flex-direction: column;
@@ -1708,6 +1841,11 @@ details.realism > summary { font-size: 13px; font-weight: 600; color: var(--ink)
 @media (prefers-reduced-motion: reduce) {
   .sweep { animation: none; background: rgba(253, 203, 110, 0.1); }
   .button:active { transform: none; }
+  /* The setup grids: a cell still marks itself under the pointer, it
+   * just does not move, and an opening cell appears rather than slides. */
+  .cell { transition: none; }
+  .cell:hover { transform: none; }
+  .cell-detail { animation: none; }
   /* The day's progress bar jumps rather than slides, and a finished day
    * waits to be played rather than playing itself -- see `maybeAutoplay`
    * in app.js, which reads the same preference. */
