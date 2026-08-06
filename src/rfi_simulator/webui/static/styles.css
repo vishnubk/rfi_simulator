@@ -1,38 +1,72 @@
-/* Interference simulator console.
+/* Interference simulator.
  *
- * Two rooms on one screen: the left and centre zones are the drafting
- * room -- paper, ink, fine rules -- and the right zone is the instrument
- * itself, a dark display surface. The site plan is the only loud thing
- * on the page; every other panel stays recessive so the data reads.
+ * Two tabs. Setup is five sections read top to bottom -- array, sky,
+ * interference, instrument, recording -- and inside them a grid of small
+ * cells, one per thing the run is made of, each expanding in place to its
+ * full form. Results is three stacked level panels -- voltages,
+ * visibilities, image -- each showing one plot and one primary switch,
+ * with everything else folded away.
+ *
+ * A control-room skin: charcoal command bar, white cards on a cool grey
+ * ground, monospace readouts, and a four-state status colour system
+ * (ok / warn / error / info) used everywhere a state is reported.
+ *
+ * Amber is reserved. It means "this is the one selected / active right
+ * now" -- the nav pill, a ticked interference kind, a shown ground-truth
+ * chip, a run in flight. It is never decoration.
  *
  * No external resources of any kind: system font stacks, no webfonts, no
  * images, an inline SVG favicon. The page renders with the network off.
  */
 
 :root {
-  --paper: #f7f5f0;
-  --room: #e7e4dd;
-  --room-edge: #d5d1c7;
-  --ink: #22242a;
-  --ink-soft: #5c5f68;
-  --ink-faint: #8b8d94;
+  /* ground and ink */
+  --app-bg: #f5f6fa;
+  --surface: #fff;
+  --ink: #2d3436;
+  --ink-soft: #636e72;
+  --ink-faint: #7f8c8d;
+  --hairline: #eee;
+  --hairline-strong: #f1f2f6;
+  --edge: #dfe6e9;
 
+  /* the command bar */
+  --bar: #2d3436;
+  --bar-ink: #fff;
+  --bar-ink-muted: #b2bec3;
+
+  /* accents */
+  --amber: #fdcb6e;          /* active / selected, nothing else */
+  --amber-line: #d4a017;
+  --amber-wash: #fffcf2;
+  --action: #0984e3;
+  --action-hover: #0873c4;
+
+  /* status system */
+  --ok-bg: #d8f3dc;
+  --ok-line: #2d6a4f;
+  --warn-bg: #ffeaa7;
+  --warn-line: #d4a017;
+  --error-bg: #fab1a0;
+  --error-line: #d63031;
+  --info-bg: #dfe6e9;
+  --info-line: #b2bec3;
+
+  /* the plotting surface: the three result canvases stay dark, because a
+   * sequential heatmap reads better against one. These tokens are the
+   * only dark ones and they pair with the constants in app.js. */
   --console: #171a1e;
-  --console-panel: #1e222a;
   --console-edge: #2b303a;
   --console-ink: #dfe3e8;
   --console-ink-soft: #9aa1ac;
+  --plot-point: #74b9ff;
 
-  --amber: #d98e32;
-  --amber-dim: #a86a1f;
-  --mask: #e4574b;
-  --cyan: #3e8fb0;
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: Menlo, Consolas, "SF Mono", ui-monospace, "DejaVu Sans Mono", monospace;
 
-  --font-display: "Avenir Next", "Segoe UI", system-ui, -apple-system, sans-serif;
-  --font-mono: "SF Mono", "Cascadia Mono", ui-monospace, "DejaVu Sans Mono", monospace;
-
-  --radius: 3px;
-  --gap: 14px;
+  --radius: 4px;
+  --radius-card: 6px;
+  --shadow-card: 0 1px 3px rgba(0, 0, 0, 0.08);
 }
 
 * { box-sizing: border-box; }
@@ -42,19 +76,13 @@
  * of a drawn chart. */
 [hidden] { display: none !important; }
 
-html, body {
-  height: 100%;
-}
-
 body {
   margin: 0;
-  background: var(--room);
+  background: var(--app-bg);
   color: var(--ink);
-  font-family: var(--font-display);
+  font-family: var(--font-ui);
   font-size: 14px;
-  line-height: 1.45;
-  display: flex;
-  flex-direction: column;
+  line-height: 1.5;
 }
 
 .mono {
@@ -63,109 +91,364 @@ body {
   font-size: 12px;
 }
 
-h1, h2, h3 { margin: 0; font-weight: 600; }
+h1, h2, h3, h4 { margin: 0; font-weight: 600; }
 
 :focus-visible {
-  outline: 2px solid var(--amber);
+  outline: 2px solid var(--action);
   outline-offset: 2px;
 }
 
-/* ------------------------------------------------------------ masthead */
-.masthead {
+/* ----------------------------------------------------------- top bar */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 10px 20px;
-  border-bottom: 1px solid var(--room-edge);
-  background: var(--paper);
+  gap: 8px 18px;
+  flex-wrap: wrap;
+  padding: 8px 20px;
+  background: var(--bar);
+  color: var(--bar-ink);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
 }
 
-.masthead-mark { color: var(--amber-dim); display: flex; }
+.topbar :focus-visible { outline-color: var(--amber); }
 
-.masthead-text h1 {
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-size: 15px;
-  letter-spacing: 0.02em;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  color: var(--bar-ink);
 }
 
-.masthead-text p {
-  margin: 0;
-  font-size: 12px;
-  color: var(--ink-soft);
+.brand svg { display: block; color: var(--amber); }
+
+/* Two real tabs in the command bar, and under it a second row of links
+ * into the Setup panel's sections. Both use the same pill: muted until
+ * hovered, amber when it is the one you are on. */
+.topnav {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
 }
 
-.masthead-meta {
-  margin: 0 0 0 auto;
-  display: grid;
-  grid-template-columns: auto auto;
-  gap: 0 10px;
-  color: var(--ink-soft);
-  text-align: right;
+.navlink {
+  padding: 4px 11px;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  text-decoration: none;
+  color: var(--bar-ink-muted);
+  white-space: nowrap;
+  cursor: pointer;
 }
 
-.masthead-meta dt { color: var(--ink-faint); }
-.masthead-meta dd { margin: 0; }
+.navlink:hover { color: var(--bar-ink); }
 
-/* -------------------------------------------------------------- layout */
-.console {
-  flex: 1;
-  min-height: 0;
-  display: grid;
-  grid-template-columns: 330px 350px minmax(0, 1fr);
-  gap: 1px;
-  background: var(--room-edge);
+.navlink.is-active {
+  background: var(--amber);
+  color: var(--ink);
+  font-weight: 600;
 }
 
-.zone {
-  min-width: 0;
-  min-height: 0;
+.topnav .navlink { font-weight: 600; }
+
+/* The Setup sections' own row, a shade lighter than the command bar so it
+ * reads as belonging to it rather than to the page. */
+.subbar {
+  position: sticky;
+  top: 42px;
+  z-index: 9;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+  padding: 5px 20px;
+  background: #3a4045;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.14);
+}
+
+.subbar :focus-visible { outline-color: var(--amber); }
+.navlink-sub { font-size: 12.5px; padding: 3px 10px; }
+
+.tab-panel {
   display: flex;
   flex-direction: column;
-  padding: 12px 16px 16px;
-  overflow: hidden;
+  gap: 16px;
 }
 
-.zone-site, .zone-sources { background: var(--room); }
-.zone-console { background: var(--console); color: var(--console-ink); }
+.topbar-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 
-.zone-head {
+.topbar-right .input {
+  width: auto;
+  min-width: 150px;
+  max-width: 220px;
+}
+
+/* -------------------------------------------------------------- layout */
+.page {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 20px 20px 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.page-lead {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.section {
+  background: var(--surface);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+  padding: 16px 18px 18px;
+  scroll-margin-top: 96px;   /* clears the command bar and the section row */
+}
+
+.section-head {
   display: flex;
   align-items: baseline;
-  flex-wrap: wrap;
-  gap: 4px 10px;
+  gap: 8px;
   padding-bottom: 8px;
-  margin-bottom: 10px;
-  border-bottom: 1px solid var(--room-edge);
+  border-bottom: 1px solid var(--hairline);
 }
 
-.zone-console .zone-head { border-bottom-color: var(--console-edge); }
+.section-number {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+}
 
-.panel-title {
+.section-title {
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+}
+
+.section-intro {
+  margin: 10px 0 16px;
+  max-width: 74ch;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.muted-inline { color: var(--ink-faint); }
+
+/* Three numbers in a section's own header -- what the section adds up
+ * to, read without scrolling into it. */
+.stat-strip {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+
+.stat {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.stat-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.stat-label {
   font-size: 11px;
   text-transform: uppercase;
-  letter-spacing: 0.14em;
-  font-weight: 600;
-  color: var(--ink-soft);
-  white-space: nowrap;
+  letter-spacing: 0.05em;
+  color: var(--ink-faint);
 }
-
-.zone-console .panel-title { color: var(--console-ink-soft); }
-
-.panel-note { margin-left: auto; color: var(--ink-faint); }
-.zone-console .panel-note { color: var(--console-ink-soft); }
 
 .hint {
   margin: 8px 0 0;
-  font-size: 11.5px;
+  font-size: 12.5px;
   color: var(--ink-faint);
-  line-height: 1.4;
 }
+
+.readout {
+  margin: 0 0 8px;
+  color: var(--ink-soft);
+}
+
+/* ------------------------------------------------------ status system */
+/* One compact monospace cell, four states. Used for the run status, and
+ * as the left-border treatment on anything that reports a state. */
+.status-cell {
+  display: inline-block;
+  padding: 3px 9px;
+  border-left: 3px solid var(--info-line);
+  border-radius: 0 3px 3px 0;
+  background: var(--info-bg);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.status-ok { background: var(--ok-bg); border-left-color: var(--ok-line); color: var(--ok-line); }
+.status-warn { background: var(--warn-bg); border-left-color: var(--warn-line); }
+.status-error { background: var(--error-bg); border-left-color: var(--error-line); color: #7a1416; }
+.status-info { background: var(--info-bg); border-left-color: var(--info-line); color: var(--ink-soft); }
+
+.topbar .status-cell { border-radius: 0 3px 3px 0; }
+
+/* full-width strips, for things that are about the whole page */
+.banner {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 12px;
+  margin-bottom: 8px;
+  border: 1px solid var(--info-line);
+  border-radius: var(--radius);
+  background: var(--info-bg);
+  color: var(--ink);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.banner-warn { background: var(--warn-bg); border-color: var(--warn-line); }
+.banner-error { background: var(--error-bg); border-color: var(--error-line); }
+
+.banner-kind {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--ink-soft);
+}
+
+.banner .button { margin-left: auto; flex: none; }
+
+/* small rounded labels, for per-item state */
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 9px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  background: var(--info-bg);
+  color: var(--ink-soft);
+}
+
+.badge-amber { background: var(--amber); color: var(--ink); }
+.badge-error { background: var(--error-bg); color: #7a1416; }
+
+/* ------------------------------------------------------ metric tables */
+.metric-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+}
+
+.metric-table th {
+  text-align: right;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+  background: var(--hairline-strong);
+  padding: 3px 8px;
+}
+
+.metric-table th:first-child,
+.metric-table td:first-child { text-align: left; }
+
+.metric-table td {
+  text-align: right;
+  padding: 3px 8px;
+  color: var(--ink);
+  border-bottom: 1px solid var(--hairline);
+}
+
+.metric-table td:first-child { color: var(--ink-soft); }
+.metric-table tr:last-child td { border-bottom: 0; }
+
+.metric-wrap { overflow-x: auto; margin: 8px 0 0; }
+.metric-wrap:empty { display: none; }
+
+/* --------------------------------------------------------------- array */
+.array-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.array-side { min-width: 0; }
+
+.array-add {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.hint-inline { margin-top: 0; }
+
+.array-load {
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.array-load .preset-row { margin-top: 4px; }
+
+.preset-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.preset-row .input { flex: 1; min-width: 0; }
+
+.site-meta {
+  margin: 0 0 12px;
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 2px 12px;
+  justify-content: start;
+  color: var(--ink);
+}
+
+.site-meta dt { color: var(--ink-faint); }
+.site-meta dd { margin: 0; }
 
 /* ---------------------------------------------------- site plan sheet */
 .sheet {
   position: relative;
-  background: var(--paper);
-  border: 1px solid var(--room-edge);
-  box-shadow: 0 1px 0 rgba(34, 36, 42, 0.06);
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
   aspect-ratio: 1 / 1;
   width: 100%;
 }
@@ -184,7 +467,7 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
   margin: 0;
   text-align: center;
   color: var(--ink-faint);
-  font-size: 12.5px;
+  font-size: 13px;
   pointer-events: none;
 }
 
@@ -193,38 +476,52 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
   right: 6px;
   bottom: 6px;
   padding: 2px 6px;
-  background: rgba(247, 245, 240, 0.9);
-  border: 1px solid var(--room-edge);
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
   color: var(--ink-soft);
   pointer-events: none;
 }
 
 /* site-plan internals (drawn as SVG, styled here) */
-.grid-minor { stroke: #d9d4c6; stroke-width: 0.5; }
-.grid-major { stroke: #bdb6a3; stroke-width: 0.8; }
-.grid-axis  { stroke: #9a927c; stroke-width: 1; }
+.grid-minor { stroke: var(--hairline-strong); stroke-width: 0.5; }
+.grid-major { stroke: var(--edge); stroke-width: 0.8; }
+.grid-axis  { stroke: var(--info-line); stroke-width: 1; }
 .grid-label { fill: var(--ink-faint); font-family: var(--font-mono); font-size: 9px; }
 .scalebar-line { stroke: var(--ink); stroke-width: 1.2; }
 .scalebar-text { fill: var(--ink-soft); font-family: var(--font-mono); font-size: 9px; }
-.compass-ring { fill: none; stroke: #bdb6a3; stroke-width: 0.8; }
+.compass-ring { fill: none; stroke: var(--edge); stroke-width: 0.8; }
 .compass-needle { stroke: var(--ink); stroke-width: 1.2; }
 .compass-text { fill: var(--ink-soft); font-family: var(--font-mono); font-size: 9px; }
 
+/* One dish per antenna, stamped from a <symbol> (see dishDefs in app.js).
+ * Fill and stroke are inherited properties, so setting them on the <use>
+ * reaches the shapes inside the symbol -- which is what lets one rule
+ * light the whole glyph amber while it is hovered or dragged. */
 .antenna { cursor: grab; }
 .antenna.dragging { cursor: grabbing; }
-.antenna-cross { stroke: var(--ink); stroke-width: 1.1; }
-.antenna-ring { fill: var(--paper); stroke: var(--ink); stroke-width: 1.1; }
-.antenna:hover .antenna-ring,
-.antenna.dragging .antenna-ring { fill: var(--amber); stroke: var(--ink); }
+
+.antenna-dish {
+  fill: var(--surface);
+  stroke: var(--ink);
+  stroke-width: 1.4;
+  stroke-linejoin: round;
+}
+
+/* Below the size at which the boom and pedestal read, the outline is
+ * drawn a touch heavier so a small dish keeps its shape. */
+.antenna-dish-small { stroke-width: 1.7; }
+
+.antenna:hover .antenna-dish,
+.antenna.dragging .antenna-dish { fill: var(--amber); stroke: var(--amber-line); }
+
 .antenna-hit { fill: transparent; }
 .antenna-label { fill: var(--ink-faint); font-family: var(--font-mono); font-size: 8.5px; }
 
 /* ------------------------------------------------------ antenna table */
 .antenna-table-wrap {
-  margin-top: 10px;
-  min-height: 0;
-  overflow-y: auto;
-  border-top: 1px solid var(--room-edge);
+  max-height: 260px;
+  overflow: auto;
 }
 
 .antenna-table {
@@ -232,29 +529,29 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
   border-collapse: collapse;
 }
 
-.antenna-table caption {
-  text-align: left;
-  padding: 8px 0 4px;
-}
-
 .antenna-table th {
   text-align: right;
-  font-weight: 500;
-  color: var(--ink-faint);
-  padding: 2px 6px;
-  border-bottom: 1px solid var(--room-edge);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
+  padding: 3px 8px;
+  background: var(--hairline-strong);
+  position: sticky;
+  top: 0;
 }
 
 .antenna-table th:first-child { text-align: left; }
 
 .antenna-table td {
-  padding: 1px 6px;
+  padding: 2px 8px;
   text-align: right;
-  color: var(--ink-soft);
-  border-bottom: 1px solid rgba(213, 209, 199, 0.5);
+  color: var(--ink);
+  border-bottom: 1px solid var(--hairline);
 }
 
-.antenna-table td:first-child { text-align: left; color: var(--ink-faint); }
+.antenna-table td:first-child { text-align: left; color: var(--ink-soft); }
 
 .row-remove {
   border: 0;
@@ -265,300 +562,685 @@ h1, h2, h3 { margin: 0; font-weight: 600; }
   padding: 0 2px;
 }
 
-.row-remove:hover { color: var(--mask); }
+.row-remove:hover { color: var(--error-line); }
 
-/* -------------------------------------------------------------- cards */
-.scroll-region {
-  flex: 1;
-  min-height: 0;
-  overflow-y: auto;
-  padding-right: 4px;
-}
-
-.group { margin-bottom: 18px; }
+/* -------------------------------------------------------------- groups */
+.group { margin-bottom: 24px; }
+.group:last-child { margin-bottom: 0; }
 
 .group-head {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
+  gap: 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--hairline);
 }
 
 .group-title {
-  font-size: 12px;
-  letter-spacing: 0.01em;
+  font-size: 12.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
 }
 
 .group-head .button { margin-left: auto; }
 
-.card-stack { display: flex; flex-direction: column; gap: 8px; }
-
-.card {
-  background: var(--paper);
-  border: 1px solid var(--room-edge);
-  border-radius: var(--radius);
-}
-
-.card-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--room-edge);
-}
-
-.card-kind {
-  font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
+.group-note {
+  margin-left: auto;
+  font-size: 12px;
   color: var(--ink-faint);
 }
 
-.card-head .card-name {
-  margin-left: auto;
-  width: 110px;
+.group-intro {
+  margin: 8px 0 12px;
+  max-width: 74ch;
+  color: var(--ink-soft);
+  font-size: 13px;
 }
 
-.card-swatch {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
+/* --------------------------------------------------------------- cells */
+/* Everything a run is made of -- a sky source, a spectral line, a
+ * transmitter, an instrument effect -- is one small cell in a grid: a
+ * name, the two or three numbers it is really about, and a More button.
+ * More expands that cell across the whole grid, in place, and shows the
+ * full form; nothing is unreachable, it is simply not all on screen at
+ * once. Density is the point, so the cells are plain: white, a hairline,
+ * and a lift on hover that says "this is a thing you can open". */
+.cell-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+
+.cell {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  padding: 9px 11px 10px;
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius-card);
+  transition: box-shadow 0.12s ease, transform 0.12s ease, border-color 0.12s ease;
+}
+
+.cell:hover {
+  border-color: var(--info-line);
+  box-shadow: var(--shadow-card);
+  transform: translateY(-1px);
+}
+
+/* An open cell takes the whole row and stops pretending to be small. */
+.cell.is-open {
+  grid-column: 1 / -1;
+  border-color: var(--info-line);
+  box-shadow: var(--shadow-card);
+  transform: none;
+}
+
+/* A switched-on instrument effect wears the amber edge every other
+ * "this one is active" on the page wears. */
+.cell.is-on { border-left: 3px solid var(--amber-line); background: var(--amber-wash); }
+
+/* Aligned to the top rather than the middle, so a title that wraps to
+ * two lines keeps its glyph and its switch beside the first of them. */
+.cell-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+}
+
+.cell-glyph {
   flex: none;
+  margin-top: 1px;
+  fill: none;
+  stroke: var(--ink-soft);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
 }
 
-.card-body { padding: 8px; }
+.cell.is-on .cell-glyph { stroke: var(--amber-line); }
 
-.card-remove {
+/* The name is editable where it is read, so it reads as a label until
+ * it is pointed at. */
+.cell-name {
+  flex: 1;
+  min-width: 0;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  padding: 2px 4px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: none;
+}
+
+.cell-name:hover { border-color: var(--edge); }
+.cell-name:focus { border-color: var(--action); background: var(--surface); outline: none; }
+
+.cell-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.cell-kind {
+  margin: -2px 0 0;
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--ink-faint);
+  font-weight: 600;
+}
+
+.cell-blurb {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--ink-soft);
+}
+
+.cell-lines {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 1px 10px;
+  margin: 0;
+  font-size: 11.5px;
+}
+
+.cell-lines dt { color: var(--ink-faint); }
+.cell-lines dd { margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+
+.cell-remove {
+  flex: none;
   border: 0;
   background: none;
   color: var(--ink-faint);
   cursor: pointer;
-  font-size: 14px;
+  font-size: 15px;
   line-height: 1;
-  padding: 2px 4px;
+  padding: 2px 3px;
 }
 
-.card-remove:hover { color: var(--mask); }
+.cell-remove:hover { color: var(--error-line); }
 
-.field-grid {
+.cell-switch { flex: none; padding: 2px 9px 2px 7px; }
+
+.cell-more {
+  align-self: flex-start;
+  margin-top: auto;
+  padding: 2px 0;
+  border: 0;
+  background: none;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--action);
+  cursor: pointer;
+}
+
+.cell-more:hover { text-decoration: underline; }
+
+.cell-detail {
+  margin-top: 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+  animation: cell-open 0.14s ease-out;
+}
+
+@keyframes cell-open {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: none; }
+}
+
+.cell-intro {
+  margin: 0 0 10px;
+  max-width: 74ch;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.cell-foot { margin-top: 12px; }
+
+/* The last cell in a grid: the way another one is added, in the same
+ * shape as the things it makes. */
+.cell-ghost {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 64px;
+  padding: 9px 11px;
+  border: 1px dashed var(--info-line);
+  border-radius: var(--radius-card);
+  background: none;
+  font-family: inherit;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+
+.cell-ghost:hover {
+  border-color: var(--action);
+  color: var(--action);
+  background: var(--surface);
+}
+
+.cell-ghost-plus { font-size: 15px; line-height: 1; }
+
+/* the sky source's position: one quantity, three ways of writing it */
+.position-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.position-inputs {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px 10px;
+  gap: 12px;
 }
 
-.field { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.position-note {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+/* out of the imaged field: amber, like every other partial state */
+.position-note.position-warn {
+  color: var(--ink);
+  background: var(--warn-bg);
+  border-left: 3px solid var(--warn-line);
+  border-radius: 0 3px 3px 0;
+  padding: 5px 9px;
+}
+
+/* -------------------------------------------------------------- fields */
+.field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 14px 18px;
+  align-items: start;
+}
+
+.field { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .field-wide { grid-column: 1 / -1; }
 
 .field-label {
-  font-size: 10.5px;
-  color: var(--ink-soft);
-  letter-spacing: 0.02em;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
 }
 
-.field-unit { color: var(--ink-faint); }
+.field-unit { color: var(--ink-faint); font-weight: 400; }
+
+.field-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--ink-faint);
+  max-width: 62ch;
+}
+
+.field-toggle .field-hint { margin-left: 24px; }
+
+.toggle-label {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.toggle-label input { margin: 0; flex: none; }
 
 .input {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
-  font-size: 12px;
-  padding: 3px 5px;
-  border: 1px solid var(--room-edge);
+  font-size: 12.5px;
+  padding: 5px 7px;
+  border: 1px solid var(--edge);
   border-radius: var(--radius);
-  background: #fff;
+  background: var(--surface);
   color: var(--ink);
   width: 100%;
   min-width: 0;
 }
 
-textarea.input { resize: vertical; min-height: 64px; line-height: 1.35; }
+.input:focus { border-color: var(--action); }
+.input:disabled { background: var(--hairline-strong); color: var(--ink-faint); }
 
-.input-dark {
-  background: var(--console-panel);
-  border-color: var(--console-edge);
-  color: var(--console-ink);
+textarea.input { resize: vertical; min-height: 72px; line-height: 1.35; }
+
+.input-small { width: auto; padding: 3px 5px; }
+
+/* ------------------------------------------------- interference picker */
+/* One tick box per kind of transmitter, named after the thing in the
+ * world and described in a line. A ticked kind wears the amber left
+ * border, so which are in the run is legible without reading the cards
+ * underneath. */
+.kind-legend { margin: 0 0 8px; }
+
+.kind-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 10px;
+  margin-bottom: 18px;
 }
 
-.input-small { width: auto; padding: 2px 4px; }
+.kind-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 12px;
+  border: 1px solid var(--edge);
+  border-left: 3px solid var(--edge);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  background: var(--surface);
+  cursor: pointer;
+}
 
-.add-row {
+.kind-card:hover { border-color: var(--info-line); }
+
+.kind-card.kind-on {
+  border-color: var(--edge);
+  border-left-color: var(--amber-line);
+  background: var(--amber-wash);
+}
+
+.kind-box { margin: 3px 0 0; flex: none; }
+
+.kind-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.kind-title {
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-bottom: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
 }
 
-.add-row .input { flex: 1; }
-
-.type-summary {
-  margin: 0 0 8px;
-  font-size: 11.5px;
-  color: var(--ink-faint);
+.kind-count {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: var(--amber);
+  color: var(--ink);
 }
 
-.empty-note {
-  margin: 0;
-  font-size: 11.5px;
-  color: var(--ink-faint);
-  font-style: italic;
+.kind-blurb {
+  font-size: 12.5px;
+  line-height: 1.35;
+  color: var(--ink-soft);
 }
+
+/* ------------------------------------------------ progressive disclosure */
+details.advanced {
+  margin-top: 14px;
+  border-top: 1px solid var(--hairline);
+  padding-top: 10px;
+}
+
+details.advanced > summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  list-style: revert;
+}
+
+details.advanced > summary:hover { color: var(--ink); }
+
+details.advanced[open] > summary { margin-bottom: 12px; }
+
+.advanced-card {
+  margin: 14px 0 0;
+  padding: 10px 0 0;
+  border-top: 1px solid var(--hairline);
+}
+
+/* per-source extras inside a cell's Advanced fold */
+.card-extras {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.extra .checkline {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  gap: 8px;
+  cursor: pointer;
+}
+
+.extra-numbers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin: 6px 0 4px 24px;
+}
+
+.extra-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.extra-field-label {
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.extra .field-hint { margin-left: 24px; }
+
+.card-extras .input-small { width: 110px; }
 
 /* ------------------------------------------------------------ buttons */
 .button {
   font-family: inherit;
-  font-size: 12px;
-  padding: 4px 10px;
-  border: 1px solid var(--ink);
+  font-size: 13px;
+  padding: 5px 14px;
+  border: 1px solid var(--edge);
   border-radius: var(--radius);
-  background: var(--paper);
+  background: var(--surface);
   color: var(--ink);
   cursor: pointer;
 }
 
-.button:hover { background: #fff; }
+.button:hover { border-color: var(--info-line); background: var(--hairline-strong); }
 .button:active { transform: translateY(1px); }
-.button[disabled] { opacity: 0.45; cursor: default; transform: none; }
 
-.button-small { font-size: 11px; padding: 2px 8px; }
+.button[disabled] {
+  color: var(--ink-faint);
+  background: var(--hairline-strong);
+  border-color: var(--edge);
+  cursor: default;
+  transform: none;
+}
 
-.button-quiet {
-  border-color: var(--room-edge);
-  color: var(--ink-soft);
+.button-small { font-size: 12px; padding: 3px 10px; }
+
+.button-quiet { color: var(--ink-soft); }
+
+/* the action colour: the buttons that do the thing this page is for */
+.button-accent,
+.button-run {
+  background: var(--action);
+  border-color: var(--action);
+  color: #fff;
+  font-weight: 600;
+}
+
+.button-accent:hover,
+.button-run:hover { background: var(--action-hover); border-color: var(--action-hover); }
+
+.button-accent[disabled],
+.button-run[disabled] {
+  background: #6f9fc4;
+  border-color: #6f9fc4;
+  color: #f2f6fa;
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 4px;
 }
 
 .run-bar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
-  padding-top: 10px;
-  margin-top: 10px;
-  border-top: 1px solid var(--room-edge);
+  padding: 14px 0 0;
+  margin-top: 16px;
+  border-top: 1px solid var(--hairline);
 }
 
-.button-run {
-  background: var(--amber);
-  border-color: var(--amber-dim);
-  color: #23180a;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  padding: 6px 16px;
-}
+.run-wall { margin-left: auto; color: var(--ink-faint); }
 
-.button-run:hover { background: #e59b45; }
-
-.run-status { color: var(--ink-soft); }
-
-/* ------------------------------------------------------------ console */
-.notice-area { margin-bottom: 10px; }
+/* ------------------------------------------------------------ notices */
+.notice-area { margin-bottom: 12px; }
 .notice-area:empty { display: none; }
 
-.notice {
+.results-head { margin: 4px 0 12px; }
+
+/* --------------------------------------------------- recent-run strip */
+/* The last few completed runs, held in memory only. Sliding back
+ * re-renders a stored response; nothing is re-requested and nothing
+ * polls. */
+.runs-strip {
   display: flex;
-  gap: 8px;
-  padding: 6px 9px;
-  margin-bottom: 6px;
-  border-left: 2px solid var(--amber);
-  background: rgba(217, 142, 50, 0.08);
-  color: var(--console-ink-soft);
-  font-size: 12px;
-  line-height: 1.4;
+  align-items: center;
+  gap: 10px 14px;
+  flex-wrap: wrap;
+  padding: 7px 12px;
+  margin-bottom: 10px;
+  background: var(--hairline-strong);
+  border-radius: var(--radius);
 }
 
-.notice-error {
-  border-left-color: var(--mask);
-  background: rgba(228, 87, 75, 0.1);
-  color: #f2c8c3;
+.runs-dots { display: flex; align-items: center; gap: 6px; }
+
+.run-dot {
+  width: 13px;
+  height: 13px;
+  padding: 0;
+  border: 1px solid var(--info-line);
+  border-radius: 50%;
+  background: var(--surface);
+  cursor: pointer;
 }
 
-.notice-kind {
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  flex: none;
-  color: var(--console-ink-soft);
+.run-dot:hover { border-color: var(--ink-soft); }
+
+.run-dot.is-active {
+  background: var(--amber);
+  border-color: var(--amber-line);
 }
 
-.console-grid {
-  flex: 1;
-  min-height: 0;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  grid-template-rows: minmax(210px, 1.15fr) minmax(190px, 1fr);
-  gap: 12px;
-  overflow-y: auto;
+.runs-meta { color: var(--ink-soft); }
+.runs-strip .button { margin-left: auto; }
+
+/* ------------------------------------------------------------ results */
+/* Three panels, one per level the data passes through, stacked in the
+ * order the data moves: voltages, visibilities, image. Stacked rather than
+ * tiled because each one is read as a picture, and a half-width picture of
+ * a dynamic spectrum is not worth having. */
+.results {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
 }
 
+/* a plot-card: white frame, dark plotting surface inside it */
 .display {
   margin: 0;
   min-width: 0;
-  min-height: 0;
   display: flex;
   flex-direction: column;
-  background: var(--console-panel);
-  border: 1px solid var(--console-edge);
-  border-radius: var(--radius);
-  padding: 8px 10px 10px;
+  background: var(--surface);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+  padding: 12px 14px 14px;
+  color: var(--ink);
 }
-
-.display-wide { grid-column: 1 / -1; }
 
 .display figcaption {
   display: flex;
   align-items: baseline;
-  gap: 8px;
-  margin-bottom: 6px;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .display-title {
-  font-size: 11px;
+  font-size: 12.5px;
+  font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.14em;
-  color: var(--console-ink);
+  letter-spacing: 0.04em;
+  color: var(--ink-soft);
 }
 
-.display-sub { margin-left: auto; color: var(--console-ink-soft); }
+.display-sub { margin-left: auto; color: var(--ink-faint); }
+
+.display-note {
+  margin: 6px 0 10px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--ink-soft);
+  max-width: 78ch;
+}
 
 .display-controls {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 18px;
   flex-wrap: wrap;
-  margin-bottom: 6px;
-  color: var(--console-ink-soft);
+  margin-bottom: 10px;
 }
 
-.control-sep {
-  width: 1px;
-  height: 14px;
-  background: var(--console-edge);
+.control-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
-.mask-toggles { display: flex; gap: 6px; flex-wrap: wrap; }
+.control-group .field-label { color: var(--ink-soft); font-weight: 600; }
 
+/* the ground-truth overlay: the point of the whole page, so it is labelled
+ * in full rather than abbreviated into a row of chips */
+.truth-bar {
+  padding: 9px 12px;
+  margin-bottom: 10px;
+  border-left: 3px solid var(--error-line);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  background: var(--hairline-strong);
+}
+
+.truth-title {
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  color: var(--ink);
+}
+
+.truth-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px 16px;
+  flex-wrap: wrap;
+}
+
+.mask-toggles { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+
+/* a shown ground-truth layer is a selected thing: amber */
 .mask-toggle {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
   font-family: var(--font-mono);
   font-size: 11px;
-  padding: 1px 6px 1px 4px;
-  border: 1px solid var(--console-edge);
-  border-radius: 10px;
-  background: transparent;
-  color: var(--console-ink-soft);
+  padding: 2px 9px 2px 6px;
+  border: 1px solid var(--edge);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--ink-soft);
   cursor: pointer;
 }
 
+.mask-toggle:hover { border-color: var(--info-line); }
+
 .mask-toggle[aria-pressed="true"] {
-  border-color: var(--mask);
-  color: #f3cdc9;
+  background: var(--amber);
+  border-color: var(--amber-line);
+  color: var(--ink);
 }
 
 .mask-chip {
   width: 8px;
   height: 8px;
   border-radius: 2px;
-  background: var(--mask);
+  background: var(--error-line);
   opacity: 0.35;
 }
 
@@ -567,49 +1249,26 @@ textarea.input { resize: vertical; min-height: 64px; line-height: 1.35; }
 .checkline {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  font-size: 11px;
-  color: var(--console-ink-soft);
+  gap: 5px;
+  font-size: 12px;
+  color: var(--ink-soft);
 }
 
-/* ------------------------------------------------------------- realism */
-#realism-details summary {
-  cursor: pointer;
-  margin-bottom: 8px;
-  list-style: revert;
-}
-
-#realism-details[open] summary { margin-bottom: 10px; }
-
-.realism-grid { margin-bottom: 4px; }
-
-.subgroup-label {
-  grid-column: 1 / -1;
-  font-size: 10.5px;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--ink-faint);
-  margin: 6px 0 -2px;
-}
-
-.card-extras {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px 12px;
-  padding: 6px 8px 8px;
-  border-top: 1px solid var(--room-edge);
-}
-
-.card-extras .checkline { color: var(--ink-soft); }
-
-.card-extras .input-small { width: 68px; }
-
+/* the dark plotting surface, the only one on the page */
 .canvas-wrap {
   position: relative;
   flex: 1;
-  min-height: 120px;
+  min-height: 260px;
+  background: var(--console);
+  border-radius: var(--radius);
+  overflow: hidden;
 }
+
+/* A level panel's own picture is the reason the panel exists, so it gets
+ * the room; the folds under it can be as short as they like. */
+#panel-voltages > .canvas-wrap,
+#panel-visibilities > .canvas-wrap,
+#panel-image > .canvas-wrap { min-height: 360px; }
 
 .canvas-wrap canvas,
 .canvas-wrap svg {
@@ -626,7 +1285,7 @@ textarea.input { resize: vertical; min-height: 64px; line-height: 1.35; }
   align-items: center;
   justify-content: center;
   color: var(--console-ink-soft);
-  font-size: 12.5px;
+  font-size: 13px;
 }
 
 .sweep {
@@ -636,7 +1295,7 @@ textarea.input { resize: vertical; min-height: 64px; line-height: 1.35; }
   background: linear-gradient(
     100deg,
     transparent 40%,
-    rgba(217, 142, 50, 0.16) 50%,
+    rgba(253, 203, 110, 0.16) 50%,
     transparent 60%
   );
   background-size: 260% 100%;
@@ -648,11 +1307,356 @@ textarea.input { resize: vertical; min-height: 64px; line-height: 1.35; }
   to { background-position: -130% 0; }
 }
 
-/* uv plot internals */
-.uv-axis { stroke: #39404b; stroke-width: 1; }
-.uv-grid { stroke: #262c35; stroke-width: 1; }
-.uv-tick-label { fill: var(--console-ink-soft); font-family: var(--font-mono); font-size: 9px; }
-.uv-point { fill: var(--amber); }
+.canvas-wrap-tall { min-height: 340px; margin-top: 8px; }
+
+/* ------------------------------------------------------- switches */
+/* A panel's primary toggle. It is a real button carrying aria-pressed, and
+ * it lights amber when on, like every other "this is the selected thing"
+ * on the page. Everything a panel can do beyond its one switch lives in a
+ * fold, because the panels are read far more often than adjusted. */
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 12px 4px 9px;
+  border: 1px solid var(--edge);
+  border-radius: 13px;
+  background: var(--surface);
+  font-family: inherit;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+
+.switch:hover { border-color: var(--info-line); }
+
+.switch[aria-pressed="true"] {
+  background: var(--amber);
+  border-color: var(--amber-line);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.switch[disabled] {
+  color: var(--ink-faint);
+  background: var(--hairline-strong);
+  cursor: default;
+}
+
+.switch-dot {
+  width: 9px;
+  height: 9px;
+  border: 1px solid var(--info-line);
+  border-radius: 50%;
+  background: var(--surface);
+  flex: none;
+}
+
+.switch[aria-pressed="true"] .switch-dot {
+  background: var(--ink);
+  border-color: var(--ink);
+}
+
+/* --------------------------------------------------- antenna thumbnails */
+/* Every antenna's dynamic spectrum at once, on the run's shared colour
+ * scale so they can be read against each other; this is what the voltage
+ * panel opens on. Clicking a tile features that antenna full size.
+ *
+ * The column count is set by JS as --ant-cols (see thumbnailColumns), and
+ * the columns are fractions rather than a minimum width, so the wall fills
+ * the panel exactly for ten antennas and for ninety-six alike and never
+ * scrolls sideways. Tiles keep one aspect ratio at every count. */
+.thumb-panel { margin-top: 2px; }
+
+.thumb-grid {
+  display: grid;
+  grid-template-columns: repeat(var(--ant-cols, 5), minmax(0, 1fr));
+  gap: 6px;
+  padding: 8px;
+  background: var(--console);
+  border-radius: var(--radius);
+}
+
+.thumb {
+  position: relative;
+  display: block;
+  padding: 0;
+  border: 1px solid var(--console-edge);
+  border-radius: 3px;
+  background: var(--console);
+  cursor: pointer;
+  overflow: hidden;
+  line-height: 0;
+  aspect-ratio: 16 / 9;
+}
+
+.thumb:hover { border-color: var(--console-ink-soft); }
+.thumb.is-active { border-color: var(--amber); box-shadow: 0 0 0 1px var(--amber); }
+
+.thumb-canvas { display: block; width: 100%; height: 100%; }
+
+.thumb-label {
+  position: absolute;
+  left: 3px;
+  top: 2px;
+  padding: 0 4px;
+  border-radius: 2px;
+  background: rgba(23, 26, 30, 0.7);
+  color: var(--console-ink);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.thumb-sub { display: block; margin: 6px 0 0; }
+
+/* ------------------------------------------------------- the flagger */
+/* A classical method run on the same voltages and scored against the same
+ * ground truth. The outcome colours are the page's own: green for right,
+ * the mask red for what was missed, amber for a false alarm. */
+.flagger-methods {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.flagger-method-name { font-size: 13px; font-weight: 600; color: var(--ink); }
+.flagger-method .field-hint { margin-top: 3px; }
+.flagger-method-grid { font-family: var(--font-mono); font-size: 11px; }
+
+.flagger-run-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.flagger-pills { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
+.flagger-pills:empty { display: none; }
+
+.flagger-legend {
+  display: flex;
+  gap: 8px 18px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+.flagger-legend:empty { display: none; }
+
+/* The traces named under a paper plot -- the bandpass's two receptors,
+ * the flag fraction's method against the truth. Same idiom as the
+ * flagger's own legend, so a swatch means the same thing everywhere. */
+#bandpass-legend,
+#flagfrac-legend {
+  display: flex;
+  gap: 6px 18px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 8px;
+}
+
+#bandpass-legend:empty,
+#flagfrac-legend:empty { display: none; }
+
+.legend-item { display: inline-flex; align-items: center; gap: 6px; }
+
+.legend-swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  border: 1px solid var(--edge);
+  flex: none;
+}
+
+.flagger-grid-note { display: block; margin: 8px 0 0; }
+.flagger-grid-note:empty { display: none; }
+
+.muted-line {
+  margin: 10px 0 0;
+  font-size: 12.5px;
+  color: var(--ink-faint);
+}
+
+/* The same sentence, in the same place, saying something the reader has
+ * to act on: an empty day and why it is empty. */
+.muted-line-warn {
+  color: var(--ink);
+  border-left: 3px solid var(--amber-line);
+  padding: 4px 10px;
+  background: var(--amber-wash);
+  border-radius: 0 3px 3px 0;
+}
+
+/* ------------------------------------------------- image panel extras */
+.vis-spectra-note { display: block; margin: 8px 0 0; }
+
+.uv-block {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--hairline);
+}
+
+.uv-sub-line { display: block; margin: 0; }
+
+/* The uv plane is the one plot on the page drawn on white.
+ *
+ * The waterfalls and the images keep the dark console ground because a
+ * sequential colour ramp needs one: magma's low end *is* near-black, and
+ * on white the whole bottom half of the scale would be invisible. The uv
+ * plane has no ramp. It is a scatter of identical marks, and a scatter of
+ * small dots reads better as ink on paper -- the marks are what carries
+ * the information, and the grid can recede properly instead of having to
+ * out-glow a dark field. */
+/* Squarish and no wider than it is tall: the uv plane has no preferred
+ * direction, and stretching it across a full-width panel would put a
+ * hundred pixels of dot in the middle of a thousand pixels of paper. */
+.uv-wrap {
+  position: relative;
+  height: 340px;
+  max-width: 420px;
+  margin-top: 8px;
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.uv-wrap svg { display: block; width: 100%; height: 100%; }
+
+.uv-axis { stroke: var(--edge); stroke-width: 1; }
+.uv-grid { stroke: #e8ecef; stroke-width: 1; fill: none; }
+.uv-tick-label { fill: var(--ink-faint); font-family: var(--font-mono); font-size: 9px; }
+.uv-axis-label { fill: var(--ink-soft); font-family: var(--font-mono); font-size: 10px; }
+.uv-point { fill: var(--action); fill-opacity: 0.72; }
+
+/* ------------------------------------------------------- chip bars */
+/* A row of chips sitting directly on top of the picture they change.
+ * Clicking one paints something over the plot below, so it belongs
+ * above the plot and nowhere else -- a control folded away in an
+ * expander cannot be understood as "this switch paints that layer". */
+.chip-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 8px;
+}
+
+.chip-bar-label {
+  font-size: 10px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.chip-set { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+
+/* Pressed is amber, the page's one "this is the selected thing" colour.
+ * A chip carrying a colour key shows it as a small square, so the wash
+ * on the plot below can be traced back to the chip that put it there. */
+.chip[aria-pressed="true"] {
+  background: var(--amber);
+  border-color: var(--amber-line);
+  color: var(--ink);
+}
+
+.chip-swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: -1px;
+  opacity: 0.55;
+}
+
+.chip[aria-pressed="true"] .chip-swatch { opacity: 1; }
+
+/* A chip whose mask is being computed. The dot spins in place rather
+ * than the chip changing size, so the row does not reflow mid-click. */
+.chip-spinner {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 5px;
+  vertical-align: -1px;
+  border: 1.5px solid var(--amber-line);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: chip-spin 0.7s linear infinite;
+}
+
+@keyframes chip-spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .chip-spinner { animation: none; opacity: 0.6; }
+}
+
+/* ------------------------------------------------------- subplots */
+/* A second, smaller plot under a panel's main picture -- the bandpass
+ * under the dynamic spectrum, the flag fraction under the overlay. It
+ * shares the panel's x axis in spirit (frequency), so it is separated by
+ * a hairline rather than being made to look like its own panel. */
+.subplot {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+.subplot-title {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.subplot-title .display-sub { font-weight: 400; }
+
+/* The subplots draw on paper, not on the console: they are line plots,
+ * and `drawLinePlot` paints no background of its own, so the wrap has to
+ * supply the white the plot was designed against. */
+.subplot .canvas-wrap {
+  min-height: 170px;
+  background: var(--surface);
+  border: 1px solid var(--edge);
+}
+
+.canvas-wrap-short { min-height: 170px; }
+
+.zone-line { margin: 0 0 12px; }
+
+/* ------------------------------------------------------- sky legend */
+.sky-howto { margin: 8px 0 0; }
+
+.sky-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 8px;
+}
+
+/* The legend and the how-to sit on the chart's dark ground, so they take
+ * the console's ink rather than the page's. */
+.sky-howto { color: var(--console-ink-soft); }
+.sky-howto strong { color: var(--console-ink); font-weight: 600; }
+
+.sky-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--console-ink-soft);
+}
+
+.sky-legend-item svg { width: 16px; height: 16px; flex: none; }
+
+.sky-legend-item svg { display: block; overflow: visible; }
 
 /* ------------------------------------------------------------ tooltip */
 .tooltip {
@@ -662,28 +1666,188 @@ textarea.input { resize: vertical; min-height: 64px; line-height: 1.35; }
   background: rgba(23, 26, 30, 0.95);
   border: 1px solid var(--console-edge);
   color: var(--console-ink);
-  padding: 4px 7px;
+  padding: 5px 8px;
   border-radius: var(--radius);
   white-space: pre;
   line-height: 1.35;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
 }
 
+/* ----------------------------------------------- the mock observatory */
+
+.obs-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px 16px;
+  margin-bottom: 14px;
+}
+
+/* Shortcut chips under the declination box. They are shortcuts, not modes:
+ * pressing one writes a number into the field above and nothing else, so
+ * none of them stays lit. */
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 5px;
+}
+.chip {
+  font: inherit;
+  font-size: 11.5px;
+  padding: 2px 9px;
+  border: 1px solid var(--edge);
+  border-radius: 11px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+.chip:hover { border-color: var(--amber-line); color: var(--ink); background: var(--amber-wash); }
+.chip[disabled] { opacity: 0.45; cursor: default; }
+.chip[disabled]:hover { border-color: var(--edge); background: var(--surface); color: var(--ink-soft); }
+
+/* A hint that has turned into a warning: same place, same size, one
+ * colour change, so it is read as the same sentence saying something
+ * stronger rather than as a new element appearing. */
+.field-hint-warn { color: var(--amber-line); }
+
+.obs-run-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.progress {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--hairline-strong);
+  overflow: hidden;
+  margin-bottom: 10px;
+}
+.progress-fill {
+  height: 100%;
+  width: 0;
+  background: var(--action);
+  transition: width 0.2s linear;
+}
+
+.canvas-wrap-square {
+  min-height: 0;
+  aspect-ratio: 1 / 1;
+  max-width: 460px;
+  width: 100%;
+  margin: 0 auto;
+}
+.movie-row { display: flex; justify-content: center; }
+.movie-controls { align-items: center; }
+#movie-canvas:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
+/* The image is a play/pause control, so it says so under the pointer. */
+#movie-canvas { cursor: pointer; }
+
+/* --- the timeline: one band, twenty-four hours ------------------------ */
+.timeline { margin-top: 14px; }
+.timeline svg {
+  display: block;
+  width: 100%;
+  height: 92px;
+  cursor: crosshair;
+  border-radius: var(--radius);
+}
+.timeline svg:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+.timeline-legend {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+.tl-label {
+  fill: var(--ink-faint);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+}
+.tl-marker-label {
+  fill: var(--amber-line);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+}
+.tl-marker { stroke: var(--amber-line); stroke-width: 1.2; }
+.tl-marker-faint { stroke: var(--info-line); stroke-width: 1; stroke-dasharray: 2 3; }
+.tl-satellite { stroke: #00cec9; stroke-width: 1.4; }
+.tl-playhead { stroke: var(--ink); stroke-width: 1.4; }
+.tl-playhead-head { fill: var(--ink); }
+.tl-frame-tick { stroke: rgba(255, 255, 255, 0.28); stroke-width: 1; }
+.tl-frame-tick-pending { stroke: rgba(255, 255, 255, 0.08); }
+.tl-rule { stroke: var(--edge); stroke-width: 1; }
+
+/* --- the live monitor ------------------------------------------------ */
+.sky-layout {
+  display: grid;
+  grid-template-columns: minmax(280px, 460px) minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+.sky-chart-wrap {
+  background: var(--console);
+  border-radius: var(--radius);
+  padding: 8px;
+}
+/* Scoped to the chart itself: the legend's own 16px glyph swatches are
+ * SVGs inside the same wrap and must keep their intrinsic size. */
+#sky-chart { display: block; width: 100%; height: auto; }
+.sky-side { min-width: 0; }
+.layer-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.sky-ring { fill: none; stroke: #39404b; stroke-width: 1; }
+.sky-ring-dashed { fill: none; stroke: #39404b; stroke-width: 1; stroke-dasharray: 3 4; }
+.sky-cardinal {
+  fill: #9aa1ac;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-anchor: middle;
+}
+.sky-tick { fill: #6c7480; font-family: var(--font-mono); font-size: 8.5px; }
+.sky-sun { fill: #fdcb6e; }
+.sky-moon { fill: #dfe3e8; }
+.sky-source { fill: #74b9ff; }
+.sky-satellite { fill: #00cec9; }
+.sky-aircraft { fill: none; stroke: #e17055; stroke-width: 1.2; }
+.sky-glyph-label {
+  fill: #9aa1ac;
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+}
+
 /* --------------------------------------------------------- responsive */
-@media (max-width: 1100px) {
-  body { height: auto; }
-  .console {
-    grid-template-columns: minmax(0, 1fr);
-  }
-  .zone { overflow: visible; }
-  .scroll-region, .antenna-table-wrap { overflow: visible; }
-  .console-grid { grid-template-rows: none; overflow: visible; }
-  .console-grid .display { min-height: 260px; }
-  .masthead { flex-wrap: wrap; }
-  .masthead-meta { margin-left: 0; text-align: left; }
+@media (max-width: 960px) {
+  .array-layout { grid-template-columns: minmax(0, 1fr); }
+  .sky-layout { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* Narrow enough that the command bar wraps to two rows, so the section row
+ * can no longer be pinned under a bar of known height: it scrolls away
+ * with the page instead of covering it. */
+@media (max-width: 760px) {
+  .topbar { gap: 8px 12px; padding: 8px 14px; }
+  .topbar-right { margin-left: 0; width: 100%; }
+  .topbar-right .input { flex: 1; max-width: none; }
+  .subbar { position: static; padding: 5px 14px; }
+  .section { padding: 14px; scroll-margin-top: 12px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .sweep { animation: none; background: rgba(217, 142, 50, 0.08); }
+  .sweep { animation: none; background: rgba(253, 203, 110, 0.1); }
   .button:active { transform: none; }
+  /* The setup grids: a cell still marks itself under the pointer, it
+   * just does not move, and an opening cell appears rather than slides. */
+  .cell { transition: none; }
+  .cell:hover { transform: none; }
+  .cell-detail { animation: none; }
+  /* The day's progress bar jumps rather than slides, and a finished day
+   * waits to be played rather than playing itself -- see `maybeAutoplay`
+   * in app.js, which reads the same preference. */
+  .progress-fill { transition: none; }
 }

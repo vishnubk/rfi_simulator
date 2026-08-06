@@ -21,6 +21,16 @@ ground truth by construction.
 peak, which keeps empty channels from taking the colour scale to minus
 infinity and makes the scale comparable between runs of the same setup.
 
+**Three levels, one run.** A response describes the same observation at
+the three places an excision method can work: the per-antenna voltages
+(`_WaterfallReducer`), the correlated visibilities
+(`_visibility_payload`) and the dirty image. Each level is reduced under
+its own budget, and each carries the ground truth *of that level* --
+occupancy masks at voltage resolution, ``rfi_fraction`` at the
+integration grid -- rather than one level's truth redrawn on another's
+axes. `run_flaggers` adds a fourth thing to compare against: what the
+classical methods actually catch.
+
 **Units at the boundary.** The library speaks hertz, metres, seconds and
 janskys, and so does this API. Field descriptors in `defaults_payload`
 carry a display unit and a multiplier so the browser can show megahertz
@@ -29,7 +39,10 @@ without either side inventing a second convention.
 
 from __future__ import annotations
 
+import logging
 import math
+import os
+import re
 import time
 import warnings
 from collections.abc import Iterator
@@ -37,6 +50,8 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import numpy as np
+from astropy import units as u
+from astropy.coordinates import SkyCoord
 from astropy.time import Time
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -69,12 +84,29 @@ from rfi_simulator.channelizer import (
     DEFAULT_WINDOW,
 )
 from rfi_simulator.delays import earth_location, zenith_coord
+from rfi_simulator.flaggers import mad_clip_mask, spectral_kurtosis_mask, sumthreshold_mask
+from rfi_simulator.metrics import flag_scores, pool_truth_accumulations
+from rfi_simulator.sky import lm_from_radec
 from rfi_simulator.voltages import DEFAULT_CHAN_WIDTH_HZ, DEFAULT_QUANT_TARGET_COUNTS
 
+_log = logging.getLogger(__name__)
+
+_SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
+
+ARRAY_DIR_ENV_VAR = "RFI_SIMULATOR_ARRAY_DIR"
+"""str: Environment variable naming a directory of extra array
+configurations, offered alongside the bundled ones. `main` sets it from
+``--array-dir`` so the value survives into the process the reloader
+starts."""
+
 __all__ = [
+    "ARRAY_DIR_ENV_VAR",
     "DEFAULT_CENTER_FREQ_HZ",
     "DEFAULT_N_BLOCKS",
     "DEFAULT_N_CHAN",
+    "FLAG_DOMAINS",
+    "FLAG_METHODS",
+    "FlagRequest",
     "MAX_ANTENNAS",
     "MAX_COORDINATE_M",
     "MAX_N_BLOCKS",
@@ -84,9 +116,14 @@ __all__ = [
     "MAX_TOTAL_SAMPLES",
     "START_TIME_UTC",
     "SimulateRequest",
+    "array_catalogue",
+    "array_detail",
+    "array_summaries",
     "build_simulator",
     "default_array",
     "defaults_payload",
+    "pointing_payload",
+    "run_flaggers",
     "run_simulation",
     "sample_tle_text",
 ]
@@ -113,7 +150,7 @@ DEFAULT_CENTER_FREQ_HZ = 1.405e9
 DEFAULT_NOISE_STD = 1.0
 DEFAULT_SEED = 20260730
 
-MAX_ANTENNAS = 32
+MAX_ANTENNAS = 128
 MAX_N_CHAN = 512
 MAX_N_BLOCKS = 32
 MAX_SKY_SOURCES = 8
@@ -127,27 +164,72 @@ The same bound the aircraft trajectory uses. Beyond it the geometry is no
 longer a local array, and coordinates near the floating-point ceiling
 overflow into infinities that leave the response full of nulls."""
 
-MAX_TOTAL_SAMPLES = 48_000_000
+MAX_TOTAL_SAMPLES = 100_000_000
 """int: Most voltage samples one run may generate.
 
 The count is ``n_antennas * n_chan * n_blocks * N_TIME_PER_BLOCK``. Each
 of the individual caps is modest on its own, but their product is not:
-taking every one of them at once would allocate several gigabytes and run
-for about a minute. This budget keeps a run to a few hundred megabytes and
-a few seconds while leaving room for the largest setups the page offers in
-any one direction -- a 32-antenna array at the default width, or a
-512-channel band on a handful of antennas."""
+taking every one of them at once would allocate tens of gigabytes and run
+for many minutes. This budget leaves room for the largest setups the page
+offers in any one direction -- a hundred-element array at the default
+width, or a 512-channel band on a handful of antennas -- while keeping the
+memory a run holds at once (one block of voltages, not the whole
+observation) to something a laptop has. The largest runs it allows take
+tens of seconds rather than the few seconds a default run takes, which is
+what the page warns about when a large array is loaded."""
 
 MAX_BINS = 256
 """int: Most cells the browser is ever sent along one axis of a waterfall."""
 
 MAX_WATERFALL_CELLS = 400_000
 """int: Budget for all antennas' waterfalls together. The time axis is
-thinned until the whole response fits, so a 32-antenna run stays a
+thinned until the whole response fits, so a many-antenna run stays a
 few megabytes rather than a few tens."""
 
 DYNAMIC_RANGE_DB = 60.0
 """float: Decibels below the observation peak at which power is clamped."""
+
+VIS_MAX_CHAN_BINS = 256
+"""int: Channel bins in the baseline-averaged visibility waterfall.
+
+The integration axis needs no budget of its own: there are at most
+`MAX_N_BLOCKS` integrations in a run, so the whole map is a few thousand
+numbers however wide the band is."""
+
+VIS_SPECTRA_MAX_CHAN_BINS = 128
+"""int: Channel bins in the per-baseline amplitude/phase spectra."""
+
+MIN_SPECTRA_BASELINES = 16
+"""int: Baselines the per-baseline spectra always offer, however large the
+array is. Below this the picker stops being a picker."""
+
+MAX_VIS_SPECTRUM_VALUES = 200_000
+"""int: Budget for the per-baseline spectra, counting amplitudes and
+phases together.
+
+One baseline of a default run is 8 integrations x 128 channels x 2
+quantities, so the default array's 45 baselines all fit with room to
+spare. A large array does not: `_visibility_spectra` first offers a
+subset of baselines evenly spaced through the uv-distance ordering, and
+only if that is still not enough averages integrations together. Either
+reduction is reported alongside the numbers, so the page can print what
+it is drawing."""
+
+FLAG_DEFAULT_M = 250
+"""int: Default accumulation length of the flagger endpoint, in voltage
+time samples. Divides `N_TIME_PER_BLOCK`, so accumulations never straddle
+a block boundary and four of them fit in each block."""
+
+MAX_FLAG_CELLS = 4_000_000
+"""int: Largest ``n_chan x n_accumulations`` grid a flagging run may
+build. Reached only by asking for a short accumulation on a wide band;
+the message says which knob to turn."""
+
+FLAG_OVERLAY_MAX_CHAN_BINS = 256
+"""int: Channel bins the flagger overlay is pooled onto before it is sent.
+The *scores* are always computed on the native grid -- pooling a mask can
+only make it look better -- so this affects the picture and nothing else.
+"""
 
 DISPLAY_PERCENTILES = (0.5, 99.5)
 """tuple of float: Percentiles of the decibel map used as the colour-scale
@@ -160,12 +242,38 @@ IMAGE_MAX_CHANNELS = 64
 """int: Channels the direct-DFT image uses. Above this the channels are
 evenly subsampled, which costs sensitivity but does not move sources."""
 
+IMAGE_FIELD_HALF_WIDTH_DEG = math.degrees(math.asin(0.5 * IMAGE_FIELD_OF_VIEW_RAD))
+"""float: Angular half-width of the imaged field, degrees.
+
+`IMAGE_FIELD_OF_VIEW_RAD` is the *full* width of the direction-cosine grid
+(`rfi_simulator.imaging.lm_axis`), so its half is the largest ``l`` or
+``m`` the image covers, and the angle that corresponds to is its arcsine.
+The two differ by a part in ten thousand at this size; the arcsine is used
+anyway so that the number the page quotes is the same angle the source
+placement uses."""
+
+DEFAULT_OFFSET_EAST_DEG = 0.5
+DEFAULT_OFFSET_NORTH_DEG = -0.3
+"""float: Where a freshly added sky source sits, degrees east and north of
+the pointing centre. Comfortably inside `IMAGE_FIELD_HALF_WIDTH_DEG`, and
+off-centre in both axes so a mirrored sign convention would be visible in
+the image rather than hidden by symmetry."""
+
+MAX_OFFSET_DEG = 30.0
+"""float: Largest tangent-plane offset a source may be given, degrees.
+
+``sin(30 deg)`` is 0.5, which is the same bound `MAX_LM` puts on the
+direction cosines themselves."""
+
+MAX_LM = 0.5
+"""float: Largest direction cosine a source may be given."""
+
 
 # ----------------------------------------------------------------------
 # Packaged inputs
 # ----------------------------------------------------------------------
-def _config_path(filename: str) -> Path | None:
-    """Locate a file in the repository's ``configs`` directory, if present.
+def _config_dir() -> Path | None:
+    """The repository's ``configs`` directory, if this is a checkout.
 
     The search only ever looks inside a checkout: it climbs from this
     module to the first directory holding a ``pyproject.toml`` and stops
@@ -183,10 +291,19 @@ def _config_path(filename: str) -> Path | None:
     if root_index is None:
         return None
     for parent in parents[: root_index + 1]:
-        candidate = parent / "configs" / filename
-        if candidate.is_file():
+        candidate = parent / "configs"
+        if candidate.is_dir():
             return candidate
     return None
+
+
+def _config_path(filename: str) -> Path | None:
+    """Locate a file in the repository's ``configs`` directory, if present."""
+    directory = _config_dir()
+    if directory is None:
+        return None
+    candidate = directory / filename
+    return candidate if candidate.is_file() else None
 
 
 _FALLBACK_ANTENNAS = [
@@ -227,6 +344,110 @@ def default_array() -> ArrayConfig:
         name="array_default",
         **_FALLBACK_SITE,
     )
+
+
+def _slugify(text: str) -> str:
+    """A short identifier made only of letters, digits and hyphens."""
+    slug = _SLUG_STRIP_RE.sub("-", text.lower()).strip("-")
+    return slug[:60] or "array"
+
+
+def _array_directories(extra_dir: str | Path | None = None) -> list[Path]:
+    """Directories scanned for array configurations, in listing order.
+
+    The bundled ``configs`` directory comes first so the default array is
+    always the first entry; `extra_dir` (the ``--array-dir`` flag, or
+    `ARRAY_DIR_ENV_VAR` in the environment) is appended when it is set and
+    exists. Nothing else on the filesystem is ever read: the operator names
+    one directory, and only that directory is offered.
+    """
+    directories: list[Path] = []
+    bundled = _config_dir()
+    if bundled is not None:
+        directories.append(bundled)
+    if extra_dir is None:
+        extra_dir = os.environ.get(ARRAY_DIR_ENV_VAR) or None
+    if extra_dir:
+        extra = Path(extra_dir).expanduser()
+        if extra.is_dir() and extra.resolve() not in {d.resolve() for d in directories}:
+            directories.append(extra)
+    return directories
+
+
+def array_catalogue(extra_dir: str | Path | None = None) -> list[tuple[str, ArrayConfig]]:
+    """Every array configuration this server can offer.
+
+    Parameters
+    ----------
+    extra_dir : str or pathlib.Path, optional
+        A second directory to scan, in addition to the bundled one.
+        Defaults to `ARRAY_DIR_ENV_VAR` in the environment.
+
+    Returns
+    -------
+    list of (str, ArrayConfig)
+        Identifier and loaded configuration, in listing order. The
+        identifier is derived from the file name *here*, on the server; a
+        client never names a path, so no request can point this at a file
+        the operator did not offer. A YAML that `ArrayConfig.from_yaml`
+        refuses -- anything from an unrelated YAML file sharing the
+        directory to a malformed array -- is skipped without comment
+        beyond a debug log line.
+    """
+    entries: list[tuple[str, ArrayConfig]] = []
+    taken: set[str] = set()
+    for directory in _array_directories(extra_dir):
+        paths = sorted(path for path in directory.iterdir() if path.suffix in {".yaml", ".yml"})
+        for path in paths:
+            try:
+                array = ArrayConfig.from_yaml(path)
+            except Exception:  # noqa: BLE001 - any unreadable file is simply not offered
+                _log.debug("not offering %s: it is not a readable array configuration", path)
+                continue
+            identifier = _slugify(path.stem)
+            if identifier in taken:
+                suffix = 2
+                while f"{identifier}-{suffix}" in taken:
+                    suffix += 1
+                identifier = f"{identifier}-{suffix}"
+            taken.add(identifier)
+            entries.append((identifier, array))
+    return entries
+
+
+def _array_payload(identifier: str, array: ArrayConfig) -> dict[str, Any]:
+    """One array in the shape the page's array section holds it."""
+    positions = np.asarray(array.antenna_positions_enu_m, dtype=np.float64)
+    return {
+        "id": identifier,
+        "name": array.name or identifier,
+        "n_antennas": int(positions.shape[0]),
+        "latitude_deg": float(array.latitude_deg),
+        "longitude_deg": float(array.longitude_deg),
+        "height_m": float(array.height_m),
+        "antennas": [[float(value) for value in row] for row in positions],
+        "runnable": int(positions.shape[0]) <= MAX_ANTENNAS,
+    }
+
+
+def array_summaries(extra_dir: str | Path | None = None) -> list[dict[str, Any]]:
+    """The catalogue without the antenna positions, for the dropdown."""
+    return [
+        {
+            key: value
+            for key, value in _array_payload(identifier, array).items()
+            if key != "antennas"
+        }
+        for identifier, array in array_catalogue(extra_dir)
+    ]
+
+
+def array_detail(identifier: str, extra_dir: str | Path | None = None) -> dict[str, Any] | None:
+    """One catalogue entry in full, or ``None`` if there is no such id."""
+    for candidate, array in array_catalogue(extra_dir):
+        if candidate == identifier:
+            return _array_payload(candidate, array)
+    return None
 
 
 def sample_tle_text() -> str:
@@ -322,27 +543,43 @@ MHZ = 1.0e6
 KHZ = 1.0e3
 
 SKY_SOURCE_FIELDS = [
-    _num(
-        "l",
-        "Offset east (l)",
-        0.0087,
-        minimum=-0.5,
-        maximum=0.5,
-        step=0.001,
-        unit="direction cosine",
-        help_text="Direction cosine towards increasing right ascension.",
-    ),
-    _num(
-        "m",
-        "Offset north (m)",
-        -0.0052,
-        minimum=-0.5,
-        maximum=0.5,
-        step=0.001,
-        unit="direction cosine",
-        help_text="Direction cosine towards increasing declination.",
-    ),
     _num("flux_jy", "Flux density", 5.0, minimum=0.0, maximum=1.0e4, step=0.5, unit="Jy"),
+]
+"""list of dict: The schema-driven part of a sky source's form.
+
+Position is deliberately not in here: it is one quantity expressed three
+different ways (see `SkySource`), which the one-control-per-field form
+builder cannot render, so the page draws a small unit switcher for it by
+hand and describes the three modes from `SKY_POSITION_MODES`."""
+
+SKY_POSITION_MODES = [
+    {
+        "value": "offset",
+        "label": "Offset from pointing (degrees E/N)",
+        "fields": ["east_deg", "north_deg"],
+        "unit": "deg",
+        "step": 0.05,
+        "limit": MAX_OFFSET_DEG,
+        "labels": ["East of pointing", "North of pointing"],
+    },
+    {
+        "value": "radec",
+        "label": "Right ascension / declination (degrees)",
+        "fields": ["ra_deg", "dec_deg"],
+        "unit": "deg",
+        "step": 0.01,
+        "limit": 360.0,
+        "labels": ["Right ascension (ICRS)", "Declination (ICRS)"],
+    },
+    {
+        "value": "lm",
+        "label": "Direction cosines l/m (advanced)",
+        "fields": ["l", "m"],
+        "unit": "direction cosine",
+        "step": 0.001,
+        "limit": MAX_LM,
+        "labels": ["l (east)", "m (north)"],
+    },
 ]
 
 # `waveform` is a real scalar field on `TowerParams`/`CombParams`, so it is
@@ -851,21 +1088,149 @@ def _build_arrival(arrival: ArrivalSpec) -> Any:
 # ----------------------------------------------------------------------
 # Request models
 # ----------------------------------------------------------------------
+def _pair(name: str, value: list[float] | None, limit: float) -> list[float] | None:
+    """Validate a two-number position spec: finite, in range, exactly two."""
+    if value is None:
+        return None
+    if len(value) != 2:
+        raise ValueError(f"{name} must be two numbers, got {len(value)}")
+    for number in value:
+        if not math.isfinite(number):
+            raise ValueError(f"{name} must be finite numbers, got {value}")
+        if abs(number) > limit:
+            raise ValueError(f"{name} must lie between -{limit:g} and {limit:g}, got {number}")
+    return [float(number) for number in value]
+
+
 class SkySource(BaseModel):
-    """One celestial point source, placed by direction cosines."""
+    """One celestial point source and where on the sky it sits.
+
+    The position may be given in any one of three ways, and giving more
+    than one is an error rather than a silent precedence rule:
+
+    ``offset_deg``
+        ``[east_deg, north_deg]`` from the pointing centre, as a rigorous
+        tangent-plane offset: `~astropy.coordinates.SkyCoord.spherical_offsets_by`
+        moves the phase centre by those two angles, and the result is
+        projected to ``(l, m)`` by the same `rfi_simulator.sky.lm_from_radec`
+        `radec_deg` uses. This is *not* the independent-sine shortcut
+        (``l = sin(east_deg)``, ``m = sin(north_deg)``) -- that shortcut is
+        exact only along a single axis (one of the two offsets zero); with
+        both nonzero it and the rigorous answer diverge at a nonzero
+        declination, by an amount of order ``east * north * tan(dec)``.
+        Going through the same projection `radec_deg` uses means the two
+        notations agree exactly by construction, not approximately.
+    ``radec_deg``
+        ``[ra_deg, dec_deg]``, absolute ICRS, projected onto the same
+        tangent plane by `rfi_simulator.sky.lm_from_radec` -- the
+        library's own forward SIN projection, which is the exact inverse
+        of the `PointSource.from_lm` used to build the source.
+    ``l``/``m``
+        Direction cosines, the library's native coordinates: ``l``
+        increases east (towards increasing right ascension), ``m`` north
+        (towards increasing declination).
+
+    With none of them given the source lands at
+    (`DEFAULT_OFFSET_EAST_DEG`, `DEFAULT_OFFSET_NORTH_DEG`).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(default="source", max_length=40)
-    l: float = Field(default=0.0087, ge=-0.5, le=0.5)  # noqa: E741 - the standard symbol
-    m: float = Field(default=-0.0052, ge=-0.5, le=0.5)
+    l: float | None = Field(default=None, ge=-MAX_LM, le=MAX_LM)  # noqa: E741 - standard symbol
+    m: float | None = Field(default=None, ge=-MAX_LM, le=MAX_LM)
+    offset_deg: list[float] | None = None
+    radec_deg: list[float] | None = None
     flux_jy: float = Field(default=5.0, ge=0.0, le=1.0e4)
 
+    @field_validator("offset_deg")
+    @classmethod
+    def _check_offset(cls, value: list[float] | None) -> list[float] | None:
+        return _pair("offset_deg", value, MAX_OFFSET_DEG)
+
+    @field_validator("radec_deg")
+    @classmethod
+    def _check_radec(cls, value: list[float] | None) -> list[float] | None:
+        value = _pair("radec_deg", value, 360.0)
+        if value is not None and abs(value[1]) > 90.0:
+            raise ValueError(f"radec_deg declination must lie in [-90, 90], got {value[1]}")
+        return value
+
     @model_validator(mode="after")
-    def _check_on_sky(self) -> "SkySource":
-        if self.l**2 + self.m**2 >= 1.0:
+    def _check_one_position(self) -> "SkySource":
+        given = []
+        if self.l is not None or self.m is not None:
+            if self.l is None or self.m is None:
+                raise ValueError("give both l and m, or neither")
+            given.append("l/m")
+        if self.offset_deg is not None:
+            given.append("offset_deg")
+        if self.radec_deg is not None:
+            given.append("radec_deg")
+        if len(given) > 1:
+            raise ValueError(
+                "give this source one position only, not " + " and ".join(given) + " together"
+            )
+        if self.l is not None and self.l**2 + self.m**2 >= 1.0:
             raise ValueError("l and m place this source off the sky: l^2 + m^2 must be below 1")
         return self
+
+    def resolve_lm(self, phase_center: SkyCoord) -> tuple[float, float]:
+        """Direction cosines of this source relative to `phase_center`.
+
+        Parameters
+        ----------
+        phase_center : astropy.coordinates.SkyCoord
+            Where the run points; only `radec_deg` sources depend on it.
+
+        Returns
+        -------
+        tuple of float
+            ``(l, m)``, whichever way the position was given.
+        """
+        if self.l is not None and self.m is not None:
+            return (float(self.l), float(self.m))
+        if self.radec_deg is not None:
+            coord = SkyCoord(
+                ra=self.radec_deg[0] * u.deg, dec=self.radec_deg[1] * u.deg, frame="icrs"
+            )
+            l_dir, m_dir = lm_from_radec(phase_center, coord)
+            return (float(l_dir), float(m_dir))
+        east_deg, north_deg = self.offset_deg or (
+            DEFAULT_OFFSET_EAST_DEG,
+            DEFAULT_OFFSET_NORTH_DEG,
+        )
+        # Rigorous, and deliberately routed through the same projection
+        # `radec_deg` uses: an offset applied independently on each axis
+        # (`l = sin(east)`, `m = sin(north)`) is only exact when one of the
+        # two is zero, and quietly diverges from the true tangent-plane
+        # position once both are nonzero at a nonzero declination. Going
+        # through an actual sky position first is what makes the two
+        # notations agree exactly rather than approximately.
+        offset_coord = phase_center.spherical_offsets_by(east_deg * u.deg, north_deg * u.deg)
+        l_dir, m_dir = lm_from_radec(phase_center, offset_coord)
+        return (float(l_dir), float(m_dir))
+
+    def build(self, phase_center: SkyCoord) -> PointSource:
+        """This source as a library `PointSource`.
+
+        A source given in right ascension and declination is built at that
+        coordinate directly rather than round-tripped through ``(l, m)``:
+        the projection is many-to-one over the whole sphere, so a position
+        far outside the field would otherwise come back mirrored onto the
+        near hemisphere instead of simply being absent from the image.
+        """
+        if self.radec_deg is not None:
+            return PointSource(
+                flux_jy=self.flux_jy,
+                coord=SkyCoord(
+                    ra=self.radec_deg[0] * u.deg, dec=self.radec_deg[1] * u.deg, frame="icrs"
+                ),
+                name=self.name,
+            )
+        return PointSource.from_lm(
+            phase_center, self.resolve_lm(phase_center), self.flux_jy, name=self.name
+        )
 
 
 class TowerParams(BaseModel):
@@ -1284,6 +1649,23 @@ class QuantizationParams(BaseModel):
     quant_scale: float | None = Field(default=None, gt=0.0)
 
 
+class SiteParams(BaseModel):
+    """Where on Earth the array origin stands.
+
+    Optional: a request that leaves it out observes from the default
+    array's site. It matters because the phase centre is the zenith of
+    *this* point at the start of the observation, so loading another
+    array's antennas without its site would point the telescope somewhere
+    that array never looks.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    latitude_deg: float = Field(default=0.0, ge=-90.0, le=90.0)
+    longitude_deg: float = Field(default=0.0, ge=-360.0, le=360.0)
+    height_m: float = Field(default=0.0, ge=-500.0, le=1.0e4)
+
+
 class SimParams(BaseModel):
     """Observation size and the receiver noise level."""
 
@@ -1300,12 +1682,14 @@ class SimulateRequest(BaseModel):
     """Everything one run needs.
 
     Antenna positions are local East-North-Up metres relative to the
-    array origin, which is the site of the default array.
+    array origin, which is `site` when it is given and the default
+    array's site otherwise.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     antennas: list[list[float]] = Field(default_factory=list, max_length=MAX_ANTENNAS)
+    site: SiteParams | None = None
     sky_sources: list[SkySource] = Field(default_factory=list, max_length=MAX_SKY_SOURCES)
     rfi_sources: list[RFIParams] = Field(default_factory=list, max_length=MAX_RFI_SOURCES)
     spectral_lines: list[SpectralLineParams] = Field(
@@ -1375,6 +1759,64 @@ def default_request() -> SimulateRequest:
 # ----------------------------------------------------------------------
 # Defaults payload
 # ----------------------------------------------------------------------
+def phase_center_for_site(latitude_deg: float, longitude_deg: float, height_m: float) -> SkyCoord:
+    """Where a run from this site points: the zenith at `START_TIME_UTC`.
+
+    Built through the library's own `earth_location`/`zenith_coord` pair,
+    on a throwaway two-antenna array, so that the coordinate the page
+    quotes and the coordinate `build_simulator` fringe-stops on cannot
+    drift apart.
+    """
+    array = ArrayConfig(
+        antenna_positions_enu_m=np.asarray([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        latitude_deg=latitude_deg,
+        longitude_deg=longitude_deg,
+        height_m=height_m,
+    )
+    return zenith_coord(earth_location(array), Time(START_TIME_UTC, scale="utc"))
+
+
+def pointing_payload(
+    latitude_deg: float | None = None,
+    longitude_deg: float | None = None,
+    height_m: float | None = None,
+) -> dict[str, Any]:
+    """Where the telescope points, and how far out the image reaches.
+
+    Parameters
+    ----------
+    latitude_deg, longitude_deg, height_m : float, optional
+        The site to answer for. Any left out is taken from the default
+        array, so the no-argument call describes the run the page opens
+        with.
+
+    Returns
+    -------
+    dict
+        ``ra_deg``/``dec_deg`` of the phase centre in ICRS, the site it
+        was computed for, the start time, and ``field_half_width_deg`` --
+        how far from the pointing a source can sit and still land inside
+        the dirty image.
+    """
+    site = default_array()
+    latitude = site.latitude_deg if latitude_deg is None else float(latitude_deg)
+    longitude = site.longitude_deg if longitude_deg is None else float(longitude_deg)
+    height = site.height_m if height_m is None else float(height_m)
+    center = phase_center_for_site(latitude, longitude, height)
+    return {
+        "ra_deg": float(center.ra.deg),
+        "dec_deg": float(center.dec.deg),
+        "start_time_utc": START_TIME_UTC,
+        "latitude_deg": latitude,
+        "longitude_deg": longitude,
+        "height_m": height,
+        "field_half_width_deg": IMAGE_FIELD_HALF_WIDTH_DEG,
+        "field_of_view_rad": IMAGE_FIELD_OF_VIEW_RAD,
+        "image_n_pix": IMAGE_N_PIX,
+        "tracking": True,
+    }
+
+
 def defaults_payload() -> dict[str, Any]:
     """Everything the page needs to draw itself before the first run.
 
@@ -1419,7 +1861,13 @@ def defaults_payload() -> dict[str, Any]:
             "label": "Sky source",
             "fields": SKY_SOURCE_FIELDS,
             "defaults": _schema_defaults(SKY_SOURCE_FIELDS),
+            "position": {
+                "modes": SKY_POSITION_MODES,
+                "default_mode": "offset",
+                "default_offset_deg": [DEFAULT_OFFSET_EAST_DEG, DEFAULT_OFFSET_NORTH_DEG],
+            },
         },
+        "pointing": pointing_payload(),
         "spectral_line": {
             "label": "Spectral line",
             "fields": SPECTRAL_LINE_FIELDS,
@@ -1428,6 +1876,12 @@ def defaults_payload() -> dict[str, Any]:
         "rfi_types": [
             dict(entry, defaults=_schema_defaults(entry["fields"])) for entry in RFI_TYPES
         ],
+        "flaggers": {
+            "methods": FLAG_METHODS,
+            "max_methods": MAX_FLAG_METHODS,
+            "domains": FLAG_DOMAINS,
+            "defaults": FlagParams().model_dump(),
+        },
         "sample_tle": sample_tle_text(),
     }
 
@@ -1448,6 +1902,230 @@ def _waterfall_shape(n_antennas: int, n_chan: int, n_blocks: int) -> tuple[int, 
 def _round_grid(values: np.ndarray, decimals: int) -> list[list[float]]:
     """A 2-D array as nested lists, rounded to keep the response small."""
     return np.round(values, decimals).astype(float).tolist()
+
+
+def _finite(value: float) -> float | None:
+    """A float the JSON encoder will accept: ``None`` for NaN and infinity.
+
+    `rfi_simulator.metrics.flag_scores` reports an undefined score as NaN
+    -- precision when nothing was flagged, recall when the truth holds no
+    interference -- and NaN is not representable in JSON, so the response
+    would fail to encode rather than fail to answer. ``None`` is the
+    honest transport for "this score is not defined for this run"; the
+    page prints it as a dash.
+    """
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _beam_half_power_rad(beam: GaussianBeam | AiryBeam, freq_hz: float) -> float | None:
+    """Angle at which this beam's power response has fallen to one half.
+
+    Found by bisection on the beam's own `power_response` rather than
+    from a closed form, so the number drawn on the image is the same
+    model the sources were attenuated by whichever beam is fitted. Both
+    beams fall monotonically through 0.5 well inside their first null
+    (`AiryBeam`'s brightest sidelobe reaches under 2 % of the peak), so
+    there is exactly one crossing to find.
+
+    Parameters
+    ----------
+    beam : GaussianBeam or AiryBeam
+        The fitted primary beam.
+    freq_hz : float
+        Frequency to evaluate at, Hz -- the band centre, since the beam
+        narrows across a band.
+
+    Returns
+    -------
+    float or None
+        The half-power radius in radians, or ``None`` for a beam so wide
+        that it has not reached half power by the horizon, where there is
+        no circle to draw.
+    """
+    low, high = 0.0, 0.5 * math.pi
+    if float(beam.power_response(high, freq_hz)) >= 0.5:
+        return None
+    for _ in range(60):
+        middle = 0.5 * (low + high)
+        if float(beam.power_response(middle, freq_hz)) >= 0.5:
+            low = middle
+        else:
+            high = middle
+    return 0.5 * (low + high)
+
+
+def _visibility_spectra(visibilities: Any, order: np.ndarray, pol: int) -> dict[str, Any]:
+    """Amplitude and phase against frequency, per baseline, per integration.
+
+    Parameters
+    ----------
+    visibilities : rfi_simulator.correlator.Visibilities
+        The correlated observation.
+    order : numpy.ndarray
+        Indices of the cross-correlation baselines, shortest first. The
+        subset that survives the payload budget is taken from this
+        ordering, so a reduced response still spans the whole range of
+        baseline lengths.
+    pol : int
+        Receptor to report, matching the waterfall's own choice.
+
+    Returns
+    -------
+    dict
+        ``baselines`` (which entries of `order` are included),
+        ``amplitude`` and ``phase_deg`` (baseline, integration, channel),
+        the two axes, and how the two reductions were applied.
+
+    Notes
+    -----
+    Amplitude is the mean of ``|V|`` over the cells of a bin and phase is
+    the argument of the mean of ``V``. They are deliberately not taken
+    from the same complex average: a bin whose phase turns over its width
+    has a small vector mean, which would read as an amplitude null that
+    the individual channels do not have.
+    """
+    data = visibilities.pol_data[:, :, pol, :]
+    n_int, _, n_chan = data.shape
+    chan_bins = min(n_chan, VIS_SPECTRA_MAX_CHAN_BINS)
+
+    # Baselines are thinned before integrations are averaged together, and
+    # only down to `MIN_SPECTRA_BASELINES`: offering fewer antenna pairs
+    # costs a reader nothing but choice, while averaging the integrations
+    # away costs them the one thing this plot is for -- watching a
+    # baseline's phase turn from one integration to the next.
+    int_bins = n_int
+    selected = order
+
+    def values() -> int:
+        return 2 * len(selected) * int_bins * chan_bins
+
+    if values() > MAX_VIS_SPECTRUM_VALUES:
+        keep = max(MIN_SPECTRA_BASELINES, MAX_VIS_SPECTRUM_VALUES // (2 * int_bins * chan_bins))
+        if len(selected) > keep:
+            selected = order[:: -(-len(selected) // keep)]
+    while int_bins > 1 and values() > MAX_VIS_SPECTRUM_VALUES:
+        int_bins = max(1, int_bins // 2)
+
+    block = data[:, selected, :]
+    amplitude = bin_mean(np.abs(block).astype(np.float64), axis=2, n_bins=chan_bins)
+    complex_mean = bin_mean(
+        block.real.astype(np.float64), axis=2, n_bins=chan_bins
+    ) + 1j * bin_mean(block.imag.astype(np.float64), axis=2, n_bins=chan_bins)
+    if int_bins != n_int:
+        amplitude = bin_mean(amplitude, axis=0, n_bins=int_bins)
+        complex_mean = bin_mean(complex_mean.real, axis=0, n_bins=int_bins) + 1j * bin_mean(
+            complex_mean.imag, axis=0, n_bins=int_bins
+        )
+
+    freq_hz = bin_mean(np.asarray(visibilities.freq_hz, dtype=np.float64), axis=0, n_bins=chan_bins)
+    centres = (np.arange(n_int) + 0.5) * visibilities.integration_time_s
+    time_s = bin_mean(centres, axis=0, n_bins=int_bins)
+
+    # (integration, baseline, channel) -> (baseline, integration, channel):
+    # one entry per baseline is what the page indexes into.
+    return {
+        "baselines": [int(index) for index in selected],
+        "freq_mhz": (freq_hz / 1.0e6).round(6).tolist(),
+        "time_s": time_s.round(6).tolist(),
+        "amplitude": np.round(np.moveaxis(amplitude, 0, 1), 5).tolist(),
+        "phase_deg": np.round(np.degrees(np.angle(np.moveaxis(complex_mean, 0, 1))), 3).tolist(),
+        "integrations_per_bin": int(round(n_int / max(1, int_bins))),
+        "channels_per_bin": int(round(n_chan / max(1, chan_bins))),
+        "n_baselines_offered": int(len(selected)),
+    }
+
+
+def _visibility_payload(visibilities: Any, pol: int) -> dict[str, Any]:
+    """What the correlator saw, reduced to what a browser can draw.
+
+    Parameters
+    ----------
+    visibilities : rfi_simulator.correlator.Visibilities
+        The correlated observation.
+    pol : int
+        Receptor to report -- the same one the voltage waterfall shows,
+        so the two panels describe the same signal path.
+
+    Returns
+    -------
+    dict
+        ``amplitude``: ``|V|`` averaged over every cross-correlation
+        baseline, on a (channel, integration) grid, which is where a
+        visibility-domain flagger works. ``sources``: the library's own
+        ``rfi_fraction`` -- the fraction of each integration's samples a
+        source occupied -- pooled onto that same grid with an ANY rule,
+        plus its exact mean and maximum. ``baselines``: one row per
+        antenna pair. ``spectra``: see `_visibility_spectra`.
+
+    Notes
+    -----
+    Occupancy is a property of a time-frequency cell, not of a baseline:
+    interference reaches every antenna, so `rfi_fraction` has no baseline
+    axis to summarise and the per-baseline rows carry only amplitudes.
+    """
+    data = visibilities.pol_data[:, :, pol, :]
+    cross = visibilities.cross_mask
+    n_int, _, n_chan = data.shape
+    chan_bins = min(n_chan, VIS_MAX_CHAN_BINS)
+
+    amplitude = np.abs(data[:, cross, :]).astype(np.float64).mean(axis=1)  # (n_int, n_chan)
+    amplitude = bin_mean(amplitude.T, axis=0, n_bins=chan_bins)  # (chan_bins, n_int)
+
+    low, high = (float(value) for value in np.percentile(amplitude, DISPLAY_PERCENTILES))
+    if high - low <= 0.0:
+        low, high = float(amplitude.min()), float(amplitude.max()) or 1.0
+
+    fraction = np.asarray(visibilities.rfi_fraction, dtype=np.float64)  # (n_int, n_src, n_chan)
+    sources = []
+    for index, name in enumerate(visibilities.rfi_source_names):
+        plane = fraction[:, index, :]
+        mask = bin_any(plane.T > 0.0, axis=0, n_bins=chan_bins)
+        sources.append(
+            {
+                "name": str(name),
+                "mask": mask.astype(np.uint8).tolist(),
+                "mean_fraction": float(plane.mean()) if plane.size else 0.0,
+                "max_fraction": float(plane.max()) if plane.size else 0.0,
+            }
+        )
+
+    lengths = np.linalg.norm(np.asarray(visibilities.baseline_vectors_enu_m), axis=1)
+    cross_indices = np.flatnonzero(cross)
+    order = cross_indices[np.argsort(lengths[cross_indices], kind="stable")]
+    mean_amplitude = np.abs(data).astype(np.float64).mean(axis=(0, 2))
+
+    baselines = [
+        {
+            "index": int(index),
+            "ant_1": int(visibilities.ant_1[index]),
+            "ant_2": int(visibilities.ant_2[index]),
+            "length_m": float(np.round(lengths[index], 2)),
+            "mean_amp_jy": float(np.round(mean_amplitude[index], 5)),
+        }
+        for index in order
+    ]
+
+    return {
+        "amplitude": _round_grid(amplitude, 5),
+        "freq_mhz": (
+            bin_mean(np.asarray(visibilities.freq_hz, dtype=np.float64), axis=0, n_bins=chan_bins)
+            / 1.0e6
+        )
+        .round(6)
+        .tolist(),
+        "time_s": ((np.arange(n_int) + 0.5) * visibilities.integration_time_s).round(6).tolist(),
+        "vmin_jy": round(low, 5),
+        "vmax_jy": round(high, 5),
+        "peak_jy": round(float(amplitude.max()) if amplitude.size else 0.0, 5),
+        "n_baselines": int(np.count_nonzero(cross)),
+        "n_integrations": int(n_int),
+        "integration_time_s": float(visibilities.integration_time_s),
+        "sources": sources,
+        "baselines": baselines,
+        "spectra": _visibility_spectra(visibilities, order, pol),
+        "unit": "Jy",
+    }
 
 
 # ----------------------------------------------------------------------
@@ -1478,13 +2156,34 @@ def _feature_seed_sequences(seed: int) -> tuple[np.random.SeedSequence, np.rando
     return instrument_seq, calibration_seq
 
 
-def build_simulator(request: SimulateRequest) -> VoltageSimulator:
+def build_simulator(
+    request: SimulateRequest,
+    *,
+    start_time: Time | None = None,
+    phase_center: SkyCoord | None = None,
+    extra_sources: list[PointSource] | None = None,
+) -> VoltageSimulator:
     """Assemble the library objects a request describes.
 
     Parameters
     ----------
     request : SimulateRequest
         A validated request.
+    start_time : astropy.time.Time, optional
+        When the observation starts. Defaults to `START_TIME_UTC`, which
+        is what the single-run endpoint uses so that a run is reproducible
+        from its seed alone. The observatory day passes one instant per
+        frame instead.
+    phase_center : astropy.coordinates.SkyCoord, optional
+        Where the array points. Defaults to the zenith of the site at
+        `start_time`. The observatory day passes a meridian pointing at a
+        fixed declination, which is not the zenith unless that
+        declination is the site latitude.
+    extra_sources : list of PointSource, optional
+        Celestial sources to observe in addition to `request.sky_sources`,
+        already built at absolute coordinates. The observatory day passes
+        its catalogue this way, so that the catalogue never has to be
+        expressed as an offset from a pointing that moves.
 
     Returns
     -------
@@ -1502,18 +2201,18 @@ def build_simulator(request: SimulateRequest) -> VoltageSimulator:
     site = default_array()
     array = ArrayConfig(
         antenna_positions_enu_m=np.asarray(request.antennas, dtype=np.float64),
-        latitude_deg=site.latitude_deg,
-        longitude_deg=site.longitude_deg,
-        height_m=site.height_m,
+        latitude_deg=site.latitude_deg if request.site is None else request.site.latitude_deg,
+        longitude_deg=site.longitude_deg if request.site is None else request.site.longitude_deg,
+        height_m=site.height_m if request.site is None else request.site.height_m,
         name=site.name,
     )
-    start_time = Time(START_TIME_UTC, scale="utc")
-    phase_center = zenith_coord(earth_location(array), start_time)
+    if start_time is None:
+        start_time = Time(START_TIME_UTC, scale="utc")
+    if phase_center is None:
+        phase_center = zenith_coord(earth_location(array), start_time)
 
-    sources = [
-        PointSource.from_lm(phase_center, (source.l, source.m), source.flux_jy, name=source.name)
-        for source in request.sky_sources
-    ]
+    sources = [source.build(phase_center) for source in request.sky_sources]
+    sources.extend(extra_sources or ())
     rfi_sources = [source.build() for source in request.rfi_sources]
     spectral_lines = [line.build() for line in request.spectral_lines]
 
@@ -1584,6 +2283,17 @@ class _WaterfallReducer:
         self._power_columns: list[np.ndarray] = []
         self._mask_columns: list[np.ndarray] = []
         self._occupied_cells = np.zeros(len(simulator.rfi_sources), dtype=np.int64)
+        # The bandpass: total power per antenna, per receptor, per channel,
+        # summed over every time sample of the run. Unlike the waterfall
+        # this keeps *both* receptors, because comparing them is the whole
+        # point of a bandpass plot; it costs n_ant x n_pol x n_chan floats,
+        # which is a few tens of kilobytes at the largest size this front
+        # end runs and is never pooled in time -- a time-averaged spectrum
+        # is exactly what is wanted.
+        self._bandpass_sum = np.zeros(
+            (simulator.n_antennas, simulator.n_pol, simulator.n_chan), dtype=np.float64
+        )
+        self._bandpass_samples = 0
 
     @property
     def time_samples_per_cell(self) -> int:
@@ -1601,6 +2311,14 @@ class _WaterfallReducer:
         # single-polarization run), so selecting `self._pol` here works
         # identically whether or not the simulator was built with n_pol=2;
         # the waterfall always shows exactly one receptor.
+        # Both receptors, every channel, summed over time: the bandpass.
+        # Taken before the single-receptor slice below so that a dual
+        # polarization run ships XX and YY spectra from one pass.
+        all_pol = block.pol_data
+        all_power = all_pol.real.astype(np.float64) ** 2 + all_pol.imag.astype(np.float64) ** 2
+        self._bandpass_sum += all_power.sum(axis=3)
+        self._bandpass_samples += all_power.shape[3]
+
         data = block.pol_data[:, self._pol]
         power = data.real.astype(np.float64) ** 2 + data.imag.astype(np.float64) ** 2
         power = bin_mean(power, axis=2, n_bins=self.time_bins_per_block)
@@ -1627,6 +2345,12 @@ class _WaterfallReducer:
         column_duration_s = simulator.duration_s / n_columns
         time_s = (np.arange(n_columns) + 0.5) * column_duration_s
 
+        # Mean power per (antenna, receptor, channel), then pooled onto the
+        # display's channel bins so the bandpass shares the waterfall's
+        # frequency axis and the two plots can be read against each other.
+        samples = max(1, self._bandpass_samples)
+        bandpass = bin_mean(self._bandpass_sum / samples, axis=2, n_bins=self.chan_bins)
+
         return {
             "waterfall": waterfall,
             "masks": masks,
@@ -1634,6 +2358,7 @@ class _WaterfallReducer:
             "freq_hz": freq_hz,
             "time_s": time_s,
             "time_samples_per_cell": self.time_samples_per_cell,
+            "bandpass": bandpass,
         }
 
 
@@ -1674,6 +2399,56 @@ def _to_decibels(power: np.ndarray) -> tuple[np.ndarray, float, float, float]:
     return decibels, low, high, peak_db
 
 
+def _bandpass_payload(bandpass: np.ndarray, pol_names: list[str]) -> dict[str, Any]:
+    """Time-averaged spectra, in decibels, ready to plot as lines.
+
+    Parameters
+    ----------
+    bandpass : numpy.ndarray
+        Mean power per ``(antenna, receptor, channel)``, Jy.
+    pol_names : list of str
+        The receptor names the correlator reports, ``["XX"]`` or
+        ``["XX", "YY"]``, so the page can label the traces without
+        guessing from an index.
+
+    Returns
+    -------
+    dict
+        ``antennas``: a ``(n_antenna, n_pol, chan_bins)`` nested list in
+        decibels, sharing the waterfall's frequency axis. ``vmin_db`` and
+        ``vmax_db`` are the true ends of the data with a little headroom,
+        not percentiles: a bandpass is read for its shape, and clipping
+        the very feature -- a narrowband spike -- that the reader is
+        looking for would be the wrong kindness. `DYNAMIC_RANGE_DB` below
+        the peak is still floored so an empty channel cannot reach minus
+        infinity.
+    """
+    peak = float(bandpass.max()) if bandpass.size else 0.0
+    if not np.isfinite(peak) or peak <= 0.0:
+        zeros = np.zeros(bandpass.shape, dtype=np.float64)
+        return {
+            "antennas": [_round_grid(plane, 3) for plane in zeros],
+            "pol_names": list(pol_names),
+            "vmin_db": 0.0,
+            "vmax_db": 1.0,
+            "unit": "dB (mean Jy per channel)",
+        }
+    floor = peak * 10.0 ** (-DYNAMIC_RANGE_DB / 10.0)
+    decibels = 10.0 * np.log10(np.maximum(bandpass, floor))
+    low = float(decibels.min())
+    high = float(decibels.max())
+    if high - low < 1.0:
+        low, high = low - 0.5, high + 0.5
+    pad = 0.05 * (high - low)
+    return {
+        "antennas": [_round_grid(plane, 3) for plane in decibels],
+        "pol_names": list(pol_names),
+        "vmin_db": round(low - pad, 3),
+        "vmax_db": round(high + pad, 3),
+        "unit": "dB (mean Jy per channel)",
+    }
+
+
 def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
     """Run one observation and reduce it to what a browser can draw.
 
@@ -1694,12 +2469,20 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
     dict
         JSON-ready: ``waterfall`` (per-antenna power in decibels on a
         shared grid), ``sources`` (one pooled ground-truth mask and one
-        exact occupancy fraction each), ``image`` (dirty image and its
-        peak), ``uv`` (baseline coordinates in wavelengths), any
+        exact occupancy fraction each), ``visibilities`` (what the
+        correlator saw, see `_visibility_payload`), ``image`` (dirty
+        image, its peak, and the fitted primary beam's half-power radius
+        when there is one), ``sky_sources`` (each with its band-centre
+        ``beam_response`` when a beam is fitted),
+        ``uv`` (baseline coordinates in wavelengths), any
         ``warnings`` the library raised, and the wall time. The waterfall
         also reports ``time_samples_per_cell``, the number of voltage
         samples pooled into one displayed column, so the page can say how
-        coarse the picture it is drawing really is.
+        coarse the picture it is drawing really is, and ``bandpass``, the
+        time-averaged spectrum of every antenna and *every* receptor (see
+        `_bandpass_payload`) -- both receptors regardless of which one the
+        waterfall is showing, because a bandpass plot exists to compare
+        them.
 
     Raises
     ------
@@ -1732,9 +2515,12 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
             channels=slice(None, None, channel_step),
         )
         u_lambda, v_lambda, _ = uvw_wavelengths(visibilities)
+        visibility_payload = _visibility_payload(visibilities, pol)
+        beam_response = simulator.beam_response()
     wall_time_s = time.perf_counter() - started
 
     decibels, vmin_db, vmax_db, peak_db = _to_decibels(reduced["waterfall"])
+    bandpass_payload = _bandpass_payload(reduced["bandpass"], list(visibilities.pol_names))
 
     peak_index = int(np.argmax(image))
     peak_row, peak_col = np.unravel_index(peak_index, image.shape)
@@ -1743,6 +2529,43 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
     cross = visibilities.cross_mask
     u_points = u_lambda[:, cross, center_channel].ravel()
     v_points = v_lambda[:, cross, center_channel].ravel()
+
+    # Band-centre primary-beam response per sky source -- the library's
+    # own ground truth (`VoltageSimulator.beam_response`), not a second
+    # evaluation of the beam here. `None` throughout when no beam is
+    # fitted, which is a different statement from "attenuated by 1.0".
+    beam_centre = (
+        None if beam_response is None else beam_response[:, simulator.n_chan // 2].astype(float)
+    )
+    sky_payload = []
+    for index, source in enumerate(simulator.sources):
+        lm = source.lm(simulator.phase_center)
+        sky_payload.append(
+            {
+                "name": source.name,
+                "flux_jy": float(source.flux_jy),
+                "l": float(lm[0]),
+                "m": float(lm[1]),
+                "ra_deg": float(source.coord.icrs.ra.deg),
+                "dec_deg": float(source.coord.icrs.dec.deg),
+                "in_field": bool(
+                    max(abs(float(lm[0])), abs(float(lm[1]))) <= 0.5 * IMAGE_FIELD_OF_VIEW_RAD
+                ),
+                "beam_response": None if beam_centre is None else float(beam_centre[index]),
+            }
+        )
+
+    beam_payload = None
+    if request.primary_beam is not None:
+        half_power_rad = _beam_half_power_rad(
+            request.primary_beam.build(), simulator.center_freq_hz
+        )
+        beam_payload = {
+            "type": request.primary_beam.type,
+            "dish_diameter_m": request.primary_beam.dish_diameter_m,
+            "half_power_rad": None if half_power_rad is None else round(half_power_rad, 9),
+            "center_freq_hz": float(simulator.center_freq_hz),
+        }
 
     messages = []
     for entry in caught:
@@ -1761,6 +2584,7 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
             "dynamic_range_db": DYNAMIC_RANGE_DB,
             "time_samples_per_cell": int(reduced["time_samples_per_cell"]),
             "unit": "dB (Jy per cell)",
+            "bandpass": bandpass_payload,
         },
         "sources": [
             {
@@ -1773,6 +2597,8 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
                 zip(request.rfi_sources, simulator.rfi_sources)
             )
         ],
+        "sky_sources": sky_payload,
+        "visibilities": visibility_payload,
         "image": {
             "values": _round_grid(image, 6),
             "l": l_grid.round(8).tolist(),
@@ -1784,6 +2610,7 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
                 "m": float(m_grid[peak_row]),
                 "value_jy": float(image[peak_row, peak_col]),
             },
+            "beam": beam_payload,
             "unit": "Jy per beam",
         },
         "uv": {
@@ -1807,6 +2634,546 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
             "pol_names": list(visibilities.pol_names),
             "waterfall_pol": pol,
         },
+        "warnings": messages,
+        "wall_time_s": round(wall_time_s, 3),
+    }
+
+
+# ----------------------------------------------------------------------
+# Classical flaggers: the floor an excision algorithm has to beat
+# ----------------------------------------------------------------------
+MAX_FLAG_METHODS = 2
+"""int: Methods one flagging request may run.
+
+Two, because the point of the panel is a head-to-head: one column each,
+scored on the same cells of the same simulated data. Three columns would
+not fit the table and would not be read."""
+
+FLAG_METHODS = [
+    {
+        "value": "sk",
+        "label": "Spectral kurtosis",
+        "summary": (
+            "Tests each accumulation's power distribution against the exponential "
+            "one Gaussian noise gives. Catches carriers and short bursts, including "
+            "ones no louder than the noise."
+        ),
+        "grid": "pre-detection voltages, one decision per accumulation",
+    },
+    {
+        "value": "mad",
+        "label": "MAD clipping",
+        "summary": (
+            "Per-channel robust sigma clipping of the power spectrogram: median and "
+            "median absolute deviation over time, then a cut either side."
+        ),
+        "grid": "detected power, one decision per accumulated cell",
+    },
+    {
+        "value": "sumthreshold",
+        "label": "SumThreshold",
+        "summary": (
+            "Thresholds runs of neighbouring cells with a limit that falls as the run "
+            "lengthens, on the MAD-normalized residual. Finds faint but contiguous "
+            "interference a single-cell cut misses."
+        ),
+        "grid": "detected power, one decision per accumulated cell",
+    },
+]
+"""list of dict: The flagging methods the page offers, as descriptors the
+browser builds its controls from -- the same one-source-of-truth rule the
+form fields follow."""
+
+FlagMethod = Literal["sk", "mad", "sumthreshold"]
+
+FlagDomain = Literal["voltage", "visibility"]
+"""Where a flagging request is answered.
+
+``voltage`` flags one antenna's own accumulated spectra, before
+correlation; ``visibility`` flags the baseline-averaged amplitude the
+correlator produced, which is where a visibility-domain method such as
+AOFlagger's SumThreshold actually runs on a real telescope. The two see
+different grids and different ground truth (per-sample interference
+masks against the correlator's per-integration `rfi_fraction`), so the
+domain travels in the response and the page prints which one it is."""
+
+FLAG_DOMAINS = [
+    {
+        "value": "voltage",
+        "label": "Voltages",
+        "summary": "One antenna's accumulated spectra, before correlation.",
+        "methods": ["sk", "mad", "sumthreshold"],
+    },
+    {
+        "value": "visibility",
+        "label": "Visibilities",
+        "summary": (
+            "The baseline-averaged amplitude the correlator produced. Spectral "
+            "kurtosis needs pre-detection samples and does not apply here."
+        ),
+        "methods": ["mad", "sumthreshold"],
+    },
+]
+"""list of dict: The two places the page can ask for flags, as
+descriptors the browser builds its controls from -- including which
+methods each domain admits, so a chip can be greyed out with a reason
+instead of a request being refused after the click."""
+
+
+class FlagParams(BaseModel):
+    """Tuning of the classical flaggers.
+
+    One model for all three methods rather than one per method: they
+    share the accumulation grid, and a page that lets a reader switch
+    method should not silently discard the settings of the one they
+    switched away from. Each method reads only the fields that mean
+    something to it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    m: int = Field(default=FLAG_DEFAULT_M, ge=2, le=N_TIME_PER_BLOCK)
+    pfa: float = Field(default=0.0027, gt=0.0, lt=1.0)
+    n_sigma: float = Field(default=5.0, gt=0.0, le=50.0)
+    chi_1: float = Field(default=6.0, gt=0.0, le=100.0)
+    iterations: int = Field(default=5, ge=1, le=10)
+
+    @field_validator("m")
+    @classmethod
+    def _check_accumulation(cls, value: int) -> int:
+        """Insist the accumulation divides a block.
+
+        Blocks are generated one at a time and never held together, so an
+        accumulation that straddled a block boundary could not be formed
+        at all; one that did not divide the block would silently drop the
+        remainder of every block instead of the remainder of the run.
+        """
+        if N_TIME_PER_BLOCK % value:
+            raise ValueError(
+                f"m must divide the {N_TIME_PER_BLOCK} time samples in a block, and "
+                f"{value} does not: accumulations are formed inside one block"
+            )
+        return value
+
+
+class FlagRequest(BaseModel):
+    """Run one or two classical flaggers over one antenna of a run.
+
+    The observation is described by `request`, exactly as
+    ``POST /api/simulate`` takes it, and is *re-simulated* here. That
+    costs a second pass over the voltages, and buys the two properties
+    that matter: the server keeps no per-client state, and the data
+    flagged is bit-identical to the data the page is displaying because
+    both are drawn from `SimParams.seed`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request: SimulateRequest
+    methods: list[FlagMethod] = Field(min_length=1, max_length=MAX_FLAG_METHODS)
+    antenna: int = Field(default=0, ge=0, le=MAX_ANTENNAS - 1)
+    pol: Literal[0, 1] = 0
+    domain: FlagDomain = "voltage"
+    params: FlagParams = Field(default_factory=FlagParams)
+
+    @field_validator("methods")
+    @classmethod
+    def _check_unique(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError(f"name each method once, got {value}")
+        return value
+
+    @model_validator(mode="after")
+    def _check_domain(self) -> FlagRequest:
+        """Refuse spectral kurtosis after correlation.
+
+        The estimator is a ratio of the second and fourth moments of the
+        *pre-detection* samples inside one accumulation. Baseline-averaged
+        visibility amplitudes have already had both the polarization and
+        the baseline axes collapsed and the samples integrated, so those
+        moments are gone; running the same formula on them would produce a
+        number, and the number would mean nothing. Say so rather than
+        return it.
+        """
+        if self.domain == "visibility" and "sk" in self.methods:
+            raise ValueError(
+                "spectral kurtosis is a pre-detection test and cannot be run on "
+                "baseline-averaged visibility amplitudes: use it in the voltage "
+                "domain, or pick MAD clipping or SumThreshold here"
+            )
+        return self
+
+
+def _flag_overlay(predicted: np.ndarray, truth: np.ndarray, chan_bins: int) -> dict[str, Any]:
+    """The three ways a decision can turn out, pooled for drawing.
+
+    Parameters
+    ----------
+    predicted, truth : numpy.ndarray
+        Boolean masks on the flagger's own grid, ``(n_chan, n_accum)``.
+    chan_bins : int
+        Channel bins to pool onto. Time is never pooled: the accumulation
+        grid is already coarse in time and its columns are what the
+        reader is being shown.
+
+    Returns
+    -------
+    dict
+        ``caught``, ``missed`` and ``false_alarm`` as 0/1 grids. Pooling
+        is an ANY rule per category, so one displayed cell can be more
+        than one colour where a bin holds both outcomes -- which is the
+        truth about that bin, and the reason the scores in the same
+        response are computed on the unpooled masks.
+    """
+    categories = {
+        "caught": predicted & truth,
+        "missed": truth & ~predicted,
+        "false_alarm": predicted & ~truth,
+    }
+    return {
+        name: bin_any(mask, axis=0, n_bins=chan_bins).astype(np.uint8).tolist()
+        for name, mask in categories.items()
+    }
+
+
+def _flag_fraction(mask: np.ndarray, chan_bins: int) -> list[float]:
+    """The fraction of the run each channel spent flagged.
+
+    Parameters
+    ----------
+    mask : numpy.ndarray
+        A boolean mask on the flagger's own grid, ``(n_chan, n_time)``.
+    chan_bins : int
+        Channel bins to pool onto, matching the overlay's.
+
+    Returns
+    -------
+    list of float
+        One number per displayed channel, 0 to 1. Pooling here is a
+        *mean*, not the ANY rule the overlay uses: this is the flag
+        occupancy of a channel and averaging is what it means, whereas
+        the overlay answers "was anything in this cell flagged".
+    """
+    if not mask.size:
+        return []
+    per_channel = mask.astype(np.float64).mean(axis=1)
+    return bin_mean(per_channel, axis=0, n_bins=chan_bins).round(5).tolist()
+
+
+def _visibility_flag_grids(request: FlagRequest) -> dict[str, Any]:
+    """Correlate the run and hand back the grid a visibility flagger sees.
+
+    Parameters
+    ----------
+    request : FlagRequest
+        A validated request whose ``domain`` is ``"visibility"``.
+
+    Returns
+    -------
+    dict
+        ``spectrogram``: ``|V|`` averaged over every cross-correlation
+        baseline, ``(n_chan, n_integrations)`` -- the same quantity the
+        visibility panel draws, at full channel resolution. ``truth``: a
+        boolean mask of the cells any interference source touched, from
+        the correlator's own ``rfi_fraction``. ``freq_hz``, ``time_s``,
+        ``integration_time_s`` and ``n_integrations`` describe the axes.
+
+    Notes
+    -----
+    Ground truth after correlation is a different statement from ground
+    truth before it. Pre-correlation, a cell is contaminated if any
+    voltage sample in it was; post-correlation, the library reports the
+    *fraction* of an integration a source occupied, and a cell counts as
+    contaminated here when that fraction is non-zero. A source that lit
+    one sample in a thousand therefore marks the whole integration --
+    which is the honest reading, because that integration's amplitude
+    really is contaminated, however slightly.
+    """
+    simulator = build_simulator(request.request)
+    pol = request.pol if simulator.n_pol > 1 else 0
+    _, calibration_seq = _feature_seed_sequences(request.request.sim.seed)
+    calibration_errors = (
+        None
+        if request.request.calibration_errors is None
+        else request.request.calibration_errors.build(
+            simulator.n_antennas, np.random.default_rng(calibration_seq)
+        )
+    )
+    visibilities = correlate(simulator.blocks(), calibration_errors=calibration_errors)
+
+    cross = visibilities.cross_mask
+    data = visibilities.pol_data[:, :, pol, :]
+    spectrogram = np.abs(data[:, cross, :]).astype(np.float64).mean(axis=1).T
+
+    fraction = np.asarray(visibilities.rfi_fraction, dtype=np.float64)
+    if fraction.size:
+        truth = (fraction > 0.0).any(axis=1).T
+    else:
+        truth = np.zeros(spectrogram.shape, dtype=bool)
+
+    n_int = int(visibilities.n_int)
+    integration_time_s = float(visibilities.integration_time_s)
+    return {
+        "simulator": simulator,
+        "pol": pol,
+        "spectrogram": spectrogram,
+        "truth": truth,
+        "freq_hz": np.asarray(visibilities.freq_hz, dtype=np.float64),
+        "time_s": (np.arange(n_int) + 0.5) * integration_time_s,
+        "integration_time_s": integration_time_s,
+        "n_integrations": n_int,
+    }
+
+
+def run_flaggers(request: FlagRequest) -> dict[str, Any]:
+    """Re-simulate one run and score classical flaggers against its truth.
+
+    Parameters
+    ----------
+    request : FlagRequest
+        A validated request: the observation, the methods, which antenna
+        and receptor to look at, and which ``domain`` -- the voltages of
+        one antenna, or the baseline-averaged visibility amplitude.
+
+    Returns
+    -------
+    dict
+        JSON-ready: one entry per method under ``methods``, each with the
+        scores `rfi_simulator.metrics.flag_scores` gives on the flagger's
+        own grid and an overlay of caught / missed / false alarm for
+        drawing; plus the shared ``grid`` those decisions live on and the
+        axes to draw it against.
+
+    Raises
+    ------
+    ValueError
+        If the antenna does not exist in this array, or the requested
+        accumulation would build a grid larger than `MAX_FLAG_CELLS`.
+
+    Notes
+    -----
+    **One grid for every method.** Spectral kurtosis is defined on
+    accumulations of ``m`` pre-detection samples and cannot be computed
+    from a spectrogram at all; the power-based methods are therefore run
+    on the mean power of the *same* accumulations rather than on the
+    voltage-resolution grid. That is both realistic -- a real time-domain
+    flagger runs on integrated spectra -- and the only way two methods
+    can be put in adjacent columns honestly, since scores computed on
+    different grids are not comparable. Ground truth is brought onto that
+    grid with `rfi_simulator.metrics.pool_truth_accumulations`, the
+    partition the kurtosis estimator itself uses.
+    """
+    if request.domain == "visibility":
+        return _run_visibility_flaggers(request)
+    started = time.perf_counter()
+    params = request.params
+    methods = list(request.methods)
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        simulator = build_simulator(request.request)
+        if request.antenna >= simulator.n_antennas:
+            raise ValueError(
+                f"this array has {simulator.n_antennas} antennas, so there is no "
+                f"antenna {request.antenna}"
+            )
+        pol = request.pol if simulator.n_pol > 1 else 0
+
+        accum_per_block = simulator.n_time_per_block // params.m
+        n_accum = accum_per_block * simulator.n_blocks
+        if simulator.n_chan * n_accum > MAX_FLAG_CELLS:
+            raise ValueError(
+                f"flagging this run on accumulations of {params.m} samples would build a "
+                f"{simulator.n_chan} x {n_accum} grid, more than the {MAX_FLAG_CELLS:,} "
+                "cells this front end flags at once: lengthen the accumulation or "
+                "record fewer channels"
+            )
+
+        sk_columns: list[np.ndarray] = []
+        power_columns: list[np.ndarray] = []
+        truth_columns: list[np.ndarray] = []
+        for block in simulator.blocks():
+            data = block.pol_data[request.antenna, pol]
+            if "sk" in methods:
+                sk_columns.append(spectral_kurtosis_mask(data, params.m, pfa=params.pfa))
+            trimmed = data[:, : accum_per_block * params.m]
+            power = (
+                trimmed.real.astype(np.float64) ** 2 + trimmed.imag.astype(np.float64) ** 2
+            ).reshape(simulator.n_chan, accum_per_block, params.m)
+            power_columns.append(power.mean(axis=2))
+            truth_columns.append(pool_truth_accumulations(block.rfi_mask.any(axis=0), params.m))
+
+        spectrogram = np.concatenate(power_columns, axis=1)
+        truth = np.concatenate(truth_columns, axis=1)
+
+        predictions: dict[str, np.ndarray] = {}
+        if "sk" in methods:
+            predictions["sk"] = np.concatenate(sk_columns, axis=1)
+        if "mad" in methods:
+            predictions["mad"] = mad_clip_mask(spectrogram, params.n_sigma)
+        if "sumthreshold" in methods:
+            _, residual = mad_clip_mask(spectrogram, params.n_sigma, return_statistic=True)
+            predictions["sumthreshold"] = sumthreshold_mask(
+                residual, params.chi_1, params.iterations
+            )
+    wall_time_s = time.perf_counter() - started
+
+    chan_bins = min(simulator.n_chan, FLAG_OVERLAY_MAX_CHAN_BINS)
+    accumulation_s = simulator.duration_s / n_accum
+    labels = {entry["value"]: entry["label"] for entry in FLAG_METHODS}
+    grids = {entry["value"]: entry["grid"] for entry in FLAG_METHODS}
+
+    results = [
+        {
+            "method": method,
+            "label": labels[method],
+            "grid": grids[method],
+            "scores": {
+                name: _finite(value)
+                for name, value in flag_scores(predictions[method], truth).items()
+            },
+            "overlay": _flag_overlay(predictions[method], truth, chan_bins),
+            "flag_fraction": _flag_fraction(predictions[method], chan_bins),
+        }
+        for method in methods
+    ]
+
+    messages = []
+    for entry in caught_warnings:
+        text = str(entry.message)
+        if text not in messages:
+            messages.append(text)
+
+    return {
+        "methods": results,
+        "grid": {
+            "domain": "voltage",
+            "m": params.m,
+            "n_chan": int(simulator.n_chan),
+            "n_accumulations": int(n_accum),
+            "accumulation_s": round(float(accumulation_s), 9),
+            "chan_bins": int(chan_bins),
+            "freq_mhz": (bin_mean(simulator.freq_hz, axis=0, n_bins=chan_bins) / 1.0e6)
+            .round(6)
+            .tolist(),
+            "time_s": ((np.arange(n_accum) + 0.5) * accumulation_s).round(6).tolist(),
+            "truth_fraction": _flag_fraction(truth, chan_bins),
+        },
+        "domain": "voltage",
+        "antenna": int(request.antenna),
+        "pol": int(pol),
+        "params": params.model_dump(),
+        "warnings": messages,
+        "wall_time_s": round(wall_time_s, 3),
+    }
+
+
+def _run_visibility_flaggers(request: FlagRequest) -> dict[str, Any]:
+    """Score the power-based flaggers on the correlated amplitudes.
+
+    Parameters
+    ----------
+    request : FlagRequest
+        A validated request whose ``domain`` is ``"visibility"``. Its
+        ``antenna`` is ignored -- interference reaches every antenna and
+        the grid here is already averaged over every baseline -- and is
+        echoed back so the caller can see that it was not used.
+
+    Returns
+    -------
+    dict
+        The same shape `run_flaggers` returns in the voltage domain, so
+        the page draws it with the same code: ``methods`` with scores, a
+        caught / missed / false-alarm overlay and a per-channel flag
+        fraction, and the ``grid`` those decisions live on.
+
+    Notes
+    -----
+    The grid is coarse in time by construction: there is one column per
+    correlator integration, and a short recording has only a handful.
+    Robust statistics over a handful of samples are weak, and the scores
+    will say so -- which is itself the lesson, since a real
+    visibility-domain flagger runs on hours of integrations, not on
+    milliseconds.
+    """
+    started = time.perf_counter()
+    params = request.params
+    methods = list(request.methods)
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        grids = _visibility_flag_grids(request)
+        spectrogram = grids["spectrogram"]
+        truth = grids["truth"]
+
+        # Both directions, unioned. A per-channel median over time -- the
+        # background the voltage domain uses -- is blind here: a
+        # continuous transmitter is *constant* in a channel across a
+        # recording this short, so it becomes the channel's own median and
+        # deviates from itself by nothing. The spectral direction is what
+        # sees it, and is what an astronomer looking at a snapshot
+        # spectrum uses. Running only one of the two would report a recall
+        # of zero on interference plainly visible in the panel above.
+        time_mask, time_residual = mad_clip_mask(spectrogram, params.n_sigma, return_statistic=True)
+        freq_mask, freq_residual = mad_clip_mask(
+            spectrogram.T, params.n_sigma, return_statistic=True
+        )
+
+        predictions: dict[str, np.ndarray] = {}
+        if "mad" in methods:
+            predictions["mad"] = time_mask | freq_mask.T
+        if "sumthreshold" in methods:
+            predictions["sumthreshold"] = (
+                sumthreshold_mask(time_residual, params.chi_1, params.iterations)
+                | sumthreshold_mask(freq_residual, params.chi_1, params.iterations).T
+            )
+    wall_time_s = time.perf_counter() - started
+
+    simulator = grids["simulator"]
+    chan_bins = min(int(simulator.n_chan), FLAG_OVERLAY_MAX_CHAN_BINS)
+    labels = {entry["value"]: entry["label"] for entry in FLAG_METHODS}
+
+    results = [
+        {
+            "method": method,
+            "label": labels[method],
+            "grid": (
+                "baseline-averaged visibility amplitude, one decision per "
+                "integration, background removed along time and frequency"
+            ),
+            "scores": {
+                name: _finite(value)
+                for name, value in flag_scores(predictions[method], truth).items()
+            },
+            "overlay": _flag_overlay(predictions[method], truth, chan_bins),
+            "flag_fraction": _flag_fraction(predictions[method], chan_bins),
+        }
+        for method in methods
+    ]
+
+    messages = []
+    for entry in caught_warnings:
+        text = str(entry.message)
+        if text not in messages:
+            messages.append(text)
+
+    return {
+        "methods": results,
+        "grid": {
+            "domain": "visibility",
+            "m": None,
+            "n_chan": int(simulator.n_chan),
+            "n_accumulations": int(grids["n_integrations"]),
+            "accumulation_s": round(float(grids["integration_time_s"]), 9),
+            "chan_bins": int(chan_bins),
+            "freq_mhz": (bin_mean(grids["freq_hz"], axis=0, n_bins=chan_bins) / 1.0e6)
+            .round(6)
+            .tolist(),
+            "time_s": np.asarray(grids["time_s"]).round(6).tolist(),
+            "truth_fraction": _flag_fraction(truth, chan_bins),
+        },
+        "domain": "visibility",
+        "antenna": int(request.antenna),
+        "pol": int(grids["pol"]),
+        "params": params.model_dump(),
         "warnings": messages,
         "wall_time_s": round(wall_time_s, 3),
     }

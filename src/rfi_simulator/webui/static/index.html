@@ -3,185 +3,582 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Interference simulator</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23171A1E'/%3E%3Cpath d='M16 5v22M5 16h22' stroke='%23D98E32' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='16' r='6' fill='none' stroke='%23E4574B' stroke-width='1.6'/%3E%3C/svg%3E">
+<title>RFI Simulator</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232D3436'/%3E%3Cpath d='M16 5v22M5 16h22' stroke='%23FDCB6E' stroke-width='1.6'/%3E%3Ccircle cx='16' cy='16' r='6' fill='none' stroke='%230984E3' stroke-width='1.6'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
 
-<header class="masthead">
-  <div class="masthead-mark" aria-hidden="true">
-    <svg viewBox="0 0 32 32" width="26" height="26">
-      <path d="M16 4v24M4 16h24" stroke="currentColor" stroke-width="1.2"/>
-      <circle cx="16" cy="16" r="7" fill="none" stroke="currentColor" stroke-width="1.2"/>
+<header class="topbar">
+  <h1 class="brand">
+    <svg viewBox="0 0 32 32" width="18" height="18" aria-hidden="true">
+      <path d="M16 4v24M4 16h24" stroke="currentColor" stroke-width="1.6"/>
+      <circle cx="16" cy="16" r="7" fill="none" stroke="currentColor" stroke-width="1.6"/>
     </svg>
+    RFI Simulator
+  </h1>
+
+  <nav class="topnav" id="tabnav" role="tablist" aria-label="Views">
+    <button type="button" class="navlink is-active" id="tab-setup" role="tab"
+            aria-selected="true" aria-controls="view-setup" data-tab="setup">Setup</button>
+    <button type="button" class="navlink" id="tab-results" role="tab"
+            aria-selected="false" aria-controls="view-results" tabindex="-1"
+            data-tab="results">Results</button>
+    <button type="button" class="navlink" id="tab-observatory" role="tab"
+            aria-selected="false" aria-controls="view-observatory" tabindex="-1"
+            data-tab="observatory">Mock Observatory</button>
+  </nav>
+
+  <div class="topbar-right">
+    <select id="preset" class="input" aria-label="Start from an example"></select>
+    <button type="button" class="button" id="load-preset">Load</button>
+    <button type="button" class="button button-run" id="run">Run</button>
+    <span class="status-cell status-info" id="run-status">idle</span>
   </div>
-  <div class="masthead-text">
-    <h1>Interference simulator</h1>
-    <p>Place antennas, place interference, see what the telescope sees.</p>
-  </div>
-  <dl class="masthead-meta mono" id="site-meta"></dl>
 </header>
 
-<main class="console">
+<nav class="subbar" id="subnav" aria-label="Setup sections">
+  <a class="navlink navlink-sub" href="#section-array" data-target="section-array">Array</a>
+  <a class="navlink navlink-sub" href="#section-sky" data-target="section-sky">Sky</a>
+  <a class="navlink navlink-sub" href="#section-rfi" data-target="section-rfi">Interference</a>
+  <a class="navlink navlink-sub" href="#section-realism" data-target="section-realism">Instrument</a>
+  <a class="navlink navlink-sub" href="#section-run" data-target="section-run">Recording</a>
+</nav>
 
-  <!-- ------------------------------------------------ site plan -->
-  <section class="zone zone-site" aria-labelledby="site-plan-heading">
-    <div class="zone-head">
-      <h2 class="panel-title" id="site-plan-heading">Site plan</h2>
-      <span class="panel-note mono" id="array-summary"></span>
+<main class="page">
+
+  <p class="page-lead">
+    Place antennas, add interference, and inspect the voltages, visibilities and
+    dirty image the observation produces.
+  </p>
+
+  <!-- ================================================== the setup tab -->
+  <div class="tab-panel" id="view-setup" role="tabpanel" aria-labelledby="tab-setup" tabindex="-1">
+
+  <!-- ---------------------------------------------------------- 1. array -->
+  <section class="section" id="section-array" aria-labelledby="array-heading">
+    <div class="section-head">
+      <span class="section-number" aria-hidden="true">1</span>
+      <h2 class="section-title" id="array-heading">Array</h2>
+      <div class="stat-strip" id="array-summary" aria-live="off"></div>
     </div>
-
-    <div class="sheet" id="sheet">
-      <svg id="site-plan" role="application" tabindex="0"
-           aria-label="Array site plan. Click to add an antenna, drag to move it, double-click to remove it. With the plan focused, press A to add an antenna at the centre."></svg>
-      <p class="sheet-empty" id="sheet-empty" hidden>Click the site plan to place your first antenna</p>
-      <output class="sheet-readout mono" id="cursor-readout" aria-live="off"></output>
-    </div>
-
-    <p class="hint">
-      Click bare ground to add an antenna. Drag a marker to move it.
-      Double-click a marker to remove it.
+    <p class="section-intro">
+      Where the antennas stand, in metres east and north of the array centre — the
+      longest baseline sets how sharp the image can be.
     </p>
 
-    <div class="button-row">
-      <button type="button" class="button" id="reset-array">Reset to the default array</button>
-      <button type="button" class="button button-quiet" id="clear-array">Remove all</button>
-    </div>
-
-    <div class="antenna-table-wrap">
-      <table class="antenna-table mono">
-        <caption class="panel-title">Antennas</caption>
-        <thead>
-          <tr><th scope="col">#</th><th scope="col">East&nbsp;m</th><th scope="col">North&nbsp;m</th><th scope="col"></th></tr>
-        </thead>
-        <tbody id="antenna-rows"></tbody>
-      </table>
-    </div>
-  </section>
-
-  <!-- ------------------------------------------- sky and interference -->
-  <section class="zone zone-sources" aria-labelledby="sources-heading">
-    <div class="zone-head">
-      <h2 class="panel-title" id="sources-heading">Sky &amp; interference</h2>
-    </div>
-
-    <div class="scroll-region">
-      <div class="group">
-        <div class="group-head">
-          <h3 class="group-title">Sky sources</h3>
-          <button type="button" class="button button-small" id="add-sky">Add sky source</button>
+    <div class="array-layout">
+      <div class="array-plan">
+        <div class="sheet" id="sheet">
+          <svg id="site-plan" role="application" tabindex="0"
+               aria-label="Array site plan. Click to add an antenna, drag to move it, double-click to remove it. With the plan focused, press A to add an antenna at the centre."></svg>
+          <p class="sheet-empty" id="sheet-empty" hidden>Click the site plan to place your first antenna</p>
+          <output class="sheet-readout mono" id="cursor-readout" aria-live="off"></output>
         </div>
-        <div id="sky-cards" class="card-stack"></div>
-        <p class="empty-note" id="sky-empty" hidden>No sky sources — the map will show noise only.</p>
+        <p class="hint">
+          Click bare ground to add an antenna, drag a marker to move it, double-click
+          it to remove it.
+        </p>
       </div>
 
-      <div class="group">
-        <div class="group-head">
-          <h3 class="group-title">Interference sources</h3>
+      <div class="array-side">
+        <div class="array-add">
+          <button type="button" class="button button-accent" id="add-antenna">+ Add an antenna</button>
+          <span class="hint hint-inline">drops one on free ground; drag it where you want it</span>
         </div>
-        <div class="add-row">
-          <label class="field-label" for="rfi-type">Kind</label>
-          <select id="rfi-type" class="input"></select>
-          <button type="button" class="button button-small" id="add-rfi">Add</button>
-        </div>
-        <p class="type-summary" id="rfi-type-summary"></p>
-        <div id="rfi-cards" class="card-stack"></div>
-        <p class="empty-note" id="rfi-empty" hidden>No interference — a clean observation.</p>
-      </div>
 
-      <div class="group">
-        <div class="group-head">
-          <h3 class="group-title">Spectral lines (celestial, not RFI)</h3>
-          <button type="button" class="button button-small" id="add-line">Add line</button>
+        <div class="array-load">
+          <label class="field-label" for="array-choice">Load a known layout</label>
+          <div class="preset-row">
+            <select id="array-choice" class="input"></select>
+            <button type="button" class="button" id="load-array">Load</button>
+          </div>
+          <p class="banner" id="array-load-note" hidden></p>
         </div>
-        <div id="line-cards" class="card-stack"></div>
-        <p class="empty-note" id="line-empty" hidden>No spectral lines in this run.</p>
-      </div>
 
-      <div class="group">
-        <div class="group-head">
-          <h3 class="group-title">Observation</h3>
+        <dl class="site-meta mono" id="site-meta"></dl>
+        <div class="button-row">
+          <button type="button" class="button" id="reset-array">Reset to the default array</button>
+          <button type="button" class="button button-quiet" id="clear-array">Remove all</button>
         </div>
-        <div class="field-grid" id="sim-fields"></div>
-        <p class="hint mono" id="sim-summary"></p>
-      </div>
 
-      <div class="group">
-        <details id="realism-details">
-          <summary class="group-title">Instrument &amp; realism</summary>
-          <div class="field-grid realism-grid" id="realism-fields"></div>
+        <details class="advanced">
+          <summary>Antenna coordinates</summary>
+          <div class="antenna-table-wrap">
+            <table class="antenna-table mono">
+              <thead>
+                <tr><th scope="col">#</th><th scope="col">East&nbsp;m</th><th scope="col">North&nbsp;m</th><th scope="col"></th></tr>
+              </thead>
+              <tbody id="antenna-rows"></tbody>
+            </table>
+          </div>
         </details>
       </div>
     </div>
+  </section>
 
-    <div class="run-bar">
-      <button type="button" class="button button-run" id="run">Run observation</button>
-      <span class="run-status mono" id="run-status"></span>
+  <!-- ------------------------------------------------------------ 2. sky -->
+  <section class="section" id="section-sky" aria-labelledby="sky-heading">
+    <div class="section-head">
+      <span class="section-number" aria-hidden="true">2</span>
+      <h2 class="section-title" id="sky-heading">Sky model</h2>
+    </div>
+    <p class="section-intro">
+      The real astronomical signal — what an interference-removal algorithm must
+      leave intact.
+    </p>
+
+    <div class="group">
+      <div class="group-head">
+        <h3 class="group-title">Point sources</h3>
+        <span class="group-note" id="sky-count"></span>
+      </div>
+      <p class="group-intro">
+        Each is a point on the sky; the dirty image should peak where you put it.
+      </p>
+      <p class="hint" id="pointing-hint"></p>
+      <div id="sky-cards" class="cell-grid"></div>
+    </div>
+
+    <div class="group">
+      <div class="group-head">
+        <h3 class="group-title">Spectral lines</h3>
+        <span class="group-note" id="line-count"></span>
+      </div>
+      <p class="group-intro">
+        A narrow emission line on every antenna — celestial signal, labelled that way
+        in the ground truth, so flagging it scores as wrong.
+      </p>
+      <div id="line-cards" class="cell-grid"></div>
     </div>
   </section>
 
-  <!-- ------------------------------------------------------- console -->
-  <section class="zone zone-console" aria-labelledby="console-heading">
-    <div class="zone-head">
-      <h2 class="panel-title" id="console-heading">Console</h2>
-      <span class="panel-note mono" id="wall-time"></span>
+  <!-- --------------------------------------------------- 3. interference -->
+  <section class="section" id="section-rfi" aria-labelledby="rfi-heading">
+    <div class="section-head">
+      <span class="section-number" aria-hidden="true">3</span>
+      <h2 class="section-title" id="rfi-heading">Interference</h2>
+    </div>
+    <p class="section-intro">
+      Human-made transmitters reaching the antennas. Every time–frequency cell they
+      touch is recorded as the ground truth an excision algorithm is scored against.
+    </p>
+
+    <p class="field-label kind-legend" id="rfi-kinds-legend">Tick the kinds of interference to add</p>
+    <div class="kind-grid" id="rfi-kinds" role="group" aria-labelledby="rfi-kinds-legend"></div>
+
+    <div class="group-head">
+      <h3 class="group-title">In this run</h3>
+      <span class="group-note" id="rfi-count"></span>
+    </div>
+    <div id="rfi-cards" class="cell-grid"></div>
+  </section>
+
+  <!-- ---------------------------------------------------- 4. imperfection -->
+  <section class="section" id="section-realism" aria-labelledby="realism-heading">
+    <div class="section-head">
+      <span class="section-number" aria-hidden="true">4</span>
+      <h2 class="section-title" id="realism-heading">Instrument</h2>
+    </div>
+    <p class="section-intro">
+      Switch on the ways a real telescope departs from an ideal one.
+      <span class="muted-inline">Ideal by default — everything here is off.</span>
+    </p>
+
+    <div class="cell-grid cell-grid-effects" id="realism-cells"></div>
+  </section>
+
+  <!-- ------------------------------------------------------- 5. recording -->
+  <section class="section" id="section-run" aria-labelledby="run-heading">
+    <div class="section-head">
+      <span class="section-number" aria-hidden="true">5</span>
+      <h2 class="section-title" id="run-heading">Recording settings</h2>
+    </div>
+    <p class="section-intro">
+      How much data to record. Run generates the voltages, correlates them, images
+      them, and lands on the Results tab.
+    </p>
+
+    <div class="field-grid" id="sim-fields"></div>
+    <div class="metric-wrap" id="sim-summary"></div>
+  </section>
+
+  </div>
+
+  <!-- ================================================ the results tab -->
+  <div class="tab-panel" id="view-results" role="tabpanel" aria-labelledby="tab-results"
+       tabindex="-1" hidden>
+
+    <div class="runs-strip" id="runs-strip" hidden>
+      <div class="runs-dots" id="runs-dots" role="group" aria-label="Recent runs"></div>
+      <span class="runs-meta mono" id="runs-meta"></span>
+      <span class="run-wall mono" id="wall-time"></span>
+    </div>
+
+    <div class="banner" id="runs-banner" hidden>
+      <span class="banner-kind">Note</span>
+      <span id="runs-banner-text">Viewing an earlier run.</span>
+      <button type="button" class="button button-small" id="runs-banner-latest">Back to latest</button>
     </div>
 
     <div class="notice-area" id="notices" aria-live="polite"></div>
 
-    <div class="console-grid">
+    <div class="results">
 
-      <figure class="display display-wide" id="waterfall-display">
+      <!-- ------------------------------------------------ level 1: voltages -->
+      <figure class="display" id="panel-voltages">
         <figcaption>
-          <span class="display-title">Autocorrelation waterfall</span>
+          <span class="display-title">Voltages</span>
           <span class="display-sub mono" id="waterfall-sub"></span>
         </figcaption>
+        <p class="display-note">
+          Per-antenna dynamic spectra: |V(&nu;,t)|&sup2; against time and frequency, every
+          antenna on one colour scale. Click a tile to feature that antenna full size.
+        </p>
+
         <div class="display-controls">
-          <label class="field-label" for="waterfall-antenna">Antenna</label>
-          <select id="waterfall-antenna" class="input input-dark input-small"></select>
-          <span class="control-sep" aria-hidden="true"></span>
-          <label class="field-label" for="waterfall-pol" id="waterfall-pol-label" hidden>Pol</label>
-          <select id="waterfall-pol" class="input input-dark input-small" hidden>
-            <option value="0">0</option>
-            <option value="1">1</option>
-          </select>
-          <span class="control-sep" aria-hidden="true"></span>
-          <span class="field-label">Ground truth</span>
-          <div class="mask-toggles" id="mask-toggles"></div>
-          <label class="checkline">
-            <input type="checkbox" id="hatch-toggle"> hatch
-          </label>
+          <span class="control-group">
+            <label class="field-label" for="waterfall-antenna">Antenna</label>
+            <select id="waterfall-antenna" class="input input-small"></select>
+          </span>
+          <span class="control-group" id="waterfall-pol-group" hidden>
+            <label class="field-label" for="waterfall-pol" id="waterfall-pol-label">Polarization</label>
+            <select id="waterfall-pol" class="input input-small">
+              <option value="0">0 (XX)</option>
+              <option value="1">1 (YY)</option>
+            </select>
+          </span>
+          <button type="button" class="switch" id="all-antennas-toggle" aria-pressed="true">
+            <span class="switch-dot" aria-hidden="true"></span>
+            <span id="all-antennas-label">All antennas</span>
+          </button>
         </div>
-        <div class="canvas-wrap">
+
+        <!-- The flag chips: one click paints that mask over the spectrum. -->
+        <div class="chip-bar" id="volt-chip-bar">
+          <span class="chip-bar-label">Overlay</span>
+          <div class="chip-set" id="volt-chips" role="group"
+               aria-label="Which mask is painted over the dynamic spectrum"></div>
+        </div>
+
+        <!-- The tile wall's own view switch: the reference's fleet view. -->
+        <div class="chip-bar" id="wall-view-bar" hidden>
+          <span class="chip-bar-label">Tiles show</span>
+          <div class="chip-set" id="wall-view-chips" role="group"
+               aria-label="What each antenna tile draws"></div>
+        </div>
+
+        <div class="canvas-wrap" id="waterfall-wrap">
           <canvas id="waterfall-canvas"></canvas>
           <div class="sweep" id="waterfall-sweep" hidden></div>
-          <p class="display-empty" id="waterfall-empty">Run an observation to fill the console.</p>
+          <p class="display-empty" id="waterfall-empty">Run an observation to fill this in.</p>
         </div>
+
+        <!-- The bandpass: the same antenna, averaged over time. -->
+        <div class="subplot" id="bandpass-block">
+          <p class="subplot-title">
+            Bandpass <span class="display-sub mono" id="bandpass-sub"></span>
+          </p>
+          <div class="canvas-wrap canvas-wrap-short">
+            <canvas id="bandpass-canvas"></canvas>
+          </div>
+          <p class="hint" id="bandpass-legend"></p>
+        </div>
+
+        <div class="thumb-panel" id="antenna-thumbnails-panel" hidden>
+          <div class="thumb-grid" id="antenna-thumbnails" role="group"
+               aria-label="Every antenna's dynamic spectrum"></div>
+          <p class="display-sub mono thumb-sub" id="antenna-thumbnails-sub"></p>
+        </div>
+
+        <details class="advanced" id="truth-more">
+          <summary>More — per-source layers, and hatching</summary>
+          <div class="truth-bar">
+            <p class="truth-title">
+              The per-source layers behind the RFI truth chip. They only paint while
+              that chip is on.
+            </p>
+            <div class="truth-controls">
+              <div class="mask-toggles" id="mask-toggles"></div>
+              <label class="checkline">
+                <input type="checkbox" id="hatch-toggle"> hatch the flagged cells
+              </label>
+            </div>
+          </div>
+        </details>
+
+        <details class="advanced" id="flagger-controls">
+          <summary>Flagger scores — caught, missed and false alarms</summary>
+          <p class="display-note">
+            Every method chip you switch on above is scored here against the same ground
+            truth an excision algorithm would be scored against, on the featured antenna.
+          </p>
+          <div class="flagger-legend" id="flagger-legend"></div>
+          <p class="display-sub mono flagger-grid-note" id="flagger-grid-note"></p>
+
+          <div class="subplot" id="flagfrac-block" hidden>
+            <p class="subplot-title">
+              Flag fraction <span class="display-sub mono" id="flagfrac-sub"></span>
+            </p>
+            <div class="canvas-wrap canvas-wrap-short">
+              <canvas id="flagfrac-canvas"></canvas>
+            </div>
+            <p class="hint" id="flagfrac-legend"></p>
+          </div>
+
+          <div class="metric-wrap" id="flagger-metrics"></div>
+          <p class="muted-line" id="flagger-note" hidden>
+            This is the classical floor an ML method should beat.
+          </p>
+        </details>
       </figure>
 
-      <figure class="display" id="image-display">
+      <!-- -------------------------------------------- level 2: visibilities -->
+      <figure class="display" id="panel-visibilities">
+        <figcaption>
+          <span class="display-title">Visibilities</span>
+          <span class="display-sub mono" id="vis-sub"></span>
+        </figcaption>
+        <p class="display-note">
+          |V| after correlation, averaged over every cross-correlation baseline, against
+          time and frequency. This is the grid a visibility-domain flagger works on.
+        </p>
+
+        <div class="chip-bar" id="vis-chip-bar">
+          <span class="chip-bar-label">Overlay</span>
+          <div class="chip-set" id="vis-chips" role="group"
+               aria-label="Which mask is painted over the visibility amplitudes"></div>
+        </div>
+
+        <div class="canvas-wrap">
+          <canvas id="vis-canvas"></canvas>
+          <p class="display-empty" id="vis-empty">Run an observation to fill this in.</p>
+        </div>
+
+        <p class="display-sub mono" id="vis-flag-note"></p>
+
+        <details class="advanced" id="vis-more">
+          <summary>More — one baseline's spectrum</summary>
+          <div class="display-controls">
+            <span class="control-group">
+              <label class="field-label" for="vis-baseline">Baseline</label>
+              <select id="vis-baseline" class="input input-small"></select>
+            </span>
+          </div>
+          <div class="canvas-wrap canvas-wrap-tall">
+            <canvas id="vis-spectrum"></canvas>
+          </div>
+          <p class="display-sub mono vis-spectra-note" id="vis-spectra-note"></p>
+        </details>
+      </figure>
+
+      <!-- --------------------------------------------------- level 3: image -->
+      <figure class="display" id="panel-image">
         <figcaption>
           <span class="display-title">Dirty image</span>
           <span class="display-sub mono" id="image-sub"></span>
         </figcaption>
+        <p class="display-note">
+          The sky this array reconstructs, before deconvolution. ◇ marks a simulated
+          source's true position · + marks the brightest pixel, which with interference
+          present need not be a source at all.
+        </p>
+
+        <div class="chip-bar" id="image-chip-bar">
+          <span class="chip-bar-label">Showing</span>
+          <div class="chip-set" id="image-chips" role="group"
+               aria-label="Which of the two images is drawn"></div>
+          <span class="display-sub mono" id="image-scale"></span>
+        </div>
+
+        <div class="banner" id="image-ab-note" hidden>
+          <span class="banner-kind">Note</span>
+          <span id="image-ab-note-text"></span>
+        </div>
+
         <div class="canvas-wrap">
           <canvas id="image-canvas"></canvas>
         </div>
-      </figure>
+        <p class="hint" id="image-beam-legend" hidden></p>
+        <div class="metric-wrap" id="image-recovered"></div>
+        <p class="hint" id="image-outside" hidden><span class="badge badge-amber" id="image-outside-text"></span></p>
+        <p class="hint" id="image-sidelobe-note" hidden>
+          Ripples around the sources are sidelobes — the imaging artefact of a
+          small array, not extra sources.
+        </p>
 
-      <figure class="display" id="uv-display">
-        <figcaption>
-          <span class="display-title">Baseline coverage</span>
-          <span class="display-sub mono" id="uv-sub"></span>
-        </figcaption>
-        <div class="canvas-wrap">
-          <svg id="uv-plot" role="img" aria-label="Baseline coverage in wavelengths"></svg>
+        <div class="uv-block">
+          <p class="subplot-title">
+            uv coverage <span class="display-sub mono uv-sub-line" id="uv-sub"></span>
+          </p>
+          <p class="display-note">
+            Every baseline projected onto the plane normal to the phase centre, in
+            wavelengths, at band centre — each sampled point and its Hermitian conjugate.
+            This is the sampling function whose transform is the synthesised beam.
+          </p>
+          <div class="uv-wrap">
+            <svg id="uv-plot" role="img" aria-label="uv coverage in wavelengths"></svg>
+          </div>
         </div>
       </figure>
 
     </div>
-  </section>
+  </div>
+
+  <!-- =========================================== the mock observatory tab -->
+  <div class="tab-panel" id="view-observatory" role="tabpanel"
+       aria-labelledby="tab-observatory" tabindex="-1" hidden>
+
+    <!-- ------------------------------------------------------- the day -->
+    <section class="section" id="section-day" aria-labelledby="day-heading">
+      <div class="section-head">
+        <span class="section-number" aria-hidden="true">1</span>
+        <h2 class="section-title" id="day-heading">A day of drift scanning</h2>
+      </div>
+      <p class="section-intro">
+        The array stares at the meridian at one declination and lets the sky drift
+        through — a transit telescope. Each frame is a fresh snapshot of your Setup
+        (the same antennas, the same interference) with the real radio sky laid in:
+        the Sun, Cas&nbsp;A, Cyg&nbsp;A, Tau&nbsp;A and Vir&nbsp;A, each drawn only
+        while it is genuinely inside the field.
+      </p>
+      <p class="zone-line"><span class="badge" id="day-zone">All times local</span></p>
+
+      <div class="obs-controls">
+        <div class="field">
+          <label class="field-label" for="day-dec">
+            Pointing declination <span class="field-unit">degrees</span>
+          </label>
+          <input class="input" type="number" id="day-dec" step="0.1" min="-90" max="90">
+          <div class="chip-row" id="day-dec-chips" role="group"
+               aria-label="Declination shortcuts"></div>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="day-date">Date</label>
+          <input class="input" type="date" id="day-date">
+          <p class="field-hint" id="day-date-hint">The day runs from 00:00 to 24:00 UTC.</p>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="day-frames">Frames</label>
+          <input class="input" type="number" id="day-frames" step="1" min="1" max="288">
+          <p class="field-hint" id="day-cadence"></p>
+        </div>
+
+        <div class="field">
+          <label class="field-label" for="day-resolution">Detail</label>
+          <select class="input" id="day-resolution">
+            <option value="coarse">Coarse — 32 channels, one integration</option>
+            <option value="fine">Fine — your Setup's recording size</option>
+          </select>
+          <p class="field-hint" id="day-resolution-note"></p>
+        </div>
+
+        <div class="field field-wide">
+          <label class="toggle-label" for="day-carry">
+            <input type="checkbox" id="day-carry">
+            Carry my Setup sky sources
+          </label>
+          <p class="field-hint">
+            Off by default: your sources are placed as offsets from the pointing, so
+            carrying them makes them follow the telescope around all day, which no
+            real source does.
+          </p>
+        </div>
+      </div>
+
+      <div class="obs-run-row">
+        <button type="button" class="button button-run" id="day-build">Build the day</button>
+        <button type="button" class="button button-quiet" id="day-cancel" hidden>Stop</button>
+        <span class="status-cell status-info" id="day-status">nothing built yet</span>
+      </div>
+
+      <div class="progress" id="day-progress" hidden>
+        <div class="progress-fill" id="day-progress-fill"></div>
+      </div>
+
+      <div class="banner banner-error" id="day-error" hidden>
+        <span class="banner-kind">Fix</span>
+        <span id="day-error-text"></span>
+      </div>
+
+      <figure class="display" id="panel-movie">
+        <figcaption>
+          <span class="display-title">Dirty image, frame by frame</span>
+          <span class="display-sub mono" id="movie-scale"></span>
+        </figcaption>
+
+        <div class="movie-row">
+          <div class="canvas-wrap canvas-wrap-square">
+            <canvas id="movie-canvas" tabindex="0" role="button"
+                    aria-label="Dirty image of the current frame. Click or press space to play and pause; arrow keys step."></canvas>
+            <p class="display-empty" id="movie-empty">Press “Build the day” to fill this in.</p>
+          </div>
+        </div>
+
+        <div class="display-controls movie-controls">
+          <button type="button" class="button button-accent" id="movie-play" disabled>Play</button>
+          <button type="button" class="button button-small" id="movie-back" disabled>◀</button>
+          <button type="button" class="button button-small" id="movie-forward" disabled>▶</button>
+          <span class="display-sub mono" id="movie-counter"></span>
+          <span class="badge" id="movie-field"></span>
+        </div>
+
+        <!-- the signature element: 24 hours of this strip, in one band -->
+        <div class="timeline" id="timeline-wrap">
+          <svg id="timeline" role="application" tabindex="0"
+               aria-label="Twenty-four hours at this pointing. Click to jump to a time; arrow keys step through the day."></svg>
+          <p class="timeline-legend" id="timeline-legend"></p>
+        </div>
+
+        <p class="readout mono" id="movie-meta"></p>
+        <p class="muted-line" id="movie-guidance">
+          Click the image to play or pause. Most frames of an empty strip are receiver
+          noise and look alike; the marks on the timeline are where something transits.
+        </p>
+      </figure>
+    </section>
+
+    <!-- ---------------------------------------------------- the monitor -->
+    <section class="section" id="section-skynow" aria-labelledby="skynow-heading">
+      <div class="section-head">
+        <span class="section-number" aria-hidden="true">2</span>
+        <h2 class="section-title" id="skynow-heading">Sky now</h2>
+      </div>
+      <p class="section-intro">
+        What is actually over the site at this moment: ephemeris for the Sun, the Moon
+        and the four bright sources, propagated element sets for satellites, and live
+        transponder reports for aircraft within 100 nautical miles.
+      </p>
+      <p class="zone-line"><span class="badge" id="sky-zone">All times local</span></p>
+
+      <div class="sky-layout">
+        <div class="sky-chart-wrap">
+          <svg id="sky-chart" role="img"
+               aria-label="Horizon chart: zenith at the centre, horizon at the rim."></svg>
+          <p class="hint sky-howto">
+            How to read this: zenith at the centre, horizon at the rim, altitude linear
+            in radius — the dashed rings are 30° and 60° elevation. North is up and
+            <strong>east is left</strong>, which is correct for a chart of the sky above
+            you rather than a map of the ground below.
+          </p>
+          <div class="sky-legend" id="sky-legend" role="group"
+               aria-label="What each glyph on the chart means"></div>
+        </div>
+
+        <div class="sky-side">
+          <div class="layer-status" id="sky-layers"></div>
+          <p class="readout mono" id="sky-updated">not polled yet</p>
+          <div class="metric-wrap" id="sky-table"></div>
+          <p class="muted-line">
+            Everything on this chart is a potential interference source — or a calibrator.
+          </p>
+        </div>
+      </div>
+    </section>
+
+  </div>
 
 </main>
 

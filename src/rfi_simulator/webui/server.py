@@ -4,13 +4,18 @@
 what the tests use; `main` is the ``rfi-simulator-ui`` console entry
 point.
 
-The server binds to the loopback interface by default and deliberately
-never reaches the network itself -- neither on the server side nor in the
-page it serves: element sets are pasted in or taken from the bundled
-sample, every asset is served from this process, and the interactive API
-documentation, which would pull its viewer from a content delivery
-network, is switched off. The machine-readable schema stays at
+The server binds to the loopback interface by default. The page it serves
+never reaches the network: every asset comes from this process, and the
+interactive API documentation, which would pull its viewer from a content
+delivery network, is switched off. The machine-readable schema stays at
 ``/api/openapi.json``.
+
+The server reaches the network in exactly one place -- ``GET
+/api/sky/now``, whose live aircraft layer is fetched from a public
+aggregator with a hard timeout and degrades to an empty layer with a
+status when it cannot be reached (see `rfi_simulator.webui.skynow`).
+Nothing a simulation depends on is ever fetched: element sets are pasted
+in or taken from the bundle.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Path as PathParam
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -29,7 +35,28 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from rfi_simulator import __version__
-from rfi_simulator.webui.simulate import SimulateRequest, defaults_payload, run_simulation
+from rfi_simulator.webui.observatory import (
+    DayBusyError,
+    DayRequest,
+    cancel_day,
+    day_frame,
+    day_status,
+    start_day,
+    timeline_payload,
+)
+from rfi_simulator.webui.simulate import (
+    ARRAY_DIR_ENV_VAR,
+    FlagRequest,
+    SimulateRequest,
+    array_detail,
+    array_summaries,
+    default_array,
+    defaults_payload,
+    pointing_payload,
+    run_flaggers,
+    run_simulation,
+)
+from rfi_simulator.webui.skynow import sky_now
 
 __all__ = ["create_app", "main"]
 
@@ -65,9 +92,37 @@ One run is bounded by the request model's size cap; unbounded concurrency
 would multiply that bound by however many requests happen to arrive, so
 the rest queue instead. Single flight also keeps warning capture correct:
 `warnings.catch_warnings` swaps interpreter-global state, so two runs
-recording at once could attribute one request's warnings to the other."""
+recording at once could attribute one request's warnings to the other.
+
+The slot is taken non-blocking, not queued: a client that cannot get it
+is told so with a 429 rather than parked on a worker thread. Threaded
+servers have a finite thread pool, and a client that queues rather than
+being refused holds one of those threads for as long as the run in front
+of it takes; forty queued clicks was enough to freeze the page behind
+threads that were all just waiting.
+
+Deliberately NOT shared with the observatory day pool
+(`rfi_simulator.webui.observatory._day_slots`, gating
+``POST /api/observatory/day``): a day build is minutes of work in a
+background process pool, and making an interactive run wait behind it --
+which is what one shared semaphore would do -- would be worse than the
+alternative. The day pool has its own, independent admission control
+(`day_max_concurrent`, default one build at a time) plus its own cost
+budget (`DAY_COST_BUDGET`) bounding what one build may cost. The two
+pools' worst case is therefore not unbounded: it is one interactive run
+here plus one day build there, each bounded on its own terms, running at
+once. See `DEFAULT_DAY_MAX_CONCURRENT` for the other half of this
+accounting."""
 
 _simulation_slots = threading.BoundedSemaphore(MAX_CONCURRENT_SIMULATIONS)
+
+
+def _busy_response(message: str) -> JSONResponse:
+    """A 429 in the same ``{detail: [...]}`` shape as a 422, for the page."""
+    return JSONResponse(
+        status_code=429,
+        content={"detail": [{"loc": ["body"], "msg": message, "type": "value_error"}]},
+    )
 
 
 class ContentLengthLimitMiddleware:
@@ -148,7 +203,7 @@ class ContentLengthLimitMiddleware:
         await self.app(scope, counted_receive, send)
 
 
-def create_app(host: str | None = None) -> FastAPI:
+def create_app(host: str | None = None, array_dir: str | Path | None = None) -> FastAPI:
     """Build the application.
 
     Parameters
@@ -158,12 +213,23 @@ def create_app(host: str | None = None) -> FastAPI:
         ``Host`` headers. Loopback names are always accepted. Defaults to
         `HOST_ENV_VAR` in the environment, which is how `main` passes the
         bound interface through the reloader's fresh process.
+    array_dir : str or pathlib.Path, optional
+        A directory of extra array configurations to offer alongside the
+        bundled ones. Defaults to `ARRAY_DIR_ENV_VAR` in the environment.
+        Only this one directory is ever read, and clients name entries by
+        an identifier this process assigned, never by path.
 
     Returns
     -------
     fastapi.FastAPI
-        With ``GET /api/defaults``, ``POST /api/simulate``, and the page
-        itself at ``/``.
+        With ``GET /api/defaults``, ``GET /api/pointing``,
+        ``GET /api/arrays``, ``GET /api/arrays/{array_id}``,
+        ``POST /api/simulate``, ``POST /api/flag``, the observatory day
+        (``POST /api/observatory/day``, ``GET /api/observatory/day/{id}``,
+        ``GET /api/observatory/day/{id}/frame/{i}``,
+        ``POST /api/observatory/day/{id}/cancel``,
+        ``GET /api/observatory/timeline``), the live monitor
+        (``GET /api/sky/now``), and the page itself at ``/``.
     """
     app = FastAPI(
         title="Interference simulator",
@@ -175,6 +241,8 @@ def create_app(host: str | None = None) -> FastAPI:
 
     if host is None:
         host = os.environ.get(HOST_ENV_VAR) or None
+    if array_dir is None:
+        array_dir = os.environ.get(ARRAY_DIR_ENV_VAR) or None
 
     allowed_hosts = list(LOCAL_HOSTS)
     if host in WILDCARD_HOSTS:
@@ -211,6 +279,40 @@ def create_app(host: str | None = None) -> FastAPI:
         """Default array, default observation, guard rails and form schemas."""
         return defaults_payload()
 
+    @app.get("/api/pointing")
+    def get_pointing(
+        latitude_deg: float | None = Query(default=None, ge=-90.0, le=90.0),
+        longitude_deg: float | None = Query(default=None, ge=-360.0, le=360.0),
+        height_m: float | None = Query(default=None, ge=-500.0, le=1.0e4),
+    ) -> dict[str, Any]:
+        """Where a run from this site points, and how wide the image is.
+
+        The page asks again whenever the site changes -- loading another
+        array moves the zenith, and the honest bounds it quotes for source
+        placement move with it.
+        """
+        return pointing_payload(latitude_deg, longitude_deg, height_m)
+
+    @app.get("/api/arrays")
+    def get_arrays() -> list[dict[str, Any]]:
+        """Array layouts this server can offer, without their positions."""
+        return array_summaries(array_dir)
+
+    @app.get("/api/arrays/{array_id}")
+    def get_array(
+        array_id: str = PathParam(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$"),
+    ) -> dict[str, Any]:
+        """One layout in full: antennas and the site they stand on.
+
+        `array_id` is matched against identifiers this process handed out
+        in `get_arrays`; it never reaches the filesystem, so there is no
+        path for a request to traverse. Anything unknown is a 404.
+        """
+        payload = array_detail(array_id, array_dir)
+        if payload is None:
+            raise HTTPException(status_code=404, detail=f"no array layout called {array_id!r}")
+        return payload
+
     @app.post("/api/simulate")
     def post_simulate(
         request: SimulateRequest,
@@ -223,23 +325,173 @@ def create_app(host: str | None = None) -> FastAPI:
         own message, because it is a fault in the setup the user typed,
         not in the server.
 
-        Runs queue behind `MAX_CONCURRENT_SIMULATIONS`: the request model
-        bounds the memory of one run, and this is what keeps several
-        arriving at once from multiplying that bound.
+        Bounded by `MAX_CONCURRENT_SIMULATIONS`: the request model bounds
+        the memory of one run, and this is what keeps several arriving at
+        once from multiplying that bound. A request that arrives while the
+        slot is taken is refused with a 429 rather than queued, so it never
+        holds a server thread waiting for someone else's run.
 
         `pol` selects which receptor the waterfall display shows for a
         dual-polarization run (``n_pol=2``); it is ignored (fixed to 0)
         for a single-polarization one. The dirty image always images
         Stokes I regardless of `pol` -- see `run_simulation`.
         """
-        with _simulation_slots:
-            try:
-                return run_simulation(request, pol=pol)
-            except ValueError as exc:
-                return JSONResponse(
-                    status_code=422,
-                    content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]},
-                )
+        if not _simulation_slots.acquire(blocking=False):
+            return _busy_response(
+                "a simulation is already running -- wait for it to finish and try again"
+            )
+        try:
+            return run_simulation(request, pol=pol)
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]},
+            )
+        finally:
+            _simulation_slots.release()
+
+    @app.post("/api/flag")
+    def post_flag(request: FlagRequest) -> Any:
+        """Score one or two classical flaggers against a run's ground truth.
+
+        The body carries the whole observation again rather than the
+        identifier of an earlier one: this server keeps no per-client
+        state, and a run is reproducible from its seed, so re-simulating
+        is what makes the flagged data provably the same data the page is
+        already showing. It shares the same `MAX_CONCURRENT_SIMULATIONS`
+        slot as a run, because it is one, and the same
+        429-rather-than-queue rule: a slot already taken is refused, not
+        waited for.
+
+        A `ValueError` -- an antenna that does not exist in this array, an
+        accumulation that would build too large a grid, or anything the
+        library refuses -- comes back as a 422 with its own message.
+        """
+        if not _simulation_slots.acquire(blocking=False):
+            return _busy_response(
+                "a simulation is already running -- wait for it to finish and try again"
+            )
+        try:
+            return run_flaggers(request)
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]},
+            )
+        finally:
+            _simulation_slots.release()
+
+    @app.post("/api/observatory/day")
+    def post_observatory_day(request: DayRequest) -> Any:
+        """Start building a simulated day, and answer with its identifier.
+
+        The work happens in a process pool behind this call rather than in
+        it: a day is ninety-six independent simulations, which is minutes
+        of work, and no browser should hold a request open for that. The
+        page polls `get_observatory_day` and reads finished frames one at
+        a time.
+
+        Refused with a 422 if the request's cost estimate is over budget
+        (see `rfi_simulator.webui.observatory.DAY_COST_BUDGET`), and with a
+        429 if a day is already building (see `day_max_concurrent`) --
+        cancel it or wait, then try again.
+        """
+        try:
+            job_id = start_day(request)
+        except DayBusyError as exc:
+            return _busy_response(str(exc))
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": [{"loc": ["body"], "msg": str(exc), "type": "value_error"}]},
+            )
+        return {"id": job_id, "total": request.n_frames, "state": "building"}
+
+    @app.get("/api/observatory/day/{job_id}")
+    def get_observatory_day(
+        job_id: str = PathParam(pattern=r"^[0-9a-f]{32}$"),
+    ) -> dict[str, Any]:
+        """How far the day has got, and every finished frame's metadata.
+
+        Deliberately without the images: this is polled once a second
+        while a day builds, and the images are what make a day large.
+        """
+        payload = day_status(job_id)
+        if payload is None:
+            raise HTTPException(
+                status_code=404,
+                detail="no such day: it may have finished over an hour ago and been dropped",
+            )
+        return payload
+
+    @app.get("/api/observatory/day/{job_id}/frame/{index}")
+    def get_observatory_frame(
+        job_id: str = PathParam(pattern=r"^[0-9a-f]{32}$"),
+        index: int = PathParam(ge=0, le=10_000),
+    ) -> dict[str, Any]:
+        """One frame's image and metadata."""
+        payload = day_frame(job_id, index)
+        if payload is None:
+            raise HTTPException(status_code=404, detail=f"no frame {index} in this day")
+        return payload
+
+    @app.post("/api/observatory/day/{job_id}/cancel")
+    def post_observatory_cancel(
+        job_id: str = PathParam(pattern=r"^[0-9a-f]{32}$"),
+    ) -> dict[str, Any]:
+        """Stop building. Frames already finished stay readable."""
+        payload = cancel_day(job_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="no such day")
+        return payload
+
+    @app.get("/api/observatory/timeline")
+    def get_observatory_timeline(
+        date: str = Query(max_length=32),
+        dec_deg: float = Query(ge=-90.0, le=90.0),
+        latitude_deg: float = Query(ge=-90.0, le=90.0),
+        longitude_deg: float = Query(ge=-360.0, le=360.0),
+        height_m: float = Query(default=0.0, ge=-500.0, le=1.0e4),
+        tle_text: str = Query(default="", max_length=4000),
+    ) -> Any:
+        """Everything the day's timeline band draws, for one date and strip.
+
+        Cheap enough to answer while the controls are still being edited:
+        no simulation happens here, only ephemeris and, when the setup has
+        a satellite, one propagation across the day.
+        """
+        try:
+            return timeline_payload(
+                date, dec_deg, latitude_deg, longitude_deg, height_m, tle_text=tle_text
+            )
+        except ValueError as exc:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": [{"loc": ["query", "date"], "msg": str(exc), "type": "value_error"}]
+                },
+            )
+
+    @app.get("/api/sky/now")
+    def get_sky_now(
+        latitude_deg: float | None = Query(default=None, ge=-90.0, le=90.0),
+        longitude_deg: float | None = Query(default=None, ge=-360.0, le=360.0),
+        height_m: float | None = Query(default=None, ge=-500.0, le=1.0e4),
+    ) -> dict[str, Any]:
+        """What is over the site at this instant.
+
+        This is the one endpoint in the server that reaches the network,
+        and it is the one endpoint that is allowed to fail in part: the
+        ephemeris layers are always there, and a layer whose source is
+        unreachable comes back empty with a status saying so rather than
+        taking the response down with it.
+        """
+        site = default_array()
+        return sky_now(
+            site.latitude_deg if latitude_deg is None else latitude_deg,
+            site.longitude_deg if longitude_deg is None else longitude_deg,
+            site.height_m if height_m is None else height_m,
+        )
 
     @app.get("/")
     def get_index() -> FileResponse:
@@ -285,6 +537,15 @@ def main(argv: list[str] | None = None) -> int:
         "--port", type=int, default=DEFAULT_PORT, help="port to listen on (default: %(default)s)"
     )
     parser.add_argument(
+        "--array-dir",
+        default=None,
+        help=(
+            "directory of extra array layout YAML files to offer in the page's "
+            "layout picker, alongside the bundled ones (default: the "
+            f"{ARRAY_DIR_ENV_VAR} environment variable, if set)"
+        ),
+    )
+    parser.add_argument(
         "--reload", action="store_true", help="restart when the source changes (development)"
     )
     args = parser.parse_args(argv)
@@ -292,6 +553,10 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     os.environ[HOST_ENV_VAR] = args.host
+    if args.array_dir:
+        # Same reason as the host: an import-string application is built
+        # in a process this one does not otherwise get to configure.
+        os.environ[ARRAY_DIR_ENV_VAR] = str(Path(args.array_dir).expanduser())
     uvicorn.run(
         "rfi_simulator.webui.server:create_app",
         factory=True,

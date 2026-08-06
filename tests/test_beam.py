@@ -22,7 +22,7 @@ from rfi_simulator import (
     correlate,
     dirty_image,
 )
-from rfi_simulator.beam import bessel_j1
+from rfi_simulator.beam import DEFAULT_GAUSSIAN_FWHM_COEFF, bessel_j1
 
 # Same fine grid test_imaging.py uses.
 PIXEL_RAD = 2e-4
@@ -83,6 +83,33 @@ def test_gaussian_beam_attenuates_more_at_higher_frequency():
     low = beam.power_response(theta, 1.0e9)
     high = beam.power_response(theta, 2.0e9)
     assert high < low
+
+
+def test_gaussian_beam_defaults_to_the_tapered_coefficient():
+    beam = GaussianBeam(dish_diameter_m=4.5)
+    assert beam.fwhm_coefficient == DEFAULT_GAUSSIAN_FWHM_COEFF
+    assert DEFAULT_GAUSSIAN_FWHM_COEFF == pytest.approx(1.2)
+
+
+def test_gaussian_beam_default_fwhm_matches_the_documented_dish():
+    # 4.65 m at 1.4 GHz: the bundled array's dish, quoted in the beam's
+    # own docstring as landing at FWHM ~= 3.166 degrees.
+    beam = GaussianBeam(dish_diameter_m=4.65)
+    fwhm_deg = np.degrees(beam.fwhm_rad(1.4e9))
+    assert fwhm_deg == pytest.approx(3.166, abs=1e-3)
+
+
+def test_gaussian_beam_custom_coefficient_scales_fwhm_proportionally():
+    freq_hz = 1.4e9
+    reference = GaussianBeam(dish_diameter_m=4.5)
+    doubled = GaussianBeam(dish_diameter_m=4.5, fwhm_coefficient=2.0 * DEFAULT_GAUSSIAN_FWHM_COEFF)
+    assert doubled.fwhm_rad(freq_hz) == pytest.approx(2.0 * reference.fwhm_rad(freq_hz), rel=1e-12)
+
+
+@pytest.mark.parametrize("bad_coefficient", [0.0, -1.0, float("nan"), float("inf")])
+def test_gaussian_beam_rejects_bad_fwhm_coefficient(bad_coefficient):
+    with pytest.raises(ValueError):
+        GaussianBeam(dish_diameter_m=4.5, fwhm_coefficient=bad_coefficient)
 
 
 def test_gaussian_beam_broadcasts_over_channels():
