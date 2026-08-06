@@ -1627,9 +1627,7 @@ def test_uv_radii_are_the_baseline_lengths_over_the_wavelength(client):
     n_chan = observation["n_chan"]
     bandwidth = observation["bandwidth_hz"]
     center_freq = (
-        observation["center_freq_hz"]
-        - 0.5 * bandwidth
-        + (n_chan // 2 + 0.5) * (bandwidth / n_chan)
+        observation["center_freq_hz"] - 0.5 * bandwidth + (n_chan // 2 + 0.5) * (bandwidth / n_chan)
     )
     wavelength_m = 299792458.0 / center_freq
 
@@ -1646,9 +1644,7 @@ def test_uv_radii_are_the_baseline_lengths_over_the_wavelength(client):
 def test_the_uv_plane_is_reported_without_its_conjugate_half(client):
     """The page mirrors each point itself, so shipping both would double-draw."""
     payload = client.post("/api/simulate", json=uv_request()).json()
-    points = {
-        (round(u, 3), round(v, 3)) for u, v in zip(payload["uv"]["u"], payload["uv"]["v"])
-    }
+    points = {(round(u, 3), round(v, 3)) for u, v in zip(payload["uv"]["u"], payload["uv"]["v"])}
     assert not (points & {(-u, -v) for u, v in points})
     assert len(payload["uv"]["u"]) == (
         payload["observation"]["n_baselines"] * payload["observation"]["n_blocks"]

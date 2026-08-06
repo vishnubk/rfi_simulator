@@ -104,9 +104,7 @@ def test_fractional_offset_zone_reports_fractional_hours():
     # offset-hours arithmetic (not the fallback table, which is
     # integer-only by construction) against a real half-hour-offset
     # zone to confirm fractional offsets are handled, not rounded away.
-    zone = ZoneInfoResult(
-        key="Asia/Kolkata", approximate=False, tzinfo=ZoneInfo("Asia/Kolkata")
-    )
+    zone = ZoneInfoResult(key="Asia/Kolkata", approximate=False, tzinfo=ZoneInfo("Asia/Kolkata"))
     local = to_local("2026-07-15T00:00:00.000", zone)
     assert local.utcoffset().total_seconds() / 3600.0 == 5.5
 

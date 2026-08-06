@@ -239,9 +239,7 @@ def _aircraft_altaz(
     return _enu_to_altaz(enu_from_ecef_offset(delta, site))
 
 
-def _parse_aircraft(
-    payload: dict[str, Any], site: EarthLocation
-) -> list[dict[str, Any]]:
+def _parse_aircraft(payload: dict[str, Any], site: EarthLocation) -> list[dict[str, Any]]:
     """Turn one aggregator response into horizon coordinates.
 
     Defensive throughout: the feed is somebody else's schema, entries with
@@ -377,9 +375,7 @@ def sky_now(
     for item in CATALOG_SOURCES:
         coord = SkyCoord(ra=item["ra_deg"] * u.deg, dec=item["dec_deg"] * u.deg, frame="icrs")
         entry = horizon(coord)
-        entry.update(
-            {"name": item["name"], "flux_jy": item["flux_jy"], "dec_deg": item["dec_deg"]}
-        )
+        entry.update({"name": item["name"], "flux_jy": item["flux_jy"], "dec_deg": item["dec_deg"]})
         sources.append(entry)
     sources.sort(key=lambda entry: -entry["altitude_deg"])
     layers["ephemeris"] = {"status": "ok", "note": "computed here, no network involved"}

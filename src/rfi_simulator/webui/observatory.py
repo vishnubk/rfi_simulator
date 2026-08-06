@@ -774,9 +774,7 @@ def day_frame(identifier: str, index: int) -> dict[str, Any] | None:
         payload["n_pix"] = IMAGE_N_PIX
         payload["field_of_view_rad"] = IMAGE_FIELD_OF_VIEW_RAD
         latitude, longitude, _ = site_coordinates(job.request.setup)
-        payload["local"] = local_clock(
-            payload.get("utc") or "", resolve_zone(latitude, longitude)
-        )
+        payload["local"] = local_clock(payload.get("utc") or "", resolve_zone(latitude, longitude))
         return payload
 
 
@@ -944,9 +942,7 @@ def timeline_payload(
         altitudes = [
             float(
                 _altitude_deg(
-                    SkyCoord(
-                        ra=item["ra_deg"] * u.deg, dec=item["dec_deg"] * u.deg, frame="icrs"
-                    ),
+                    SkyCoord(ra=item["ra_deg"] * u.deg, dec=item["dec_deg"] * u.deg, frame="icrs"),
                     instant,
                     location,
                 )[0]

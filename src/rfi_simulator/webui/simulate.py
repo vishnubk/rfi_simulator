@@ -3098,9 +3098,7 @@ def _run_visibility_flaggers(request: FlagRequest) -> dict[str, Any]:
         # sees it, and is what an astronomer looking at a snapshot
         # spectrum uses. Running only one of the two would report a recall
         # of zero on interference plainly visible in the panel above.
-        time_mask, time_residual = mad_clip_mask(
-            spectrogram, params.n_sigma, return_statistic=True
-        )
+        time_mask, time_residual = mad_clip_mask(spectrogram, params.n_sigma, return_statistic=True)
         freq_mask, freq_residual = mad_clip_mask(
             spectrogram.T, params.n_sigma, return_statistic=True
         )
@@ -3109,9 +3107,10 @@ def _run_visibility_flaggers(request: FlagRequest) -> dict[str, Any]:
         if "mad" in methods:
             predictions["mad"] = time_mask | freq_mask.T
         if "sumthreshold" in methods:
-            predictions["sumthreshold"] = sumthreshold_mask(
-                time_residual, params.chi_1, params.iterations
-            ) | sumthreshold_mask(freq_residual, params.chi_1, params.iterations).T
+            predictions["sumthreshold"] = (
+                sumthreshold_mask(time_residual, params.chi_1, params.iterations)
+                | sumthreshold_mask(freq_residual, params.chi_1, params.iterations).T
+            )
     wall_time_s = time.perf_counter() - started
 
     simulator = grids["simulator"]

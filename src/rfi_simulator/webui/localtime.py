@@ -161,7 +161,7 @@ def to_local(utc_isot: str, zone: ZoneInfoResult) -> datetime:
 
 
 def local_clock(utc_isot: str, zone: ZoneInfoResult) -> str:
-    """"HH:MM" in local time, or "--:--" for falsy/missing input."""
+    """ "HH:MM" in local time, or "--:--" for falsy/missing input."""
     if not utc_isot:
         return "--:--"
     local = to_local(utc_isot, zone)
@@ -172,17 +172,12 @@ def local_day_fraction(utc_isot: str, zone: ZoneInfoResult) -> float:
     """Fraction (0..1) of the way through the LOCAL calendar day."""
     local = to_local(utc_isot, zone)
     seconds_since_midnight = (
-        local.hour * 3600
-        + local.minute * 60
-        + local.second
-        + local.microsecond / 1e6
+        local.hour * 3600 + local.minute * 60 + local.second + local.microsecond / 1e6
     )
     return seconds_since_midnight / 86400.0
 
 
-def zone_payload(
-    latitude_deg: float, longitude_deg: float, when: datetime | None = None
-) -> dict:
+def zone_payload(latitude_deg: float, longitude_deg: float, when: datetime | None = None) -> dict:
     """A JSON-safe summary of the resolved zone, for the API layer.
 
     `when` defaults to the current instant; pass a specific instant to

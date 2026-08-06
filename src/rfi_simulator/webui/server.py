@@ -418,9 +418,7 @@ def create_app(host: str | None = None, array_dir: str | Path | None = None) -> 
             return JSONResponse(
                 status_code=422,
                 content={
-                    "detail": [
-                        {"loc": ["query", "date"], "msg": str(exc), "type": "value_error"}
-                    ]
+                    "detail": [{"loc": ["query", "date"], "msg": str(exc), "type": "value_error"}]
                 },
             )
 

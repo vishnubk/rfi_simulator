@@ -210,9 +210,7 @@ def test_a_source_below_the_horizon_never_enters_the_field():
     # A southern site cannot see Cassiopeia A at all; point at its
     # declination anyway and check the field stays empty of it.
     southern = {"latitude_deg": -60.0, "longitude_deg": 0.0, "height_m": 0.0}
-    location = EarthLocation.from_geodetic(
-        lon=0.0 * u.deg, lat=-60.0 * u.deg, height=0.0 * u.m
-    )
+    location = EarthLocation.from_geodetic(lon=0.0 * u.deg, lat=-60.0 * u.deg, height=0.0 * u.m)
     cas = CATALOG_SOURCES[0]
     payload = timeline_payload(DATE, cas["dec_deg"], **southern)
     entry = [item for item in payload["sources"] if item["name"] == "Cas A"][0]
