@@ -573,8 +573,34 @@ def test_the_endpoints_carry_a_day_from_start_to_frame(client, monkeypatch):
     assert len(frame.json()["image"]) == frame.json()["n_pix"]
 
     assert client.get(f"/api/observatory/day/{job_id}/frame/9").status_code == 404
+
+    # Local time travels with both the status poll and the full frame.
+    assert status["zone"]["key"] == "America/Los_Angeles"
+    assert all(len(entry["local"]) == 5 for entry in status["frames"])
+    assert frame.json()["local"] == status["frames"][0]["local"]
+
     assert client.get("/api/observatory/day/" + "0" * 32).status_code == 404
     assert client.post(f"/api/observatory/day/{job_id}/cancel").status_code == 200
+
+
+def test_the_timeline_endpoint_carries_the_zone_and_local_clocks(client):
+    payload = client.get(
+        "/api/observatory/timeline",
+        params=dict(SITE, date=DATE, dec_deg=SITE["latitude_deg"]),
+    ).json()
+    assert payload["zone"]["abbreviation"] == "PDT"
+    assert payload["sun"]["dec_date"] == DATE
+    assert len(payload["sun"]["sunrise_local"]) == len(payload["sun"]["sunrise_utc"])
+    assert payload["sun"]["transit_local"] != ""
+
+
+def test_the_monitor_endpoint_carries_the_zone(client, monkeypatch):
+    monkeypatch.setattr(skynow, "fetch_aircraft", dead_fetcher)
+    monkeypatch.setattr(skynow, "load_elements", dead_fetcher)
+    skynow.clear_caches()
+    payload = client.get("/api/sky/now", params=SITE).json()
+    assert payload["zone"]["key"] == "America/Los_Angeles"
+    assert len(payload["local"]) == 5
 
 
 def test_the_day_endpoint_refuses_a_job_it_cannot_size(client):
@@ -652,3 +678,147 @@ def test_the_request_model_defends_its_bounds():
     with pytest.raises(ValueError):
         DayRequest.model_validate({"setup": dict(TINY_SETUP, antennas=[[0.0, 0.0, 0.0]])})
     assert isinstance(tiny_day().setup, SimulateRequest)
+
+
+# ----------------------------------------------------------------------
+# Observatory-local time
+# ----------------------------------------------------------------------
+def test_the_timeline_names_the_sites_own_time_zone():
+    """Every clock the tab prints is the observatory's, so it must say which."""
+    payload = timeline_payload(DATE, SITE["latitude_deg"], **SITE)
+    zone = payload["zone"]
+    assert zone["key"] == "America/Los_Angeles"
+    assert zone["abbreviation"] == "PDT"
+    assert zone["utc_offset_hours"] == -7.0
+    assert zone["approximate"] is False
+
+
+def test_local_clocks_are_the_utc_ones_shifted_by_that_offset():
+    payload = timeline_payload(DATE, SITE["latitude_deg"], **SITE)
+    offset_hours = payload["zone"]["utc_offset_hours"]
+    for utc, local in zip(payload["sun"]["sunrise_utc"], payload["sun"]["sunrise_local"]):
+        expected = (Time(utc, scale="utc") + offset_hours * u.hour).datetime
+        assert local == f"{expected.hour:02d}:{expected.minute:02d}"
+    assert payload["sun"]["transit_local"] != payload["sun"]["transit_utc"][11:16]
+    # Solar transit lands near local noon, which is the whole point of
+    # showing local time on a transit instrument. Not *at* noon: the site
+    # sits east of its zone meridian and the zone is on daylight saving,
+    # so an hour of slack is the honest bound.
+    hour, minute = (int(part) for part in payload["sun"]["transit_local"].split(":"))
+    assert abs(hour * 60 + minute - 12 * 60) < 90
+
+
+def test_daylight_saving_is_resolved_at_the_requested_date():
+    """Not a fixed offset stamped once: the same site, two seasons."""
+    summer = timeline_payload("2026-07-15", 37.0, **SITE)["zone"]
+    winter = timeline_payload("2026-01-15", 37.0, **SITE)["zone"]
+    assert summer["abbreviation"] == "PDT"
+    assert winter["abbreviation"] == "PST"
+    assert summer["utc_offset_hours"] - winter["utc_offset_hours"] == 1.0
+
+
+def test_a_site_outside_the_table_gets_an_approximate_zone():
+    payload = timeline_payload(DATE, 0.0, latitude_deg=-30.0, longitude_deg=25.0, height_m=0.0)
+    zone = payload["zone"]
+    assert zone["approximate"] is True
+    assert zone["utc_offset_hours"] == 2.0
+    assert "approximated from the site longitude" in zone["note"]
+
+
+def test_every_source_transit_carries_a_local_clock():
+    payload = timeline_payload(DATE, SITE["latitude_deg"], **SITE)
+    for source in payload["sources"]:
+        assert len(source["transits_local"]) == len(source["transits_utc"])
+        for clock in source["transits_local"]:
+            assert len(clock) == 5 and clock[2] == ":"
+
+
+def test_the_day_and_the_monitor_agree_about_the_zone():
+    """Two payloads, one site: a reader must not see two different clocks."""
+    identifier, status = run_day(tiny_day())
+    monitor = skynow.sky_now(**SITE, now=Time(f"{DATE}T20:00:00", scale="utc"))
+    assert status["zone"]["key"] == monitor["zone"]["key"]
+    assert monitor["local"] == "13:00"
+
+
+def test_each_frame_is_stamped_with_its_local_clock():
+    identifier, status = run_day(tiny_day())
+    offset_hours = status["zone"]["utc_offset_hours"]
+    for index, meta in enumerate(status["frames"]):
+        assert meta["utc"] is not None
+        expected = (Time(meta["utc"], scale="utc") + offset_hours * u.hour).datetime
+        assert meta["local"] == f"{expected.hour:02d}:{expected.minute:02d}"
+        # The full frame carries the same stamp as the status poll's row.
+        assert day_frame(identifier, index)["local"] == meta["local"]
+
+
+# ----------------------------------------------------------------------
+# The Sun's strip moves with the date
+# ----------------------------------------------------------------------
+def test_the_suns_strip_follows_the_date_and_matches_astropy():
+    """The shortcut chip offers a declination that swings 47 degrees a year."""
+    from astropy.coordinates import get_sun
+
+    august = timeline_payload("2026-08-05", 37.0, **SITE)["sun"]
+    september = timeline_payload("2026-09-05", 37.0, **SITE)["sun"]
+
+    assert august["dec_date"] == "2026-08-05"
+    assert september["dec_date"] == "2026-09-05"
+    assert abs(august["dec_deg"] - september["dec_deg"]) > 5.0
+    for payload, date in ((august, "2026-08-05"), (september, "2026-09-05")):
+        expected = float(get_sun(Time(f"{date}T12:00:00", scale="utc")).dec.deg)
+        assert abs(payload["dec_deg"] - expected) < 1.0e-3
+
+
+# ----------------------------------------------------------------------
+# A finished day must say so
+# ----------------------------------------------------------------------
+def test_frame_workers_never_fork_the_server():
+    """A forked child inherits the server's locks and its listening socket."""
+    from rfi_simulator.webui.observatory import _worker_context
+
+    assert _worker_context().get_start_method() == "spawn"
+
+
+def test_a_finished_day_reports_done_without_waiting_for_the_pool():
+    """The state is settled from the frames, not from the pool shutting down.
+
+    A worker process that lingers -- and one that has inherited a web
+    server's threads can -- must not be able to leave a day whose frames
+    are all computed reading "building", because the page will not play a
+    day it believes is still being built.
+    """
+    from rfi_simulator.webui import observatory
+
+    released = []
+    original = observatory._release_pool
+
+    def slow_release(pool):
+        # Stand in for a pool that will not join: the state must already
+        # be right by the time this is reached.
+        released.append(observatory.jobs.get(identifier).state)
+        original(pool)
+
+    identifier = None
+    observatory._release_pool = slow_release
+    try:
+        identifier = start_day(tiny_day(), max_workers=2)
+        deadline = time.time() + 180.0
+        while time.time() < deadline:
+            if day_status(identifier)["state"] != "building":
+                break
+            time.sleep(0.1)
+    finally:
+        observatory._release_pool = original
+
+    status = day_status(identifier)
+    assert status["state"] == "done"
+    assert status["done"] == status["total"]
+    # And the state was already "done" when the pool was let go, not after.
+    assert released == ["done"]
+
+
+def test_the_sun_is_in_field_exactly_when_the_strip_is_pointed_at_it():
+    dec = timeline_payload(DATE, 0.0, **SITE)["sun"]["dec_deg"]
+    assert timeline_payload(DATE, dec, **SITE)["sun"]["in_field"] is True
+    assert timeline_payload(DATE, dec + 10.0, **SITE)["sun"]["in_field"] is False

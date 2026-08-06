@@ -1312,6 +1312,21 @@ details.realism > summary { font-size: 13px; font-weight: 600; color: var(--ink)
 
 .flagger-legend:empty { display: none; }
 
+/* The traces named under a paper plot -- the bandpass's two receptors,
+ * the flag fraction's method against the truth. Same idiom as the
+ * flagger's own legend, so a swatch means the same thing everywhere. */
+#bandpass-legend,
+#flagfrac-legend {
+  display: flex;
+  gap: 6px 18px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 8px;
+}
+
+#bandpass-legend:empty,
+#flagfrac-legend:empty { display: none; }
+
 .legend-item { display: inline-flex; align-items: center; gap: 6px; }
 
 .legend-swatch {
@@ -1331,6 +1346,16 @@ details.realism > summary { font-size: 13px; font-weight: 600; color: var(--ink)
   color: var(--ink-faint);
 }
 
+/* The same sentence, in the same place, saying something the reader has
+ * to act on: an empty day and why it is empty. */
+.muted-line-warn {
+  color: var(--ink);
+  border-left: 3px solid var(--amber-line);
+  padding: 4px 10px;
+  background: var(--amber-wash);
+  border-radius: 0 3px 3px 0;
+}
+
 /* ------------------------------------------------- image panel extras */
 .vis-spectra-note { display: block; margin: 8px 0 0; }
 
@@ -1341,13 +1366,164 @@ details.realism > summary { font-size: 13px; font-weight: 600; color: var(--ink)
 }
 
 .uv-sub-line { display: block; margin: 0; }
-.uv-block .canvas-wrap { min-height: 300px; }
 
-/* uv plot internals (drawn on the dark surface) */
-.uv-axis { stroke: #39404b; stroke-width: 1; }
-.uv-grid { stroke: #262c35; stroke-width: 1; }
-.uv-tick-label { fill: var(--console-ink-soft); font-family: var(--font-mono); font-size: 9px; }
-.uv-point { fill: var(--plot-point); }
+/* The uv plane is the one plot on the page drawn on white.
+ *
+ * The waterfalls and the images keep the dark console ground because a
+ * sequential colour ramp needs one: magma's low end *is* near-black, and
+ * on white the whole bottom half of the scale would be invisible. The uv
+ * plane has no ramp. It is a scatter of identical marks, and a scatter of
+ * small dots reads better as ink on paper -- the marks are what carries
+ * the information, and the grid can recede properly instead of having to
+ * out-glow a dark field. */
+/* Squarish and no wider than it is tall: the uv plane has no preferred
+ * direction, and stretching it across a full-width panel would put a
+ * hundred pixels of dot in the middle of a thousand pixels of paper. */
+.uv-wrap {
+  position: relative;
+  height: 340px;
+  max-width: 420px;
+  margin-top: 8px;
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.uv-wrap svg { display: block; width: 100%; height: 100%; }
+
+.uv-axis { stroke: var(--edge); stroke-width: 1; }
+.uv-grid { stroke: #e8ecef; stroke-width: 1; fill: none; }
+.uv-tick-label { fill: var(--ink-faint); font-family: var(--font-mono); font-size: 9px; }
+.uv-axis-label { fill: var(--ink-soft); font-family: var(--font-mono); font-size: 10px; }
+.uv-point { fill: var(--action); fill-opacity: 0.72; }
+
+/* ------------------------------------------------------- chip bars */
+/* A row of chips sitting directly on top of the picture they change.
+ * Clicking one paints something over the plot below, so it belongs
+ * above the plot and nowhere else -- a control folded away in an
+ * expander cannot be understood as "this switch paints that layer". */
+.chip-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 8px;
+}
+
+.chip-bar-label {
+  font-size: 10px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.chip-set { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+
+/* Pressed is amber, the page's one "this is the selected thing" colour.
+ * A chip carrying a colour key shows it as a small square, so the wash
+ * on the plot below can be traced back to the chip that put it there. */
+.chip[aria-pressed="true"] {
+  background: var(--amber);
+  border-color: var(--amber-line);
+  color: var(--ink);
+}
+
+.chip-swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: -1px;
+  opacity: 0.55;
+}
+
+.chip[aria-pressed="true"] .chip-swatch { opacity: 1; }
+
+/* A chip whose mask is being computed. The dot spins in place rather
+ * than the chip changing size, so the row does not reflow mid-click. */
+.chip-spinner {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-right: 5px;
+  vertical-align: -1px;
+  border: 1.5px solid var(--amber-line);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: chip-spin 0.7s linear infinite;
+}
+
+@keyframes chip-spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .chip-spinner { animation: none; opacity: 0.6; }
+}
+
+/* ------------------------------------------------------- subplots */
+/* A second, smaller plot under a panel's main picture -- the bandpass
+ * under the dynamic spectrum, the flag fraction under the overlay. It
+ * shares the panel's x axis in spirit (frequency), so it is separated by
+ * a hairline rather than being made to look like its own panel. */
+.subplot {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+}
+
+.subplot-title {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.subplot-title .display-sub { font-weight: 400; }
+
+/* The subplots draw on paper, not on the console: they are line plots,
+ * and `drawLinePlot` paints no background of its own, so the wrap has to
+ * supply the white the plot was designed against. */
+.subplot .canvas-wrap {
+  min-height: 170px;
+  background: var(--surface);
+  border: 1px solid var(--edge);
+}
+
+.canvas-wrap-short { min-height: 170px; }
+
+.zone-line { margin: 0 0 12px; }
+
+/* ------------------------------------------------------- sky legend */
+.sky-howto { margin: 8px 0 0; }
+
+.sky-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin-top: 8px;
+}
+
+/* The legend and the how-to sit on the chart's dark ground, so they take
+ * the console's ink rather than the page's. */
+.sky-howto { color: var(--console-ink-soft); }
+.sky-howto strong { color: var(--console-ink); font-weight: 600; }
+
+.sky-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--console-ink-soft);
+}
+
+.sky-legend-item svg { width: 16px; height: 16px; flex: none; }
+
+.sky-legend-item svg { display: block; overflow: visible; }
 
 /* ------------------------------------------------------------ tooltip */
 .tooltip {
@@ -1433,6 +1609,8 @@ details.realism > summary { font-size: 13px; font-weight: 600; color: var(--ink)
 .movie-row { display: flex; justify-content: center; }
 .movie-controls { align-items: center; }
 #movie-canvas:focus-visible { outline: 2px solid var(--amber); outline-offset: -2px; }
+/* The image is a play/pause control, so it says so under the pointer. */
+#movie-canvas { cursor: pointer; }
 
 /* --- the timeline: one band, twenty-four hours ------------------------ */
 .timeline { margin-top: 14px; }
@@ -1480,7 +1658,9 @@ details.realism > summary { font-size: 13px; font-weight: 600; color: var(--ink)
   border-radius: var(--radius);
   padding: 8px;
 }
-.sky-chart-wrap svg { display: block; width: 100%; height: auto; }
+/* Scoped to the chart itself: the legend's own 16px glyph swatches are
+ * SVGs inside the same wrap and must keep their intrinsic size. */
+#sky-chart { display: block; width: 100%; height: auto; }
 .sky-side { min-width: 0; }
 .layer-status {
   display: flex;

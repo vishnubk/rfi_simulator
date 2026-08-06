@@ -1523,3 +1523,203 @@ def test_the_flagger_refuses_an_accumulation_that_straddles_a_block(client):
 def test_the_flagger_refuses_a_method_list_it_cannot_answer(client, methods):
     """One or two named methods, each named once."""
     assert client.post("/api/flag", json=flag_body(methods)).status_code == 422
+
+
+# ----------------------------------------------------------------------
+# The bandpass: time-averaged spectra, both receptors
+# ----------------------------------------------------------------------
+def test_the_bandpass_ships_every_antenna_and_every_receptor(client):
+    """A dual-polarization run carries XX and YY, whichever one the
+    waterfall is showing: the bandpass plot exists to compare them."""
+    body = make_request()
+    body["n_pol"] = 2
+    response = client.post("/api/simulate?pol=0", json=body)
+    assert response.status_code == 200, response.text
+    water = response.json()["waterfall"]
+    bandpass = water["bandpass"]
+
+    assert bandpass["pol_names"] == ["XX", "YY"]
+    grid = np.asarray(bandpass["antennas"])
+    assert grid.shape == (len(water["antennas"]), 2, len(water["freq_mhz"]))
+    assert np.isfinite(grid).all()
+    assert bandpass["vmin_db"] < bandpass["vmax_db"]
+
+
+def test_a_single_polarization_run_still_ships_one_bandpass_trace(client):
+    response = client.post("/api/simulate", json=make_request())
+    bandpass = response.json()["waterfall"]["bandpass"]
+    assert np.asarray(bandpass["antennas"]).shape[1] == 1
+
+
+def test_the_bandpass_is_the_time_average_of_the_waterfall(client):
+    """Not a second, differently-computed quantity: the same power, averaged.
+
+    The waterfall is pooled in time by the mean, so averaging its
+    decibels back is *not* the bandpass -- but averaging the linear power
+    is, and the two agree to the rounding the response carries.
+    """
+    payload = client.post("/api/simulate", json=make_request([{"type": "tower"}])).json()
+    water = payload["waterfall"]
+    antenna = np.asarray(water["antennas"][0])
+    bandpass = np.asarray(water["bandpass"]["antennas"][0][0])
+
+    from_waterfall = 10.0 * np.log10((10.0 ** (antenna / 10.0)).mean(axis=1))
+    assert np.allclose(from_waterfall, bandpass, atol=0.05)
+
+
+def test_a_transmitter_raises_the_bandpass_in_its_own_channels(client):
+    """The sanity test: the spike sits where the transmitter is tuned."""
+    clean = client.post("/api/simulate", json=make_request()).json()
+    tower = {"type": "tower", "center_freq_hz": 1.4055e9, "bandwidth_hz": 2.0e5}
+    dirty = client.post("/api/simulate", json=make_request([tower])).json()
+
+    freq_mhz = np.asarray(dirty["waterfall"]["freq_mhz"])
+    lift = np.asarray(dirty["waterfall"]["bandpass"]["antennas"][0][0]) - np.asarray(
+        clean["waterfall"]["bandpass"]["antennas"][0][0]
+    )
+    assert lift.max() > 3.0
+    assert abs(freq_mhz[int(np.argmax(lift))] - 1405.5) < 1.0
+
+
+# ----------------------------------------------------------------------
+# uv coverage
+# ----------------------------------------------------------------------
+def uv_request() -> dict:
+    """Three antennas on flat ground -- small enough to check by hand."""
+    body = make_request()
+    body["antennas"] = [[0.0, 0.0, 0.0], [100.0, 0.0, 0.0], [0.0, 60.0, 0.0]]
+    return body
+
+
+def test_the_plotted_uv_points_are_the_librarys_own_uvw(client):
+    """What the page draws is `uvw_wavelengths`, not a second calculation.
+
+    The response is re-derived here by rebuilding the identical
+    observation from its seed and correlating it, so a drift between the
+    page's uv plane and the library's would fail rather than go unseen.
+    """
+    from rfi_simulator import uvw_wavelengths
+
+    body = uv_request()
+    payload = client.post("/api/simulate", json=body).json()
+
+    simulator = build_simulator(SimulateRequest(**body))
+    visibilities = correlate(simulator.blocks())
+    u_lambda, v_lambda, _ = uvw_wavelengths(visibilities)
+    cross = visibilities.cross_mask
+    center = visibilities.n_chan // 2
+
+    assert np.allclose(payload["uv"]["u"], u_lambda[:, cross, center].ravel(), atol=1e-3)
+    assert np.allclose(payload["uv"]["v"], v_lambda[:, cross, center].ravel(), atol=1e-3)
+
+
+def test_uv_radii_are_the_baseline_lengths_over_the_wavelength(client):
+    """An independent geometric check that owes the library nothing.
+
+    A flat array pointed at its own zenith has every baseline
+    perpendicular to the phase-center direction, so ``w`` vanishes and
+    ``sqrt(u**2 + v**2)`` is exactly the baseline length in wavelengths.
+    The three baselines here are 100 m, 60 m and hypot(100, 60) m.
+    """
+    payload = client.post("/api/simulate", json=uv_request()).json()
+    observation = payload["observation"]
+
+    n_chan = observation["n_chan"]
+    bandwidth = observation["bandwidth_hz"]
+    center_freq = (
+        observation["center_freq_hz"]
+        - 0.5 * bandwidth
+        + (n_chan // 2 + 0.5) * (bandwidth / n_chan)
+    )
+    wavelength_m = 299792458.0 / center_freq
+
+    radii = np.hypot(payload["uv"]["u"], payload["uv"]["v"])
+    expected = np.array([60.0, 100.0, math.hypot(100.0, 60.0)]) / wavelength_m
+    # Every point sits on one of the three circles, and every circle is
+    # visited. The radii drift by a fraction of a wavelength across the
+    # recording -- that is Earth rotation, and over 130 ms it is all there
+    # is of it, which is why the plot is a scatter and not an arc.
+    assert np.abs(radii[:, None] - expected[None, :]).min(axis=1).max() < 1.0
+    assert np.abs(expected[:, None] - radii[None, :]).min(axis=1).max() < 1.0
+
+
+def test_the_uv_plane_is_reported_without_its_conjugate_half(client):
+    """The page mirrors each point itself, so shipping both would double-draw."""
+    payload = client.post("/api/simulate", json=uv_request()).json()
+    points = {
+        (round(u, 3), round(v, 3)) for u, v in zip(payload["uv"]["u"], payload["uv"]["v"])
+    }
+    assert not (points & {(-u, -v) for u, v in points})
+    assert len(payload["uv"]["u"]) == (
+        payload["observation"]["n_baselines"] * payload["observation"]["n_blocks"]
+    )
+
+
+# ----------------------------------------------------------------------
+# Flag fractions and the visibility domain
+# ----------------------------------------------------------------------
+def test_every_method_reports_a_flag_fraction_per_channel(client):
+    response = client.post("/api/flag", json=flag_body(["mad", "sumthreshold"]))
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    chan_bins = payload["grid"]["chan_bins"]
+    assert len(payload["grid"]["truth_fraction"]) == chan_bins
+    for method in payload["methods"]:
+        fraction = np.asarray(method["flag_fraction"])
+        assert fraction.shape == (chan_bins,)
+        assert ((fraction >= 0.0) & (fraction <= 1.0)).all()
+
+
+def test_the_flag_fraction_agrees_with_the_overlay_beside_it(client):
+    """A channel flagged in no cell at all must report a zero fraction."""
+    payload = client.post("/api/flag", json=flag_body(["mad"])).json()
+    method = payload["methods"][0]
+    fraction = np.asarray(method["flag_fraction"])
+    flagged_anywhere = (
+        np.asarray(method["overlay"]["caught"]) | np.asarray(method["overlay"]["false_alarm"])
+    ).any(axis=1)
+    assert not fraction[~flagged_anywhere].any()
+
+
+def test_the_visibility_domain_flags_the_correlated_amplitudes(client):
+    """A tower survives correlation, so a visibility-domain method finds it."""
+    body = flag_body(["mad", "sumthreshold"], domain="visibility")
+    response = client.post("/api/flag", json=body)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+
+    assert payload["domain"] == "visibility"
+    assert payload["grid"]["domain"] == "visibility"
+    assert payload["grid"]["m"] is None
+    # One column per correlator integration, not per accumulation.
+    assert payload["grid"]["n_accumulations"] == SMALL_SIM["n_blocks"]
+    assert len(payload["grid"]["time_s"]) == SMALL_SIM["n_blocks"]
+    for method in payload["methods"]:
+        assert method["scores"]["recall"] > 0.5
+
+
+def test_visibility_truth_is_the_correlators_own_interference_fraction(client):
+    """Not a second opinion about which cells were hit."""
+    body = flag_body(["mad"], domain="visibility")
+    payload = client.post("/api/flag", json=body).json()
+
+    simulator = build_simulator(SimulateRequest(**body["request"]))
+    visibilities = correlate(simulator.blocks())
+    truth = (np.asarray(visibilities.rfi_fraction) > 0.0).any(axis=1).T
+    assert np.allclose(
+        payload["grid"]["truth_fraction"], truth.astype(float).mean(axis=1), atol=1e-5
+    )
+
+
+def test_spectral_kurtosis_is_refused_after_correlation(client):
+    """It is a pre-detection test; the moments it needs are gone by here."""
+    response = client.post("/api/flag", json=flag_body(["sk"], domain="visibility"))
+    assert response.status_code == 422
+    assert "pre-detection" in response.text
+
+
+def test_the_defaults_describe_both_flagging_domains(defaults):
+    domains = defaults["flaggers"]["domains"]
+    assert [entry["value"] for entry in domains] == ["voltage", "visibility"]
+    visibility = [entry for entry in domains if entry["value"] == "visibility"][0]
+    assert "sk" not in visibility["methods"]

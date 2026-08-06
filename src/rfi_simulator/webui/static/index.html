@@ -48,7 +48,8 @@
 <main class="page">
 
   <p class="page-lead">
-    Place antennas, place interference, see what the telescope sees.
+    Place antennas, add interference, and inspect the voltages, visibilities and
+    dirty image the observation produces.
   </p>
 
   <!-- ================================================== the setup tab -->
@@ -58,7 +59,7 @@
   <section class="section" id="section-array" aria-labelledby="array-heading">
     <div class="section-head">
       <span class="section-number" aria-hidden="true">1</span>
-      <h2 class="section-title" id="array-heading">The array</h2>
+      <h2 class="section-title" id="array-heading">Array</h2>
     </div>
     <p class="section-intro">
       Where the antennas stand on the ground. Positions are metres east and north of
@@ -122,7 +123,7 @@
   <section class="section" id="section-sky" aria-labelledby="sky-heading">
     <div class="section-head">
       <span class="section-number" aria-hidden="true">2</span>
-      <h2 class="section-title" id="sky-heading">The sky</h2>
+      <h2 class="section-title" id="sky-heading">Sky model</h2>
     </div>
     <p class="section-intro">
       What the telescope is meant to be looking at. These are the real astronomical
@@ -162,7 +163,7 @@
   <section class="section" id="section-rfi" aria-labelledby="rfi-heading">
     <div class="section-head">
       <span class="section-number" aria-hidden="true">3</span>
-      <h2 class="section-title" id="rfi-heading">The interference</h2>
+      <h2 class="section-title" id="rfi-heading">Interference</h2>
     </div>
     <p class="section-intro">
       Human-made transmitters that reach the antennas. Tick the kinds you want and the
@@ -181,7 +182,7 @@
   <section class="section" id="section-realism" aria-labelledby="realism-heading">
     <div class="section-head">
       <span class="section-number" aria-hidden="true">4</span>
-      <h2 class="section-title" id="realism-heading">The instrument</h2>
+      <h2 class="section-title" id="realism-heading">Instrument</h2>
     </div>
     <p class="section-intro">
       Until you open this, the simulator is an ideal instrument: identical antennas,
@@ -235,14 +236,12 @@
       <!-- ------------------------------------------------ level 1: voltages -->
       <figure class="display" id="panel-voltages">
         <figcaption>
-          <span class="display-title">Voltages — what each antenna records</span>
+          <span class="display-title">Voltages</span>
           <span class="display-sub mono" id="waterfall-sub"></span>
         </figcaption>
         <p class="display-note">
-          Power against time and frequency. Every antenna is shown at once, on one
-          colour scale, so an antenna that couples to a transmitter differently from
-          its neighbours stands out; click one to see it full size. Interference shows
-          up as bright stripes, blobs or drifting tracks.
+          Per-antenna dynamic spectra: |V(&nu;,t)|&sup2; against time and frequency, every
+          antenna on one colour scale. Click a tile to feature that antenna full size.
         </p>
 
         <div class="display-controls">
@@ -261,15 +260,37 @@
             <span class="switch-dot" aria-hidden="true"></span>
             <span id="all-antennas-label">All antennas</span>
           </button>
-          <button type="button" class="switch" id="truth-toggle" aria-pressed="false">
-            <span class="switch-dot" aria-hidden="true"></span>Show RFI truth
-          </button>
+        </div>
+
+        <!-- The flag chips: one click paints that mask over the spectrum. -->
+        <div class="chip-bar" id="volt-chip-bar">
+          <span class="chip-bar-label">Overlay</span>
+          <div class="chip-set" id="volt-chips" role="group"
+               aria-label="Which mask is painted over the dynamic spectrum"></div>
+        </div>
+
+        <!-- The tile wall's own view switch: the reference's fleet view. -->
+        <div class="chip-bar" id="wall-view-bar" hidden>
+          <span class="chip-bar-label">Tiles show</span>
+          <div class="chip-set" id="wall-view-chips" role="group"
+               aria-label="What each antenna tile draws"></div>
         </div>
 
         <div class="canvas-wrap" id="waterfall-wrap">
           <canvas id="waterfall-canvas"></canvas>
           <div class="sweep" id="waterfall-sweep" hidden></div>
           <p class="display-empty" id="waterfall-empty">Run an observation to fill this in.</p>
+        </div>
+
+        <!-- The bandpass: the same antenna, averaged over time. -->
+        <div class="subplot" id="bandpass-block">
+          <p class="subplot-title">
+            Bandpass <span class="display-sub mono" id="bandpass-sub"></span>
+          </p>
+          <div class="canvas-wrap canvas-wrap-short">
+            <canvas id="bandpass-canvas"></canvas>
+          </div>
+          <p class="hint" id="bandpass-legend"></p>
         </div>
 
         <div class="thumb-panel" id="antenna-thumbnails-panel" hidden>
@@ -279,11 +300,11 @@
         </div>
 
         <details class="advanced" id="truth-more">
-          <summary>More — which sources, and hatching</summary>
+          <summary>More — per-source layers, and hatching</summary>
           <div class="truth-bar">
             <p class="truth-title">
-              The per-source layers behind the toggle above. They only paint while
-              "Show RFI truth" is on.
+              The per-source layers behind the RFI truth chip. They only paint while
+              that chip is on.
             </p>
             <div class="truth-controls">
               <div class="mask-toggles" id="mask-toggles"></div>
@@ -295,21 +316,24 @@
         </details>
 
         <details class="advanced" id="flagger-controls">
-          <summary>Run a classical flagger</summary>
+          <summary>Flagger scores — caught, missed and false alarms</summary>
           <p class="display-note">
-            Pick one or two methods and score them against the same ground truth an
-            excision algorithm would be scored against, on the featured antenna.
+            Every method chip you switch on above is scored here against the same ground
+            truth an excision algorithm would be scored against, on the featured antenna.
           </p>
-          <div class="flagger-methods" id="flagger-methods" role="group"
-               aria-label="Flagging methods"></div>
-          <div class="flagger-run-row">
-            <button type="button" class="button button-accent" id="flagger-run">Flag it</button>
-            <span class="status-cell status-info" id="flagger-status">idle</span>
-          </div>
-          <div class="flagger-pills" id="flagger-pills" role="group"
-               aria-label="Which method's overlay is drawn"></div>
           <div class="flagger-legend" id="flagger-legend"></div>
           <p class="display-sub mono flagger-grid-note" id="flagger-grid-note"></p>
+
+          <div class="subplot" id="flagfrac-block" hidden>
+            <p class="subplot-title">
+              Flag fraction <span class="display-sub mono" id="flagfrac-sub"></span>
+            </p>
+            <div class="canvas-wrap canvas-wrap-short">
+              <canvas id="flagfrac-canvas"></canvas>
+            </div>
+            <p class="hint" id="flagfrac-legend"></p>
+          </div>
+
           <div class="metric-wrap" id="flagger-metrics"></div>
           <p class="muted-line" id="flagger-note" hidden>
             This is the classical floor an ML method should beat.
@@ -320,23 +344,26 @@
       <!-- -------------------------------------------- level 2: visibilities -->
       <figure class="display" id="panel-visibilities">
         <figcaption>
-          <span class="display-title">Visibilities — what the correlator sees</span>
+          <span class="display-title">Visibilities</span>
           <span class="display-sub mono" id="vis-sub"></span>
         </figcaption>
         <p class="display-note">
-          This is the data a visibility-domain flagger works on.
+          |V| after correlation, averaged over every cross-correlation baseline, against
+          time and frequency. This is the grid a visibility-domain flagger works on.
         </p>
 
-        <div class="display-controls">
-          <button type="button" class="switch" id="vis-truth-toggle" aria-pressed="false">
-            <span class="switch-dot" aria-hidden="true"></span>Show RFI truth
-          </button>
+        <div class="chip-bar" id="vis-chip-bar">
+          <span class="chip-bar-label">Overlay</span>
+          <div class="chip-set" id="vis-chips" role="group"
+               aria-label="Which mask is painted over the visibility amplitudes"></div>
         </div>
 
         <div class="canvas-wrap">
           <canvas id="vis-canvas"></canvas>
           <p class="display-empty" id="vis-empty">Run an observation to fill this in.</p>
         </div>
+
+        <p class="display-sub mono" id="vis-flag-note"></p>
 
         <details class="advanced" id="vis-more">
           <summary>More — one baseline's spectrum</summary>
@@ -356,20 +383,19 @@
       <!-- --------------------------------------------------- level 3: image -->
       <figure class="display" id="panel-image">
         <figcaption>
-          <span class="display-title">Image — what the astronomer gets</span>
+          <span class="display-title">Dirty image</span>
           <span class="display-sub mono" id="image-sub"></span>
         </figcaption>
         <p class="display-note">
-          The sky as this array reconstructs it, before any deconvolution. ◇ marks
-          where a simulated source truly is · + marks the brightest pixel (which,
-          with RFI present, may not be a source at all).
+          The sky this array reconstructs, before deconvolution. ◇ marks a simulated
+          source's true position · + marks the brightest pixel, which with interference
+          present need not be a source at all.
         </p>
 
-        <div class="display-controls">
-          <button type="button" class="switch" id="image-ab-toggle" aria-pressed="false">
-            <span class="switch-dot" aria-hidden="true"></span>Compare without interference
-          </button>
-          <span class="badge" id="image-ab-state">showing: contaminated</span>
+        <div class="chip-bar" id="image-chip-bar">
+          <span class="chip-bar-label">Showing</span>
+          <div class="chip-set" id="image-chips" role="group"
+               aria-label="Which of the two images is drawn"></div>
           <span class="display-sub mono" id="image-scale"></span>
         </div>
 
@@ -390,13 +416,16 @@
         </p>
 
         <div class="uv-block">
-          <p class="display-sub mono uv-sub-line" id="uv-sub"></p>
-          <p class="display-note">
-            Every antenna pair, in wavelengths. This is the sampling pattern that gives
-            the dirty image its shape.
+          <p class="subplot-title">
+            uv coverage <span class="display-sub mono uv-sub-line" id="uv-sub"></span>
           </p>
-          <div class="canvas-wrap">
-            <svg id="uv-plot" role="img" aria-label="Baseline coverage in wavelengths"></svg>
+          <p class="display-note">
+            Every baseline projected onto the plane normal to the phase centre, in
+            wavelengths, at band centre — each sampled point and its Hermitian conjugate.
+            This is the sampling function whose transform is the synthesised beam.
+          </p>
+          <div class="uv-wrap">
+            <svg id="uv-plot" role="img" aria-label="uv coverage in wavelengths"></svg>
           </div>
         </div>
       </figure>
@@ -412,7 +441,7 @@
     <section class="section" id="section-day" aria-labelledby="day-heading">
       <div class="section-head">
         <span class="section-number" aria-hidden="true">1</span>
-        <h2 class="section-title" id="day-heading">A day at the Mock Observatory</h2>
+        <h2 class="section-title" id="day-heading">A day of drift scanning</h2>
       </div>
       <p class="section-intro">
         The array stares at the meridian at one declination and lets the sky drift
@@ -421,6 +450,7 @@
         the Sun, Cas&nbsp;A, Cyg&nbsp;A, Tau&nbsp;A and Vir&nbsp;A, each drawn only
         while it is genuinely inside the field.
       </p>
+      <p class="zone-line"><span class="badge" id="day-zone">All times local</span></p>
 
       <div class="obs-controls">
         <div class="field">
@@ -433,9 +463,9 @@
         </div>
 
         <div class="field">
-          <label class="field-label" for="day-date">Date <span class="field-unit">UTC</span></label>
+          <label class="field-label" for="day-date">Date</label>
           <input class="input" type="date" id="day-date">
-          <p class="field-hint">The day runs from 00:00 to 24:00 UTC.</p>
+          <p class="field-hint" id="day-date-hint">The day runs from 00:00 to 24:00 UTC.</p>
         </div>
 
         <div class="field">
@@ -483,14 +513,14 @@
 
       <figure class="display" id="panel-movie">
         <figcaption>
-          <span class="display-title">The day, one frame at a time</span>
+          <span class="display-title">Dirty image, frame by frame</span>
           <span class="display-sub mono" id="movie-scale"></span>
         </figcaption>
 
         <div class="movie-row">
           <div class="canvas-wrap canvas-wrap-square">
-            <canvas id="movie-canvas" tabindex="0"
-                    aria-label="Dirty image of the current frame. Press space to play, arrow keys to step."></canvas>
+            <canvas id="movie-canvas" tabindex="0" role="button"
+                    aria-label="Dirty image of the current frame. Click or press space to play and pause; arrow keys step."></canvas>
             <p class="display-empty" id="movie-empty">Press “Build the day” to fill this in.</p>
           </div>
         </div>
@@ -500,6 +530,7 @@
           <button type="button" class="button button-small" id="movie-back" disabled>◀</button>
           <button type="button" class="button button-small" id="movie-forward" disabled>▶</button>
           <span class="display-sub mono" id="movie-counter"></span>
+          <span class="badge" id="movie-field"></span>
         </div>
 
         <!-- the signature element: 24 hours of this strip, in one band -->
@@ -510,9 +541,9 @@
         </div>
 
         <p class="readout mono" id="movie-meta"></p>
-        <p class="muted-line">
-          Everything the telescope records here is either the sky you wanted or
-          something that got in the way.
+        <p class="muted-line" id="movie-guidance">
+          Click the image to play or pause. Most frames of an empty strip are receiver
+          noise and look alike; the marks on the timeline are where something transits.
         </p>
       </figure>
     </section>
@@ -528,11 +559,20 @@
         and the four bright sources, propagated element sets for satellites, and live
         transponder reports for aircraft within 100 nautical miles.
       </p>
+      <p class="zone-line"><span class="badge" id="sky-zone">All times local</span></p>
 
       <div class="sky-layout">
         <div class="sky-chart-wrap">
           <svg id="sky-chart" role="img"
                aria-label="Horizon chart: zenith at the centre, horizon at the rim."></svg>
+          <p class="hint sky-howto">
+            How to read this: zenith at the centre, horizon at the rim, altitude linear
+            in radius — the dashed rings are 30° and 60° elevation. North is up and
+            <strong>east is left</strong>, which is correct for a chart of the sky above
+            you rather than a map of the ground below.
+          </p>
+          <div class="sky-legend" id="sky-legend" role="group"
+               aria-label="What each glyph on the chart means"></div>
         </div>
 
         <div class="sky-side">

@@ -38,12 +38,14 @@ than the field's half width.
 from __future__ import annotations
 
 import math
+import multiprocessing
 import os
 import threading
 import time as _time
 import uuid
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import timezone
 from typing import Any, Literal
 
 import numpy as np
@@ -55,6 +57,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from rfi_simulator import ArrayConfig, PointSource, correlate, dirty_image
 from rfi_simulator.delays import earth_location
 from rfi_simulator.sky import lm_from_radec
+from rfi_simulator.webui.localtime import (
+    ZoneInfoResult,
+    local_clock,
+    resolve_zone,
+    zone_payload,
+)
 from rfi_simulator.webui.simulate import (
     IMAGE_FIELD_HALF_WIDTH_DEG,
     IMAGE_FIELD_OF_VIEW_RAD,
@@ -81,6 +89,7 @@ __all__ = [
     "day_workers",
     "jobs",
     "meridian_phase_center",
+    "site_coordinates",
     "site_location",
     "start_day",
     "timeline_payload",
@@ -176,6 +185,22 @@ def day_workers() -> int:
 # ----------------------------------------------------------------------
 # Geometry shared by the movie and the monitor
 # ----------------------------------------------------------------------
+def site_coordinates(request: SimulateRequest | None = None) -> tuple[float, float, float]:
+    """The site's latitude, longitude and height, from a request or the default.
+
+    Split out of `site_location` because the time zone is resolved from
+    plain degrees, not from an `~astropy.coordinates.EarthLocation`.
+    """
+    site = default_array()
+    if request is None or request.site is None:
+        return float(site.latitude_deg), float(site.longitude_deg), float(site.height_m)
+    return (
+        float(request.site.latitude_deg),
+        float(request.site.longitude_deg),
+        float(request.site.height_m),
+    )
+
+
 def site_location(request: SimulateRequest | None = None) -> EarthLocation:
     """The observing site, from a request's ``site`` or the default array.
 
@@ -542,50 +567,88 @@ jobs = _JobStore()
 """_JobStore: The process-wide store of simulated days."""
 
 
+def _worker_context() -> Any:
+    """The start method a frame pool uses: never ``fork``.
+
+    Forking is the default on Linux and is the wrong default here. This
+    module runs inside a threaded web server, and a forked child inherits
+    every thread's *locks* without the threads that would release them,
+    which is a well-known way to get a worker that never finishes. It also
+    inherits the server's listening socket, so an orphaned worker keeps
+    the port bound after the server itself is gone.
+
+    ``spawn`` costs one interpreter start per worker -- a couple of
+    seconds, paid once per day and in parallel across the pool -- and buys
+    a child that shares nothing with the server it was started from.
+    """
+    return multiprocessing.get_context("spawn")
+
+
+def _release_pool(pool: ProcessPoolExecutor | None) -> None:
+    """Let a finished pool go without waiting for it.
+
+    ``shutdown(wait=True)`` -- which is what leaving a ``with`` block does
+    -- blocks until every worker process has exited. A single worker that
+    does not exit therefore holds up the caller indefinitely, and if the
+    caller is the thread that marks the job finished then a day whose
+    frames are all computed sits at "building" for ever and the page never
+    starts playing it. The job's state is settled before this is called,
+    so nothing a reader can see depends on the pool going quietly.
+    """
+    if pool is None:
+        return
+    pool.shutdown(wait=False, cancel_futures=True)
+
+
 def _drive(job: _DayJob, max_workers: int) -> None:
     """Compute every frame of `job` in a pool, filling slots as they land."""
     spec = job.request.model_dump()
+    pool: ProcessPoolExecutor | None = None
     try:
-        with ProcessPoolExecutor(max_workers=max_workers) as pool:
-            futures = {
-                pool.submit(compute_frame, spec, index): index for index in range(job.total)
-            }
-            # Frames are collected as they land rather than in order, so
-            # the progress the page shows is the work actually finished.
-            for future in as_completed(futures):
-                index = futures[future]
-                if job.cancelled.is_set():
-                    for pending in futures:
-                        pending.cancel()
-                    break
-                try:
-                    frame = future.result()
-                except Exception as exc:  # noqa: BLE001 - a worker that died
-                    frame = {
-                        "index": index,
-                        "utc": None,
-                        "sources": [],
-                        "image": None,
-                        "vmin_jy": None,
-                        "vmax_jy": None,
-                        "rms_jy": None,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                with jobs.lock:
-                    job.frames[index] = frame
-                    job.done += 1
-                    if frame.get("error"):
-                        job.failed += 1
+        pool = ProcessPoolExecutor(max_workers=max_workers, mp_context=_worker_context())
+        futures = {pool.submit(compute_frame, spec, index): index for index in range(job.total)}
+        # Frames are collected as they land rather than in order, so
+        # the progress the page shows is the work actually finished.
+        for future in as_completed(futures):
+            index = futures[future]
+            if job.cancelled.is_set():
+                for pending in futures:
+                    pending.cancel()
+                break
+            try:
+                frame = future.result()
+            except Exception as exc:  # noqa: BLE001 - a worker that died
+                frame = {
+                    "index": index,
+                    "utc": None,
+                    "sources": [],
+                    "image": None,
+                    "vmin_jy": None,
+                    "vmax_jy": None,
+                    "rms_jy": None,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            with jobs.lock:
+                job.frames[index] = frame
+                job.done += 1
+                if frame.get("error"):
+                    job.failed += 1
     except Exception as exc:  # noqa: BLE001 - the pool itself failed
         with jobs.lock:
             job.state = "failed"
             job.error = f"{type(exc).__name__}: {exc}"
+        _release_pool(pool)
         return
+    # The day is finished the moment its last frame is in hand. Settling
+    # the state here rather than after the pool has been joined is the
+    # whole point of `_release_pool`: a worker that lingers must not be
+    # able to leave a finished day reading "building".
     with jobs.lock:
         if job.cancelled.is_set():
             job.state = "cancelled"
         elif job.state == "building":
             job.state = "done"
+    _release_pool(pool)
 
 
 def start_day(request: DayRequest, *, max_workers: int | None = None) -> str:
@@ -614,11 +677,23 @@ def start_day(request: DayRequest, *, max_workers: int | None = None) -> str:
     return job.id
 
 
-def _frame_meta(frame: dict[str, Any] | None) -> dict[str, Any] | None:
-    """One frame without its image -- what the status poll carries."""
+def _frame_meta(
+    frame: dict[str, Any] | None, zone: ZoneInfoResult | None = None
+) -> dict[str, Any] | None:
+    """One frame without its image -- what the status poll carries.
+
+    The frame is computed in a worker process that knows nothing about
+    the site's time zone, so the local clock is stamped on here, where
+    the job (and therefore the site) is in hand. ``utc`` stays exactly as
+    it was: local time is what the reader is shown, UTC is what the
+    reader can check it against.
+    """
     if frame is None:
         return None
-    return {key: value for key, value in frame.items() if key != "image"}
+    meta = {key: value for key, value in frame.items() if key != "image"}
+    if zone is not None:
+        meta["local"] = local_clock(meta.get("utc") or "", zone)
+    return meta
 
 
 def day_status(identifier: str) -> dict[str, Any] | None:
@@ -641,8 +716,11 @@ def day_status(identifier: str) -> dict[str, Any] | None:
     job = jobs.get(identifier)
     if job is None:
         return None
+    latitude, longitude, _ = site_coordinates(job.request.setup)
+    zone = resolve_zone(latitude, longitude)
+    noon = Time(f"{job.request.date}T12:00:00", scale="utc").to_datetime(timezone=timezone.utc)
     with jobs.lock:
-        frames = [_frame_meta(frame) for frame in job.frames]
+        frames = [_frame_meta(frame, zone) for frame in job.frames]
         maxima = [
             frame["vmax_jy"] for frame in job.frames if frame and frame.get("vmax_jy") is not None
         ]
@@ -666,6 +744,7 @@ def day_status(identifier: str) -> dict[str, Any] | None:
             "field_half_width_deg": IMAGE_FIELD_HALF_WIDTH_DEG,
             "scale_max_jy": max(maxima) if maxima else None,
             "scale_soft_jy": soft,
+            "zone": zone_payload(latitude, longitude, noon),
             "frames": frames,
         }
 
@@ -694,6 +773,10 @@ def day_frame(identifier: str, index: int) -> dict[str, Any] | None:
         payload["pending"] = False
         payload["n_pix"] = IMAGE_N_PIX
         payload["field_of_view_rad"] = IMAGE_FIELD_OF_VIEW_RAD
+        latitude, longitude, _ = site_coordinates(job.request.setup)
+        payload["local"] = local_clock(
+            payload.get("utc") or "", resolve_zone(latitude, longitude)
+        )
         return payload
 
 
@@ -788,6 +871,13 @@ def timeline_payload(
 
     start = Time(f"{date}T00:00:00", scale="utc")
     end = start + TimeDelta(86400.0, format="sec")
+    # Resolved once for the whole payload, at local noon of the requested
+    # date: a day that straddles a daylight-saving change has two offsets,
+    # and noon picks the one that covers most of the working day. Every
+    # instant below is still converted individually, so the clock strings
+    # either side of a change are each correct.
+    zone = resolve_zone(float(latitude_deg), float(longitude_deg))
+    noon_utc = (start + TimeDelta(43200.0, format="sec")).to_datetime(timezone=timezone.utc)
 
     def fraction_of(instant: Time | str) -> float:
         moment = Time(instant, scale="utc") if isinstance(instant, str) else instant
@@ -814,6 +904,9 @@ def timeline_payload(
     sun_payload["sunrise"] = [fraction_of(value) for value in sun_payload["sunrise_utc"]]
     sun_payload["sunset"] = [fraction_of(value) for value in sun_payload["sunset_utc"]]
     sun_payload["transit"] = fraction_of(sun_payload["transit_utc"])
+    sun_payload["sunrise_local"] = [local_clock(v, zone) for v in sun_payload["sunrise_utc"]]
+    sun_payload["sunset_local"] = [local_clock(v, zone) for v in sun_payload["sunset_utc"]]
+    sun_payload["transit_local"] = local_clock(sun_payload["transit_utc"], zone)
     # The Sun's declination moves a fraction of a degree a day, so which
     # strip it is in is a property of the date; the page offers it as a
     # shortcut chip. Taken at the middle of the day, and read straight off
@@ -822,6 +915,10 @@ def timeline_payload(
     sun_payload["dec_deg"] = round(
         float(get_sun(start + TimeDelta(43200.0, format="sec")).dec.deg), 4
     )
+    # Which date that declination is for. The chip that offers it as a
+    # shortcut says so, because "the Sun's strip" without a date is a
+    # different strip every week -- it swings 47 degrees over a year.
+    sun_payload["dec_date"] = date
     sun_payload["in_field"] = bool(
         abs(sun_payload["dec_deg"] - float(dec_deg)) <= IMAGE_FIELD_HALF_WIDTH_DEG
     )
@@ -865,6 +962,7 @@ def timeline_payload(
                 "in_field": in_field,
                 "dec_offset_deg": round(item["dec_deg"] - float(dec_deg), 4),
                 "transits_utc": [instant.isot for instant in instants],
+                "transits_local": [local_clock(instant.isot, zone) for instant in instants],
                 "transits": [fraction_of(instant) for instant in instants],
                 "transit_altitude_deg": [round(value, 3) for value in altitudes],
             }
@@ -874,6 +972,7 @@ def timeline_payload(
         "date": date,
         "start_utc": start.isot,
         "end_utc": end.isot,
+        "zone": zone_payload(float(latitude_deg), float(longitude_deg), noon_utc),
         "pointing_dec_deg": float(dec_deg),
         "latitude_deg": float(latitude_deg),
         "longitude_deg": float(longitude_deg),

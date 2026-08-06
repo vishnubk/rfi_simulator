@@ -44,6 +44,7 @@ import threading
 import time as _time
 import urllib.error
 import urllib.request
+from datetime import timezone as datetime_timezone
 from typing import Any, Callable
 
 import numpy as np
@@ -52,6 +53,7 @@ from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_body, get_su
 from astropy.time import Time
 
 from rfi_simulator.rfi import enu_from_ecef_offset
+from rfi_simulator.webui.localtime import local_clock, resolve_zone, zone_payload
 from rfi_simulator.webui.observatory import (
     CATALOG_SOURCES,
     QUIET_SUN_FLUX_JY,
@@ -421,8 +423,15 @@ def sky_now(
             "age_s": round(aircraft_age, 1),
         }
 
+    zone = resolve_zone(float(latitude_deg), float(longitude_deg))
     return {
         "utc": when.isot,
+        "local": local_clock(when.isot, zone),
+        "zone": zone_payload(
+            float(latitude_deg),
+            float(longitude_deg),
+            when.to_datetime(timezone=datetime_timezone.utc),
+        ),
         "latitude_deg": float(latitude_deg),
         "longitude_deg": float(longitude_deg),
         "height_m": float(height_m),

@@ -57,6 +57,26 @@
   var AXIS_TEXT = "#9aa1ac";
   var PLOT_FONT = '11px Menlo, Consolas, ui-monospace, monospace';
 
+  // The same three, for the one plotting ground that is white: the
+  // bandpass, the flag-fraction spectrum and the uv plane. A scatter or a
+  // handful of lines reads better as ink on paper; only the heatmaps need
+  // the dark field their colour ramp was built for.
+  var PAPER_AXIS = "#dfe6e9";
+  var PAPER_GRID = "#f1f2f6";
+  var PAPER_TEXT = "#7f8c8d";
+
+  // One colour per receptor, held constant everywhere a polarization is
+  // drawn: XX in the page's action blue, YY in its complement. Two hues
+  // that stay distinguishable in the common forms of colour blindness and
+  // in greyscale, which a blue/green pair would not.
+  var POL_COLOURS = ["#0984e3", "#e17055"];
+
+  // A method's flags, painted as one wash for the quick look above the
+  // plot. The three-colour caught / missed / false-alarm breakdown lives
+  // in the fold below, where there is room to explain it.
+  var FLAG_WASH_RGB = "9, 132, 227";
+  var FLAG_WASH_ALPHA = 0.42;
+
   var VIEW = 400;          // site-plan internal coordinate box, px
   var SHEET_PAD = 30;      // margin inside it, px
   var MIN_SPACING_M = 5;   // how far apart a dropped antenna tries to land
@@ -178,7 +198,16 @@
     hatch: false,
     visTruth: false,      // the visibility panel's own ground-truth switch
     visBaseline: null,    // `index` of the baseline whose spectra are drawn
-    flagMethods: [],      // which methods the flagger control has ticked
+    wallView: "spectrum", // "spectrum" or "bandpass": what the tiles draw
+    /* The chip rows above the two waterfalls. Each holds at most one
+       *method* at a time plus, independently, the ground-truth layer.
+       One method rather than several is a deliberate simplification: the
+       quick look above the plot is a single wash, and two washes on top
+       of each other would say nothing that the three-colour breakdown in
+       the fold below does not say properly. */
+    voltMethod: null,     // "sk" | "mad" | "sumthreshold" | null
+    visMethod: null,      // "mad" | "sumthreshold" | null
+    flagPending: {},      // chip key -> true while its mask is computing
     flagRunning: false,
     flagError: false,     // keeps a refusal on screen until something changes
     notices: [],
@@ -2183,7 +2212,10 @@
       request: payload,   // what produced it, for the clean twin and the flagger
       clean: null,        // the interference-free twin, once asked for
       showClean: false,   // which of the two the image panel is showing
-      flag: null,         // the last flagger response for this run
+      // Flagger responses, keyed by what they were computed for (see
+      // `flagKey`): a chip clicked twice costs one request, and a mask
+      // computed for antenna 3 is never shown on antenna 4.
+      flags: {},
       at: new Date(),
       n_antennas: state.antennas.length,
       n_sky: state.skySources.length,
@@ -2207,6 +2239,12 @@
       state.waterfallAntenna, 0, result.waterfall.antennas.length - 1
     );
     state.visBaseline = null;   // baseline indices are this run's, not the last one's
+    // Flags are cached per run, so a chip left on from a previous run
+    // would paint nothing until it was clicked again. Start both rows
+    // clear; the ground-truth chips carry over, since truth is shipped
+    // with every run and needs no request.
+    state.voltMethod = null;
+    state.visMethod = null;
     $("waterfall-pol-group").hidden = result.observation.n_pol !== 2;
     showAbNote("");
     renderRunStrip();
@@ -2564,22 +2602,8 @@
         return { mask: source.mask };
       })
       : [];
-    var flag = activeFlag();
-    var coordOverlays = [];
-    if (flag) {
-      var chosen = flag.response.methods[flag.active];
-      var grid = flag.response.grid;
-      // Caught first, false alarm next, missed last: where a coarse cell
-      // holds more than one outcome the worst one is what stays visible.
-      ["caught", "false_alarm", "missed"].forEach(function (key) {
-        coordOverlays.push({
-          mask: chosen.overlay[key],
-          freq_mhz: grid.freq_mhz,
-          time_s: grid.time_s,
-          colour: FLAG_COLOURS[key]
-        });
-      });
-    }
+    var flag = activeVoltFlag();
+    var coordOverlays = flag ? flagOverlays(flag, $("flagger-controls").open) : [];
 
     drawHeatmap(canvas, {
       values: values,
@@ -2611,6 +2635,92 @@
       water.freq_mhz.length + " × " + water.time_s.length + " cells · "
       + water.vmin_db.toFixed(0) + " to " + water.vmax_db.toFixed(0) + " dB";
     $("waterfall-empty").hidden = true;
+    renderBandpass();
+  }
+
+  /* --- the bandpass ----------------------------------------------------
+   *
+   * The featured antenna's spectrum, averaged over the whole recording,
+   * with both receptors overlaid when the run has two. It answers a
+   * different question from the dynamic spectrum above it -- what shape
+   * is this antenna's band, and where does it have narrowband features --
+   * and it is the plot a real monitoring page leads with, so it sits
+   * directly under the waterfall rather than behind a fold.
+   *
+   * Decibels, because a bandpass spans orders of magnitude and its
+   * interesting features are the ones a linear axis flattens: a spike
+   * thirty decibels above the noise floor and a one-decibel ripple across
+   * the band are both legible on the same log axis and on no other.
+   */
+  function bandpassTraces() {
+    var result = state.result;
+    if (!result || !result.waterfall.bandpass) { return []; }
+    var bandpass = result.waterfall.bandpass;
+    var antenna = bandpass.antennas[state.waterfallAntenna];
+    if (!antenna) { return []; }
+    var names = bandpass.pol_names || [];
+    return antenna.map(function (values, index) {
+      return {
+        label: names[index] || (antenna.length > 1 ? "pol " + index : "power"),
+        colour: POL_COLOURS[index % POL_COLOURS.length],
+        values: values
+      };
+    });
+  }
+
+  function renderBandpass() {
+    var block = $("bandpass-block");
+    var result = state.result;
+    var traces = bandpassTraces();
+    // The wall shows every antenna at once; a bandpass of "every antenna"
+    // would be a different plot, and the wall's own toggle already offers
+    // it as thumbnails.
+    block.hidden = state.allAntennas || !traces.length;
+    if (block.hidden) { return; }
+
+    var water = result.waterfall;
+    var bandpass = water.bandpass;
+    drawLinePlot($("bandpass-canvas"), {
+      x: water.freq_mhz,
+      traces: traces,
+      xLabel: "frequency (MHz)",
+      yLabel: "mean power (dB)",
+      xFormat: function (v) { return v.toFixed(2); },
+      yFormat: function (v) { return v.toFixed(1); },
+      yLow: bandpass.vmin_db,
+      yHigh: bandpass.vmax_db
+    });
+
+    $("bandpass-sub").textContent = "antenna " + state.waterfallAntenna + " · "
+      + water.freq_mhz.length + " channels · averaged over the whole recording";
+    fillTraceLegend($("bandpass-legend"), traces);
+  }
+
+  // Every antenna's bandpass at thumbnail size: no axes, no labels, one
+  // shared decibel range so the tiles are comparable, which is the only
+  // reason to show them side by side at all.
+  function drawBandpassThumbnail(canvas, planes, low, high) {
+    var ratio = window.devicePixelRatio || 1;
+    var rect = canvas.getBoundingClientRect();
+    var width = Math.max(1, Math.round((rect.width || 120) * ratio));
+    var height = Math.max(1, Math.round((rect.height || 64) * ratio));
+    canvas.width = width;
+    canvas.height = height;
+    var ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#11141a";
+    ctx.fillRect(0, 0, width, height);
+    var span = (high - low) || 1;
+    planes.forEach(function (values, polIndex) {
+      ctx.strokeStyle = POL_COLOURS[polIndex % POL_COLOURS.length];
+      ctx.lineWidth = Math.max(1, ratio);
+      ctx.beginPath();
+      values.forEach(function (value, index) {
+        var x = values.length > 1 ? (index / (values.length - 1)) * width : width / 2;
+        var y = height - ((value - low) / span) * height;
+        if (index === 0) { ctx.moveTo(x, y); } else { ctx.lineTo(x, y); }
+      });
+      ctx.stroke();
+    });
   }
 
   function maskedBy(row, col) {
@@ -2699,22 +2809,70 @@
     state.waterfallAntenna = index;
     state.allAntennas = false;
     state.flagError = false;   // the flagger's scores were for another antenna
+    // A method chip is a statement about the antenna on screen. Featuring
+    // another one either has that antenna's answer cached already, or it
+    // does not and the chip must fetch it; either way the chip is
+    // re-clicked for us rather than left pressed over a stale mask.
+    var method = state.voltMethod;
+    state.voltMethod = null;
     $("waterfall-antenna").value = String(index);
     renderAllAntennasControl();
     renderThumbnails();
+    renderVoltChips();
     renderFlagger();
     renderWaterfall();
+    if (method) { toggleFlagChip("voltage", method); }
+  }
+
+  /* Two ways to see the fleet, and both are wanted.
+   *
+   * The dynamic spectrum is the default and stays the default: the
+   * interference this simulator makes is *time*-structured -- a duty-cycled
+   * tower, a burst train, a drifting satellite track -- and a spectrum
+   * averaged over time is exactly the reduction that throws that structure
+   * away. The bandpass wall is the other half of the same question, the one
+   * a real monitoring page leads with: which antenna's band is the wrong
+   * shape, which one has a spike its neighbours do not.
+   */
+  var WALL_VIEWS = [
+    { value: "spectrum", label: "Dynamic spectrum",
+      hint: "power against time and frequency — shows when interference was on" },
+    { value: "bandpass", label: "Bandpass",
+      hint: "time-averaged spectrum per antenna, both receptors overlaid" }
+  ];
+
+  function renderWallViewChips() {
+    var bar = $("wall-view-bar");
+    bar.hidden = !state.allAntennas || !state.result;
+    var host = $("wall-view-chips");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    if (bar.hidden) { return; }
+    WALL_VIEWS.forEach(function (view) {
+      var chip = el("button", "chip", view.label);
+      chip.type = "button";
+      chip.title = view.hint;
+      chip.setAttribute("aria-pressed", String(state.wallView === view.value));
+      chip.addEventListener("click", function () {
+        state.wallView = view.value;
+        renderThumbnails();
+      });
+      host.appendChild(chip);
+    });
   }
 
   function renderThumbnails() {
     var panel = $("antenna-thumbnails-panel");
     panel.hidden = !state.allAntennas;
     $("waterfall-wrap").hidden = state.allAntennas;
+    $("bandpass-block").hidden = state.allAntennas || !bandpassTraces().length;
+    renderWallViewChips();
     var host = $("antenna-thumbnails");
     while (host.firstChild) { host.removeChild(host.firstChild); }
     if (!state.allAntennas || !state.result) { return; }
 
     var water = state.result.waterfall;
+    var bandpass = water.bandpass;
+    var asBandpass = state.wallView === "bandpass" && Boolean(bandpass);
     // Set before anything is measured: the tiles are sized by the grid, and
     // each canvas draws itself at whatever width the grid gave it.
     host.style.setProperty("--ant-cols", String(thumbnailColumns(water.antennas.length)));
@@ -2733,13 +2891,22 @@
       button.appendChild(el("span", "thumb-label mono", String(index)));
       button.addEventListener("click", function () { featureAntenna(index); });
       host.appendChild(button);
-      drawThumbnail(canvas, values, water.vmin_db, water.vmax_db);
+      if (asBandpass) {
+        drawBandpassThumbnail(
+          canvas, bandpass.antennas[index], bandpass.vmin_db, bandpass.vmax_db
+        );
+      } else {
+        drawThumbnail(canvas, values, water.vmin_db, water.vmax_db);
+      }
     });
 
-    $("antenna-thumbnails-sub").textContent =
-      water.antennas.length + " antennas · " + water.freq_mhz.length + " × "
-      + water.time_s.length + " cells each · pooled over "
-      + water.time_samples_per_cell + " voltage samples per pixel";
+    $("antenna-thumbnails-sub").textContent = asBandpass
+      ? water.antennas.length + " antennas · " + water.freq_mhz.length
+        + " channels each · " + bandpass.vmin_db.toFixed(0) + " to "
+        + bandpass.vmax_db.toFixed(0) + " dB, one scale for every tile"
+      : water.antennas.length + " antennas · " + water.freq_mhz.length + " × "
+        + water.time_s.length + " cells each · pooled over "
+        + water.time_samples_per_cell + " voltage samples per pixel";
   }
 
   /* --- level 2: what the correlator sees -------------------------------
@@ -2861,6 +3028,139 @@
     });
   }
 
+  /* --- the paper line plot ---------------------------------------------
+   *
+   * One set of named traces against a shared x axis, on the page's white
+   * ground: the bandpass, and the flag-fraction spectrum. Separate from
+   * `drawLineStack`, which is the dark-ground stack the per-baseline
+   * spectra use, because the two grounds need different hairline weights
+   * and the trace colours here are *named* (a receptor, a method) rather
+   * than positions on a ramp.
+   *
+   * `spec.traces` is a list of ``{label, colour, values}``. `spec.yLow`
+   * and `spec.yHigh` pin the range when the caller has one worth pinning
+   * -- a fraction runs 0 to 1 whether or not the data reaches either end.
+   */
+  function drawLinePlot(canvas, spec) {
+    var surface = prepareCanvas(canvas);
+    var ctx = surface.ctx;
+    ctx.font = PLOT_FONT;
+    if (!spec.x.length || !spec.traces.length) { return; }
+
+    var low = spec.yLow;
+    var high = spec.yHigh;
+    if (low === undefined || high === undefined) {
+      low = Infinity;
+      high = -Infinity;
+      spec.traces.forEach(function (trace) {
+        trace.values.forEach(function (value) {
+          if (!isFinite(value)) { return; }
+          low = Math.min(low, value);
+          high = Math.max(high, value);
+        });
+      });
+      if (!isFinite(low)) { low = 0; high = 1; }
+      var pad = (high - low) * 0.08 || 0.5;
+      low -= pad;
+      high += pad;
+    }
+    if (high - low < 1e-12) { high = low + 1; }
+
+    var labels = ticks(low, high, 4).map(spec.yFormat);
+    var widest = labels.reduce(function (most, text) {
+      return Math.max(most, ctx.measureText(text).width);
+    }, 0);
+    var margin = { left: Math.ceil(widest) + 24, right: 10, top: 8, bottom: 32 };
+    var plot = {
+      x: margin.left,
+      y: margin.top,
+      w: Math.max(10, surface.width - margin.left - margin.right),
+      h: Math.max(10, surface.height - margin.top - margin.bottom)
+    };
+
+    var xLow = spec.x[0];
+    var xHigh = spec.x[spec.x.length - 1];
+    if (xHigh - xLow === 0) { xHigh = xLow + 1; }
+
+    function toX(value) { return plot.x + (value - xLow) / (xHigh - xLow) * plot.w; }
+    function toY(value) { return plot.y + plot.h - (value - low) / (high - low) * plot.h; }
+
+    // Hairline grid first, so every trace sits on top of all of it.
+    ctx.strokeStyle = PAPER_GRID;
+    ctx.lineWidth = 1;
+    ticks(low, high, 4).forEach(function (value) {
+      ctx.beginPath();
+      ctx.moveTo(plot.x, Math.round(toY(value)) + 0.5);
+      ctx.lineTo(plot.x + plot.w, Math.round(toY(value)) + 0.5);
+      ctx.stroke();
+    });
+    ticks(xLow, xHigh, 4).forEach(function (value) {
+      ctx.beginPath();
+      ctx.moveTo(Math.round(toX(value)) + 0.5, plot.y);
+      ctx.lineTo(Math.round(toX(value)) + 0.5, plot.y + plot.h);
+      ctx.stroke();
+    });
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(plot.x, plot.y, plot.w, plot.h);
+    ctx.clip();
+    spec.traces.forEach(function (trace) {
+      ctx.strokeStyle = trace.colour;
+      ctx.lineWidth = 1.3;
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      var started = false;
+      trace.values.forEach(function (value, index) {
+        if (!isFinite(value)) { started = false; return; }
+        var px = toX(spec.x[index]);
+        var py = toY(value);
+        if (!started) { ctx.moveTo(px, py); started = true; } else { ctx.lineTo(px, py); }
+      });
+      ctx.stroke();
+    });
+    ctx.restore();
+
+    ctx.strokeStyle = PAPER_AXIS;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(plot.x + 0.5, plot.y + 0.5, plot.w - 1, plot.h - 1);
+
+    ctx.fillStyle = PAPER_TEXT;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ticks(xLow, xHigh, 4).forEach(function (value, i) {
+      ctx.fillText(spec.xFormat(value), plot.x + (i / 4) * plot.w, plot.y + plot.h + 5);
+    });
+    ctx.fillText(spec.xLabel, plot.x + plot.w / 2, plot.y + plot.h + 18);
+
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    ticks(low, high, 4).forEach(function (value, i) {
+      ctx.fillText(spec.yFormat(value), plot.x - 6, plot.y + plot.h - (i / 4) * plot.h);
+    });
+    ctx.save();
+    ctx.translate(11, plot.y + plot.h / 2);
+    ctx.rotate(-Math.PI / 2);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    ctx.fillText(spec.yLabel, 0, 0);
+    ctx.restore();
+  }
+
+  // The traces named under a paper plot, as coloured swatches. The plot
+  // itself carries no legend box: at this size one would cover data.
+  function fillTraceLegend(host, traces) {
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    traces.forEach(function (trace) {
+      var item = el("span", "legend-item");
+      var swatch = el("span", "legend-swatch");
+      swatch.style.background = trace.colour;
+      item.appendChild(swatch);
+      item.appendChild(document.createTextNode(trace.label));
+      host.appendChild(item);
+    });
+  }
+
   function visBaselines() {
     var vis = state.result ? state.result.visibilities : null;
     if (!vis) { return []; }
@@ -2941,6 +3241,11 @@
     var overlays = state.visTruth
       ? vis.sources.map(function (source) { return { mask: source.mask }; })
       : [];
+    // The visibility flagger decides on the full-resolution channel axis
+    // and one column per integration, so its mask is placed by frequency
+    // and time like the voltage one rather than by row and column.
+    var flag = activeVisFlag();
+    var coordOverlays = flag ? flagOverlays(flag, false) : [];
 
     drawHeatmap($("vis-canvas"), {
       values: vis.amplitude,
@@ -2957,6 +3262,7 @@
       yFormat: function (v) { return v.toFixed(2); },
       barFormat: function (v) { return v.toFixed(1); },
       overlays: overlays,
+      coordOverlays: coordOverlays,
       readCell: function (row, col) {
         return vis.freq_mhz[row].toFixed(3) + " MHz\n"
           + vis.time_s[col].toFixed(4) + " s\n"
@@ -2970,6 +3276,22 @@
       + (vis.integration_time_s * 1000).toFixed(2) + " ms · peak "
       + vis.peak_jy.toFixed(1) + " Jy";
     $("vis-empty").hidden = true;
+
+    // One line of scores under the panel rather than a table: the point
+    // being made here is that the same method scores differently after
+    // correlation, and one number each says that.
+    var note = $("vis-flag-note");
+    if (flag) {
+      var scores = flag.methods[0].scores;
+      note.textContent = flag.methods[0].label + " on " + flag.grid.n_accumulations
+        + " integrations · precision " + score(scores.precision)
+        + " · recall " + score(scores.recall)
+        + " · truth occupancy "
+        + (scores.truth_occupancy === null || scores.truth_occupancy === undefined
+          ? "—" : (scores.truth_occupancy * 100).toFixed(2) + "%");
+    } else {
+      note.textContent = "";
+    }
 
     renderVisBaselineSelect();
     renderVisSpectrum();
@@ -3126,19 +3448,7 @@
   }
 
   function renderAbState() {
-    var entry = shownEntry();
-    var button = $("image-ab-toggle");
-    var label = $("image-ab-state");
-    var comparable = Boolean(entry) && entry.result.sources.length > 0;
-    button.disabled = !comparable || state.abRunning;
-    button.title = comparable
-      ? "Re-run this observation with the interference removed and the same seed"
-      : "This run has no interference to remove";
-    setPressed(button, Boolean(entry && entry.showClean));
-    label.textContent = entry && entry.showClean
-      ? "showing: clean, no interference"
-      : "showing: contaminated";
-    label.className = entry && entry.showClean ? "badge badge-amber" : "badge";
+    renderImageChips();
   }
 
   function showAbNote(text) {
@@ -3213,7 +3523,7 @@
     svg.setAttribute("viewBox", "0 0 " + width + " " + height);
     while (svg.firstChild) { svg.removeChild(svg.firstChild); }
 
-    var margin = { left: 46, right: 12, top: 8, bottom: 30 };
+    var margin = { left: 54, right: 14, top: 12, bottom: 36 };
     var plotW = width - margin.left - margin.right;
     var plotH = height - margin.top - margin.bottom;
     var limit = Math.max(1, result.uv.max_lambda) * 1.1;
@@ -3221,9 +3531,23 @@
     var cx = margin.left + plotW / 2;
     var cy = margin.top + plotH / 2;
 
-    [0.5, 1].forEach(function (fraction) {
+    function toX(u) { return cx + u / limit * half; }
+    function toY(v) { return cy - v / limit * half; }
+
+    // Rings at round numbers of kilo-wavelengths where the scale allows,
+    // otherwise at halves of the longest baseline. Either way the reader
+    // gets a scale they can measure a point against, rather than two
+    // unlabelled circles.
+    var ringStep = niceStep(limit / 3);
+    var rings = [];
+    for (var radius = ringStep; radius <= limit; radius += ringStep) {
+      rings.push(radius);
+    }
+    if (!rings.length) { rings = [limit * 0.5, limit]; }
+
+    rings.forEach(function (radius) {
       svg.appendChild(svgNode("circle", {
-        cx: cx, cy: cy, r: half * fraction, "class": "uv-grid", fill: "none"
+        cx: cx, cy: cy, r: radius / limit * half, "class": "uv-grid"
       }));
     });
     svg.appendChild(svgNode("line", {
@@ -3233,6 +3557,10 @@
       x1: cx, y1: cy - half, x2: cx, y2: cy + half, "class": "uv-axis"
     }));
 
+    // Every sampled point and its Hermitian conjugate: a visibility at
+    // (u, v) is the conjugate of the one at (-u, -v), so the second half
+    // is measured, not invented, and the plot would be misleading without
+    // it -- the sampling function really is centrally symmetric.
     var points = [];
     result.uv.u.forEach(function (u, index) {
       var v = result.uv.v[index];
@@ -3242,38 +3570,38 @@
 
     points.forEach(function (point) {
       svg.appendChild(svgNode("circle", {
-        cx: cx + point[0] / limit * half,
-        cy: cy - point[1] / limit * half,
-        r: 1.7,
-        "class": "uv-point"
+        cx: toX(point[0]), cy: toY(point[1]), r: 2, "class": "uv-point"
       }));
     });
 
-    [[cx + half, cy + 14, "end", limit.toFixed(0)],
-     [cx, cy + 14, "middle", "0"],
-     [cx - 6, cy - half + 4, "end", limit.toFixed(0)]].forEach(function (entry) {
-      var text = svgNode("text", {
-        x: entry[0], y: entry[1], "class": "uv-tick-label", "text-anchor": entry[2]
+    // Ring labels along the positive u axis, and the two axis ends.
+    rings.forEach(function (radius) {
+      var label = svgNode("text", {
+        x: toX(radius) - 3, y: cy - 4, "class": "uv-tick-label", "text-anchor": "end"
       });
-      text.textContent = entry[3];
-      svg.appendChild(text);
+      label.textContent = radius >= 10000
+        ? (radius / 1000).toFixed(0) + "k"
+        : radius.toFixed(0);
+      svg.appendChild(label);
     });
 
     var uLabel = svgNode("text", {
-      x: cx, y: height - 6, "class": "uv-tick-label", "text-anchor": "middle"
+      x: cx, y: height - 8, "class": "uv-axis-label", "text-anchor": "middle"
     });
     uLabel.textContent = "u (wavelengths)";
     svg.appendChild(uLabel);
     var vLabel = svgNode("text", {
-      x: 12, y: cy, "class": "uv-tick-label", "text-anchor": "middle",
-      transform: "rotate(-90 12 " + cy + ")"
+      x: 14, y: cy, "class": "uv-axis-label", "text-anchor": "middle",
+      transform: "rotate(-90 14 " + cy + ")"
     });
     vLabel.textContent = "v (wavelengths)";
     svg.appendChild(vLabel);
 
     svg.uvSpec = { cx: cx, cy: cy, half: half, limit: limit, points: points };
+    var observation = result.observation;
     $("uv-sub").textContent =
-      points.length + " samples · longest "
+      points.length + " points · " + observation.n_baselines + " baselines × "
+      + observation.n_blocks + " integrations, and conjugates · longest "
       + result.uv.max_lambda.toFixed(0) + " λ";
   }
 
@@ -3334,6 +3662,8 @@
     renderAntennaSelect();
     renderMaskToggles();
     renderAllAntennasControl();
+    renderVoltChips();
+    renderVisChips();
     renderThumbnails();
     renderFlagger();
     renderWaterfall();
@@ -3368,129 +3698,287 @@
     return (state.defaults && state.defaults.flaggers) || null;
   }
 
-  function activeFlag() {
-    var entry = shownEntry();
-    if (!entry || !entry.flag) { return null; }
-    if (entry.flag.antenna !== state.waterfallAntenna) { return null; }
-    if (entry.flag.pol !== state.waterfallPol) { return null; }
-    return entry.flag;
+  function flaggerMethod(value) {
+    var schema = flaggerSchema();
+    if (!schema) { return null; }
+    return schema.methods.filter(function (entry) {
+      return entry.value === value;
+    })[0] || null;
   }
 
-  function renderFlaggerControls() {
+  // Which methods a domain admits, straight from the schema, so a chip
+  // the server would refuse is greyed out before it is clicked rather
+  // than after.
+  function domainMethods(domain) {
     var schema = flaggerSchema();
-    var panel = $("flagger-controls");
-    if (!schema || !schema.methods.length) {
-      panel.hidden = true;
+    var domains = (schema && schema.domains) || [];
+    var entry = domains.filter(function (item) { return item.value === domain; })[0];
+    if (entry) { return entry.methods; }
+    return (schema ? schema.methods : []).map(function (item) { return item.value; });
+  }
+
+  /* A cached flagger result is only valid for what it was computed on.
+     The voltage domain reads one antenna and one receptor; the visibility
+     domain has already averaged over every baseline, so neither applies
+     to it and the key leaves them out. */
+  function flagKey(domain, method) {
+    if (domain === "visibility") { return "visibility|" + method; }
+    return "voltage|" + state.waterfallAntenna + "|" + state.waterfallPol + "|" + method;
+  }
+
+  function cachedFlag(domain, method) {
+    var entry = shownEntry();
+    if (!entry || !method) { return null; }
+    return entry.flags[flagKey(domain, method)] || null;
+  }
+
+  function activeVoltFlag() { return cachedFlag("voltage", state.voltMethod); }
+  function activeVisFlag() { return cachedFlag("visibility", state.visMethod); }
+
+  /* What a flagger's decision looks like on the picture.
+   *
+   * With the fold below closed, one wash: these are the cells the method
+   * flagged, full stop, which is what a chip promises. Open, the same
+   * cells are split into caught, missed and false alarm, because that is
+   * the distinction the fold exists to explain and its legend is right
+   * there to read the colours against. One overlay either way -- the two
+   * are never drawn at once. */
+  function flagOverlays(response, detailed) {
+    var method = response.methods[0];
+    var grid = response.grid;
+    if (!method) { return []; }
+    if (!detailed) {
+      var flagged = method.overlay.caught.map(function (row, r) {
+        return row.map(function (value, c) {
+          return value || method.overlay.false_alarm[r][c] ? 1 : 0;
+        });
+      });
+      return [{
+        mask: flagged,
+        freq_mhz: grid.freq_mhz,
+        time_s: grid.time_s,
+        colour: FLAG_WASH_RGB,
+        alpha: FLAG_WASH_ALPHA
+      }];
+    }
+    // Caught first, false alarm next, missed last: where a coarse cell
+    // holds more than one outcome the worst one is what stays visible.
+    return ["caught", "false_alarm", "missed"].map(function (key) {
+      return {
+        mask: method.overlay[key],
+        freq_mhz: grid.freq_mhz,
+        time_s: grid.time_s,
+        colour: FLAG_COLOURS[key]
+      };
+    });
+  }
+
+  /* --- the chip rows ---------------------------------------------------
+   *
+   * One row of chips directly above each data product. Clicking a method
+   * chip computes that method's flags for exactly what is on screen and
+   * paints them; clicking it again takes them off. The ground-truth chip
+   * is independent of the method chips -- the two answer different
+   * questions ("what was really there" against "what did this method
+   * decide") and a reader comparing them wants both at once.
+   *
+   * At most one method at a time. A second wash on top of the first would
+   * be unreadable, and the head-to-head that genuinely needs two methods
+   * is the score table in the fold, which reads whichever method is on.
+   */
+  function chipButton(label, pressed, options) {
+    var chip = el("button", "chip");
+    chip.type = "button";
+    chip.setAttribute("aria-pressed", String(Boolean(pressed)));
+    if (options && options.swatch) {
+      var swatch = el("span", "chip-swatch");
+      swatch.style.background = options.swatch;
+      chip.appendChild(swatch);
+    }
+    if (options && options.busy) {
+      chip.appendChild(el("span", "chip-spinner"));
+    }
+    chip.appendChild(document.createTextNode(label));
+    if (options && options.title) { chip.title = options.title; }
+    if (options && options.disabled) { chip.disabled = true; }
+    return chip;
+  }
+
+  function renderVoltChips() {
+    var host = $("volt-chips");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    if (!state.result) { return; }
+
+    var truth = chipButton("RFI truth", state.truthVisible, {
+      swatch: "rgba(" + MASK_RGB + ", 0.75)",
+      title: state.result.sources.length
+        ? "The time-frequency cells the simulator actually put interference in"
+        : "This run has no interference to show"
+    });
+    truth.disabled = !state.result.sources.length;
+    truth.addEventListener("click", function () {
+      state.truthVisible = !state.truthVisible;
+      renderVoltChips();
+      renderWaterfall();
+    });
+    host.appendChild(truth);
+
+    domainMethods("voltage").forEach(function (value) {
+      var method = flaggerMethod(value);
+      if (!method) { return; }
+      var key = flagKey("voltage", value);
+      var chip = chipButton(method.label, state.voltMethod === value, {
+        swatch: "rgba(" + FLAG_WASH_RGB + ", 0.8)",
+        busy: Boolean(state.flagPending[key]),
+        title: method.summary + " Decides on: " + method.grid + "."
+      });
+      chip.addEventListener("click", function () { toggleFlagChip("voltage", value); });
+      host.appendChild(chip);
+    });
+  }
+
+  function renderVisChips() {
+    var host = $("vis-chips");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    var schema = flaggerSchema();
+    if (!state.result || !state.result.visibilities || !schema) { return; }
+
+    var truth = chipButton("RFI truth", state.visTruth, {
+      swatch: "rgba(" + MASK_RGB + ", 0.75)",
+      title: "Integrations the correlator reports a non-zero interference"
+        + " fraction in — the post-correlation ground truth"
+    });
+    truth.disabled = !state.result.visibilities.sources.length;
+    truth.addEventListener("click", function () {
+      state.visTruth = !state.visTruth;
+      renderVisChips();
+      renderVisibilities();
+    });
+    host.appendChild(truth);
+
+    var admitted = domainMethods("visibility");
+    schema.methods.forEach(function (method) {
+      var allowed = admitted.indexOf(method.value) >= 0;
+      var key = flagKey("visibility", method.value);
+      var chip = chipButton(method.label, state.visMethod === method.value, {
+        swatch: "rgba(" + FLAG_WASH_RGB + ", 0.8)",
+        busy: Boolean(state.flagPending[key]),
+        disabled: !allowed,
+        title: allowed
+          ? method.summary
+          : "Spectral kurtosis tests the distribution of pre-detection samples"
+            + " inside an accumulation. Correlation has already averaged those"
+            + " samples away, so the statistic does not exist here — run it in"
+            + " the voltage panel above."
+      });
+      if (allowed) {
+        chip.addEventListener("click", function () {
+          toggleFlagChip("visibility", method.value);
+        });
+      }
+      host.appendChild(chip);
+    });
+  }
+
+  // The image has no per-pixel flag mask -- an image is a transform of
+  // every cell at once, and no method decides pixel by pixel. The honest
+  // equivalent of a chip row here is the A/B: the same observation with
+  // and without the interference, same seed, so the difference between
+  // the two pictures is the interference and nothing else.
+  function renderImageChips() {
+    var host = $("image-chips");
+    while (host.firstChild) { host.removeChild(host.firstChild); }
+    var entry = shownEntry();
+    if (!entry) { return; }
+    var comparable = entry.result.sources.length > 0;
+    var clean = Boolean(entry.showClean);
+
+    [["With interference", false], ["Without interference", true]].forEach(function (pair) {
+      var wantsClean = pair[1];
+      var chip = chipButton(pair[0], clean === wantsClean, {
+        busy: wantsClean && state.abRunning,
+        title: wantsClean
+          ? "Re-run this observation with the interference removed and the same seed"
+          : "The observation as recorded"
+      });
+      chip.disabled = (wantsClean && !comparable) || state.abRunning;
+      if (wantsClean && !comparable) {
+        chip.title = "This run has no interference to remove";
+      }
+      chip.addEventListener("click", function () {
+        if (clean !== wantsClean) { toggleClean(); }
+      });
+      host.appendChild(chip);
+    });
+  }
+
+  /* Clicking a chip. A cached answer paints at once; anything else asks
+     the server for that one method and spins the chip while it waits.
+     The request is the run's own stored payload, not whatever the forms
+     hold now, so the flags really are the flags of the picture on screen. */
+  function toggleFlagChip(domain, method) {
+    var entry = shownEntry();
+    if (!entry) { return; }
+    var chosen = domain === "visibility" ? state.visMethod : state.voltMethod;
+    if (chosen === method) {
+      setChipMethod(domain, null);
       return;
     }
-    panel.hidden = false;
-    var host = $("flagger-methods");
-    while (host.firstChild) { host.removeChild(host.firstChild); }
+    setChipMethod(domain, method);
+    if (cachedFlag(domain, method)) { return; }
 
-    schema.methods.forEach(function (method) {
-      var id = "flagger-method-" + method.value;
-      var wrap = el("div", "flagger-method");
-      var line = el("label", "checkline flagger-method-name");
-      var box = el("input");
-      box.type = "checkbox";
-      box.id = id;
-      box.value = method.value;
-      box.checked = state.flagMethods.indexOf(method.value) >= 0;
-      box.addEventListener("change", function () {
-        var at = state.flagMethods.indexOf(method.value);
-        if (box.checked && at < 0) {
-          state.flagMethods.push(method.value);
-        } else if (!box.checked && at >= 0) {
-          state.flagMethods.splice(at, 1);
-        }
-        syncFlaggerCap();
-      });
-      line.appendChild(box);
-      line.appendChild(document.createTextNode(" " + method.label));
-      wrap.appendChild(line);
-      wrap.appendChild(el("p", "field-hint", method.summary));
-      wrap.appendChild(el("p", "field-hint flagger-method-grid",
-        "decides on: " + method.grid));
-      host.appendChild(wrap);
-    });
-    syncFlaggerCap();
-  }
-
-  // At the cap the unticked boxes go dead rather than silently dropping a
-  // choice, so the limit is visible before the request is refused.
-  function syncFlaggerCap() {
-    var schema = flaggerSchema();
-    if (!schema) { return; }
-    var full = state.flagMethods.length >= schema.max_methods;
-    Array.prototype.forEach.call(
-      $("flagger-methods").querySelectorAll("input[type=checkbox]"),
-      function (box) { box.disabled = full && !box.checked; }
-    );
-    $("flagger-run").disabled = state.flagRunning || state.flagMethods.length === 0;
-  }
-
-  function setFlaggerStatus(kind, text) {
-    var node = $("flagger-status");
-    node.className = "status-cell status-" + kind;
-    node.textContent = text;
-  }
-
-  function runFlagger() {
-    var entry = shownEntry();
-    if (!entry || state.flagRunning || !state.flagMethods.length) { return; }
-    state.flagRunning = true;
+    var key = flagKey(domain, method);
+    if (state.flagPending[key]) { return; }
+    state.flagPending[key] = true;
     state.flagError = false;
-    syncFlaggerCap();
-    setFlaggerStatus("warn", "flagging…");
+    renderChipRow(domain);
 
-    var antenna = state.waterfallAntenna;
-    var pol = state.waterfallPol;
     request("/api/flag", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         request: entry.request,
-        methods: state.flagMethods.slice(),
-        antenna: antenna,
-        pol: pol
+        methods: [method],
+        antenna: state.waterfallAntenna,
+        pol: state.waterfallPol,
+        domain: domain
       })
     }).then(function (response) {
-      entry.flag = { antenna: antenna, pol: pol, response: response, active: 0 };
+      entry.flags[key] = response;
       response.warnings.forEach(function (message) { showNotice("note", message); });
-      setFlaggerStatus("ok", "done   " + fmt(response.wall_time_s, 2) + " s");
     }).catch(function (error) {
-      // A refusal (a 422 on the method list or the request) is reported in
-      // full through the page's own notice area, and left standing on the
-      // control's status cell until something about the run changes.
       state.flagError = true;
       showNotice("error", error.message);
-      setFlaggerStatus("error", "failed   " + shorten(error.message, 60));
+      // Leave the chip off rather than pressed-but-empty: a chip that is
+      // on and paints nothing is a lie about the data.
+      setChipMethod(domain, null);
     }).then(function () {
-      state.flagRunning = false;
-      syncFlaggerCap();
-      renderFlagger();
-      renderWaterfall();
+      delete state.flagPending[key];
+      renderChipRow(domain);
+      if (domain === "visibility") {
+        renderVisibilities();
+      } else {
+        renderFlagger();
+        renderWaterfall();
+      }
     });
   }
 
-  function renderFlaggerPills(flag) {
-    var host = $("flagger-pills");
-    while (host.firstChild) { host.removeChild(host.firstChild); }
-    var methods = flag ? flag.response.methods : [];
-    // One method needs no chooser; two do, and only ever one is painted.
-    if (methods.length < 2) { return; }
-    methods.forEach(function (method, index) {
-      var pill = el("button", "mask-toggle");
-      pill.type = "button";
-      pill.setAttribute("aria-pressed", String(index === flag.active));
-      pill.appendChild(document.createTextNode(method.label));
-      pill.addEventListener("click", function () {
-        flag.active = index;
-        renderFlaggerPills(flag);
-        renderWaterfall();
-      });
-      host.appendChild(pill);
-    });
+  function setChipMethod(domain, method) {
+    if (domain === "visibility") {
+      state.visMethod = method;
+      renderVisChips();
+      renderVisibilities();
+      return;
+    }
+    state.voltMethod = method;
+    renderVoltChips();
+    renderFlagger();
+    renderWaterfall();
+  }
+
+  function renderChipRow(domain) {
+    if (domain === "visibility") { renderVisChips(); } else { renderVoltChips(); }
   }
 
   function renderFlaggerLegend(flag) {
@@ -3509,31 +3997,77 @@
     });
   }
 
+  /* --- the flag-fraction spectrum --------------------------------------
+   *
+   * How much of the recording each channel spent flagged, against the
+   * same axis the bandpass uses. It is the plot that says *where* a
+   * method is spending its flags: a spike at the transmitter and nothing
+   * else is a method behaving; a raised floor across the band is a method
+   * throwing away good data, which the false-alarm rate in the table
+   * states as one number and this states channel by channel.
+   *
+   * The truth is drawn beside it in the ground-truth red, so the two can
+   * be read against each other without switching anything.
+   */
+  function renderFlagFraction(flag) {
+    var block = $("flagfrac-block");
+    block.hidden = !flag;
+    if (!flag) { return; }
+    var grid = flag.grid;
+    var method = flag.methods[0];
+    var traces = [
+      {
+        label: "flagged by " + method.label,
+        colour: "rgb(" + FLAG_WASH_RGB + ")",
+        values: method.flag_fraction
+      },
+      {
+        label: "interference truth",
+        colour: "rgb(" + MASK_RGB + ")",
+        values: grid.truth_fraction
+      }
+    ];
+    drawLinePlot($("flagfrac-canvas"), {
+      x: grid.freq_mhz,
+      traces: traces,
+      xLabel: "frequency (MHz)",
+      yLabel: "fraction flagged",
+      xFormat: function (v) { return v.toFixed(2); },
+      yFormat: function (v) { return v.toFixed(2); },
+      yLow: -0.03,
+      yHigh: 1.03
+    });
+    $("flagfrac-sub").textContent = grid.chan_bins + " channels · fraction of the "
+      + grid.n_accumulations + (grid.domain === "visibility"
+        ? " integrations" : " accumulations") + " flagged in each";
+    fillTraceLegend($("flagfrac-legend"), traces);
+  }
+
   function renderFlagger() {
     var schema = flaggerSchema();
     if (!schema || !schema.methods.length) { return; }
-    var flag = activeFlag();
-    renderFlaggerPills(flag);
+    var flag = activeVoltFlag();
+    // Nothing to score until a method chip is on: the fold would be an
+    // empty promise, so it is not offered at all.
+    $("flagger-controls").hidden = !flag;
     renderFlaggerLegend(flag);
+    renderFlagFraction(flag);
     $("flagger-note").hidden = !flag;
 
     if (!flag) {
       $("flagger-grid-note").textContent = "";
       fillMetricTable($("flagger-metrics"), [], []);
-      if (!state.flagRunning && !state.flagError) { setFlaggerStatus("info", "idle"); }
       return;
     }
 
-    var grid = flag.response.grid;
-    $("flagger-grid-note").textContent = "flagger grid: " + grid.chan_bins
+    var grid = flag.grid;
+    $("flagger-grid-note").textContent = "decisions on " + grid.chan_bins
       + " ch × " + grid.n_accumulations + " accumulations of " + grid.m
       + " samples (" + (grid.accumulation_s * 1000).toFixed(1) + " ms) · antenna "
-      + flag.antenna + ", pol " + flag.pol;
+      + flag.antenna + ", pol " + flag.pol
+      + " · the three colours replace the single wash while this is open";
 
-    // One column per method, so the head-to-head is one glance -- including
-    // the grid each one decided on, which is the honest caveat on the rest
-    // of the column.
-    var methods = flag.response.methods;
+    var methods = flag.methods;
     var headers = ["metric"].concat(methods.map(function (method) {
       return method.label;
     }));
@@ -3599,9 +4133,9 @@
   function pad2(value) { return (value < 10 ? "0" : "") + value; }
 
   // "2026-08-05T13:05:50.892" -> "13:05". The server speaks ISO UTC
-  // throughout and the page never converts to local time: a drift scan is
-  // indexed by sidereal time, and mixing in a local clock would invite the
-  // reader to compare two different days.
+  // throughout; every clock this tab *shows* is the observatory's local
+  // one, converted server-side where the site's zone is known, and UTC is
+  // kept beside it as the thing a reader can check against.
   function utcClock(isot) {
     if (!isot) { return "--:--"; }
     return String(isot).slice(11, 16);
@@ -3610,6 +4144,48 @@
   function fractionClock(fraction) {
     var minutes = Math.round(clamp(fraction, 0, 1) * 1440);
     return pad2(Math.floor(minutes / 60) % 24) + ":" + pad2(minutes % 60);
+  }
+
+  function obsZone() {
+    return (state.obs && state.obs.timeline && state.obs.timeline.zone) || null;
+  }
+
+  // A UTC day fraction, relabelled on the observatory's clock. The band
+  // still spans one UTC day -- that is the day the frames were computed
+  // for -- so the local hour rule starts partway through and wraps, which
+  // is exactly what a local clock does against a UTC day and is why the
+  // wrap is shown rather than hidden.
+  function localHourLabel(utcHour) {
+    var zone = obsZone();
+    var offset = zone ? zone.utc_offset_hours : 0;
+    var shifted = ((utcHour + offset) % 24 + 24) % 24;
+    var whole = Math.floor(shifted);
+    return pad2(whole) + ":" + pad2(Math.round((shifted - whole) * 60) % 60);
+  }
+
+  function zoneNote(zone) {
+    if (!zone) { return "All times local"; }
+    return "All times " + zone.abbreviation
+      + (zone.approximate ? " (approx local)" : "");
+  }
+
+  function renderZoneBadges() {
+    var timelineZone = obsZone();
+    var day = $("day-zone");
+    day.textContent = zoneNote(timelineZone);
+    day.title = timelineZone ? timelineZone.note : "";
+    day.className = timelineZone && timelineZone.approximate ? "badge badge-amber" : "badge";
+
+    var skyZone = state.sky.data ? state.sky.data.zone : null;
+    var sky = $("sky-zone");
+    sky.textContent = zoneNote(skyZone);
+    sky.title = skyZone ? skyZone.note : "";
+    sky.className = skyZone && skyZone.approximate ? "badge badge-amber" : "badge";
+
+    $("day-date-hint").textContent = timelineZone
+      ? "The day runs from 00:00 to 24:00 UTC; the clock beside each frame is "
+        + timelineZone.abbreviation + "."
+      : "The day runs from 00:00 to 24:00 UTC.";
   }
 
   function todayUtc() {
@@ -3633,9 +4209,10 @@
   }
 
   function resetObservatory() {
-    var site = obsSite();
     state.obs = {
-      dec_deg: site ? site.latitude_deg : 0,
+      // Cygnus A's strip, not the zenith: a first build has to show
+      // something happen, and this is the declination that guarantees it.
+      dec_deg: CYG_A_DEC_DEG,
       date: todayUtc(),
       frames: 96,
       resolution: "coarse",
@@ -3665,15 +4242,46 @@
 
   /* --- controls ------------------------------------------------------ */
 
+  // The date a "YYYY-MM-DD" string names, written the way a person says
+  // it: "Aug 5". Built from the parts rather than parsed by Date, whose
+  // constructor would shift a bare date string into the browser's own
+  // zone and could hand back the day before.
+  var MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+  function shortDate(iso) {
+    var parts = String(iso || "").split("-");
+    if (parts.length !== 3) { return ""; }
+    var month = MONTH_NAMES[Number(parts[1]) - 1];
+    return month ? month + " " + Number(parts[2]) : "";
+  }
+
+  /* The three strips worth one click each.
+   *
+   * Cygnus A's is offered first and is the one a fresh page opens on: it
+   * is the only one of the three that guarantees an *event*. A zenith
+   * strip at this site sees no catalogue source at all, so a first play
+   * of a zenith day is twenty-four hours of receiver noise, which reads
+   * as a broken movie rather than as an empty field. The Sun's strip
+   * moves with the date, so its chip names the date it was computed for.
+   */
   function renderDecChips() {
     var host = $("day-dec-chips");
     while (host.firstChild) { host.removeChild(host.firstChild); }
     var site = obsSite();
-    var sunDec = state.obs.timeline ? state.obs.timeline.sun.dec_deg : null;
+    var timeline = state.obs.timeline;
+    var sunDec = timeline ? timeline.sun.dec_deg : null;
+    var sunDate = timeline ? shortDate(timeline.sun.dec_date) : "";
     var chips = [
-      ["Zenith strip", site ? site.latitude_deg : null],
-      ["Cyg A's strip", CYG_A_DEC_DEG],
-      ["Sun's strip today", sunDec]
+      ["Cyg A's strip", CYG_A_DEC_DEG,
+        "Cygnus A transits through the centre of this strip — the one strip that"
+          + " is certain to show something happen"],
+      ["Zenith strip", site ? site.latitude_deg : null,
+        "Straight up. No catalogue source lies on it, so expect receiver noise"
+          + " unless the Sun happens to be near this declination"],
+      ["Sun's strip" + (sunDate ? " on " + sunDate : ""), sunDec,
+        "Where the Sun is on the selected date. It moves about a degree a"
+          + " week, so this chip changes with the date picker"]
     ];
     chips.forEach(function (entry) {
       var value = entry[1];
@@ -3683,10 +4291,14 @@
       }
       var chip = el("button", "chip", label);
       chip.type = "button";
+      chip.setAttribute("aria-pressed",
+        String(value !== null && value !== undefined
+          && Math.abs(state.obs.dec_deg - value) < 0.05));
       if (value === null || value === undefined) {
         chip.disabled = true;
-        chip.title = "Build or reload the timeline to learn where the Sun is on this date";
+        chip.title = "Waiting for the timeline of this date to say where the Sun is";
       } else {
+        chip.title = entry[2];
         chip.addEventListener("click", function () {
           state.obs.dec_deg = Number(value.toFixed(3));
           $("day-dec").value = state.obs.dec_deg;
@@ -3777,9 +4389,11 @@
       + "&tle_text=" + encodeURIComponent(setupTleText());
     request("/api/observatory/timeline" + query).then(function (timeline) {
       state.obs.timeline = timeline;
+      renderZoneBadges();
       renderDecChips();
       renderCadenceHint();
       drawTimeline();
+      renderMovie();
     }).catch(function (error) {
       state.obs.timelineKey = "";
       showDayError("The timeline could not be worked out: " + error.message);
@@ -3922,6 +4536,7 @@
         setDayStatus("ok", "Built — press play");
       }
       updateMovieControls();
+      renderDayGuidance();
       maybeAutoplay();
     }).catch(function (error) {
       $("day-build").disabled = false;
@@ -4060,6 +4675,7 @@
         : "";
       $("movie-meta").textContent = meta && meta.error ? "This frame failed: " + meta.error : "";
       $("movie-scale").textContent = "";
+      setFieldBadge(null);
       return;
     }
 
@@ -4104,9 +4720,19 @@
       + " Jy" + (soft ? ", arcsinh stretch" : "") + " (fixed for the day)";
     $("movie-counter").textContent = "frame " + (obs.cursor + 1) + " of " + obs.total;
 
+    /* What is in the field, always, in the same place.
+     *
+     * Most frames of most strips contain nothing but receiver noise, and
+     * two noise frames look identical however carefully they are drawn --
+     * which is what makes a working movie look broken. The answer is not
+     * to fake motion: it is to say, on every single frame, what is in the
+     * field, so that "these two frames look the same" reads as the fact
+     * it is rather than as a fault. */
     var parts = [];
     if (meta) {
-      parts.push(utcClock(meta.utc) + " UTC");
+      var zone = obsZone();
+      parts.push((meta.local || utcClock(meta.utc))
+        + (zone ? " " + zone.abbreviation : "") + "   (" + utcClock(meta.utc) + " UTC)");
       parts.push("LST " + fractionClock(((meta.lst_deg % 360) + 360) % 360 / 360));
       parts.push("pointing " + meta.ra_deg.toFixed(2) + "°, " + meta.dec_deg.toFixed(2) + "°");
       if (meta.sources.length) {
@@ -4114,10 +4740,95 @@
           return source.name + " in field: " + source.flux_jy.toFixed(0) + " Jy";
         }).join(" · "));
       } else {
-        parts.push("empty field");
+        parts.push("nothing in field — receiver noise only");
       }
     }
     $("movie-meta").textContent = parts.join("   ");
+    setFieldBadge(meta);
+  }
+
+  /* The sentence under the movie, rewritten from what the finished day
+   * actually contains.
+   *
+   * A day whose frames are all empty is the single most confusing thing
+   * this tab can produce: the movie plays, every frame is receiver noise,
+   * every frame looks the same, and the reader concludes the movie is
+   * broken. It is not -- there was nothing to see -- and the two reasons
+   * it happens have different fixes, so the page names the one that
+   * applies rather than offering a general apology.
+   *
+   *   - Nothing ever crosses this strip: change the declination. The
+   *     timeline already says which sources are out of reach.
+   *   - Something does cross it, but between two frames: the sky takes
+   *     `field_crossing_minutes` to drift through the field, and a
+   *     coarser cadence than that steps straight over the event.
+   */
+  function renderDayGuidance() {
+    var obs = state.obs;
+    var line = $("movie-guidance");
+    if (!obs || obs.jobState !== "done" || !obs.total) {
+      line.textContent = "Click the image to play or pause. The marks on the timeline"
+        + " are where a source transits — that is where the picture changes.";
+      line.className = "muted-line";
+      return;
+    }
+
+    var withSources = obs.meta.filter(function (meta) {
+      return meta && !meta.error && meta.sources && meta.sources.length;
+    }).length;
+    if (withSources) {
+      line.textContent = withSources + " of " + obs.total + " frames have something in"
+        + " the field; the rest are receiver noise and are meant to look alike."
+        + " Click the image to play or pause, or click the timeline to jump to a"
+        + " transit mark.";
+      line.className = "muted-line";
+      return;
+    }
+
+    var timeline = obs.timeline;
+    var reachable = timeline
+      ? timeline.sources.filter(function (source) { return source.in_field; })
+      : [];
+    var crossing = timeline ? timeline.field_crossing_minutes : null;
+    var minutesPerFrame = 1440 / Math.max(1, obs.total);
+    if (reachable.length && crossing && minutesPerFrame > crossing) {
+      line.textContent = "Every frame is receiver noise, and not because nothing"
+        + " happened: " + reachable.map(function (source) { return source.name; }).join(", ")
+        + " crosses this strip in " + crossing.toFixed(0) + " min, but the frames are "
+        + minutesPerFrame.toFixed(0) + " min apart, so the day steps over the transit."
+        + " Raise the frames to " + Math.min(288, Math.ceil(1440 / crossing)) + " and build again.";
+    } else if (!reachable.length) {
+      line.textContent = "Every frame is receiver noise: no catalogue source lies on"
+        + " this declination, so nothing ever enters the field. Try Cyg A's strip,"
+        + " or add interference on the Setup tab — that reaches every pointing.";
+    } else {
+      line.textContent = "Every frame is receiver noise — nothing was in the field at"
+        + " any of these instants. The marks on the timeline are where a source"
+        + " transits; jump to one, or build more frames.";
+    }
+    line.className = "muted-line muted-line-warn";
+  }
+
+  // The one-glance version of the same statement, beside the frame
+  // counter: amber when the field holds something, quiet when it does not.
+  function setFieldBadge(meta) {
+    var badge = $("movie-field");
+    if (!meta || meta.error) {
+      badge.textContent = "";
+      badge.className = "badge";
+      badge.hidden = true;
+      return;
+    }
+    badge.hidden = false;
+    if (meta.sources && meta.sources.length) {
+      badge.textContent = meta.sources.map(function (source) {
+        return source.name;
+      }).join(", ") + " in field";
+      badge.className = "badge badge-amber";
+    } else {
+      badge.textContent = "empty field";
+      badge.className = "badge";
+    }
   }
 
   /* --- drawing the timeline ------------------------------------------ */
@@ -4181,7 +4892,7 @@
     });
 
     // Sunrise and sunset: a small disc on the horizon line of the band.
-    function sunGlyph(fraction, rising) {
+    function sunGlyph(fraction, rising, clock) {
       var at = x(fraction);
       var group = svgNode("g", {});
       group.appendChild(svgNode("circle", {
@@ -4195,12 +4906,17 @@
       var label = svgNode("text", {
         x: at, y: bandY - 4, class: "tl-label", "text-anchor": "middle"
       });
-      label.textContent = (rising ? "sunrise " : "sunset ") + fractionClock(fraction);
+      label.textContent = (rising ? "sunrise " : "sunset ")
+        + (clock || fractionClock(fraction));
       group.appendChild(label);
       svg.appendChild(group);
     }
-    timeline.sun.sunrise.forEach(function (fraction) { sunGlyph(fraction, true); });
-    timeline.sun.sunset.forEach(function (fraction) { sunGlyph(fraction, false); });
+    timeline.sun.sunrise.forEach(function (fraction, index) {
+      sunGlyph(fraction, true, (timeline.sun.sunrise_local || [])[index]);
+    });
+    timeline.sun.sunset.forEach(function (fraction, index) {
+      sunGlyph(fraction, false, (timeline.sun.sunset_local || [])[index]);
+    });
 
     // Satellite passes, as thin ticks in the lane under the band.
     (timeline.satellite.passes || []).forEach(function (pass) {
@@ -4216,12 +4932,22 @@
     // about the declination the user chose, and hiding it hides the fix.
     var placed = [];
     timeline.sources.forEach(function (source) {
-      source.transits.forEach(function (fraction) {
+      source.transits.forEach(function (fraction, index) {
         var at = x(fraction);
-        svg.appendChild(svgNode("line", {
+        var marker = svgNode("line", {
           x1: at, y1: bandY, x2: at, y2: laneY + laneH,
           class: source.in_field ? "tl-marker" : "tl-marker-faint"
-        }));
+        });
+        // A transit is the answer to "where in the day does something
+        // happen", so it says so under the pointer as well as on the band.
+        var title = svgNode("title", {});
+        title.textContent = source.name + (source.in_field
+          ? " transits at " + ((source.transits_local || [])[index] || fractionClock(fraction))
+            + " — inside this strip"
+          : " transits then, but its declination is "
+            + fmt(Math.abs(source.dec_offset_deg), 2) + "° off this strip");
+        marker.appendChild(title);
+        svg.appendChild(marker);
         if (!source.in_field) { return; }
         // Labels are dropped rather than overprinted when two transits
         // land within a few pixels of each other.
@@ -4237,7 +4963,10 @@
       });
     });
 
-    // Hour rule.
+    // Hour rule, labelled on the observatory's clock. The band is still
+    // one UTC day wide -- that is the day the frames cover -- so the local
+    // labels start partway through and wrap round, which is what a local
+    // clock does against a UTC day.
     for (var hour = 0; hour <= 24; hour += 3) {
       var hx = x(hour / 24);
       svg.appendChild(svgNode("line", {
@@ -4246,7 +4975,7 @@
       var tick = svgNode("text", {
         x: clamp(hx, 10, width - 10), y: height - 3, class: "tl-label", "text-anchor": "middle"
       });
-      tick.textContent = pad2(hour % 24) + ":00";
+      tick.textContent = localHourLabel(hour % 24);
       svg.appendChild(tick);
     }
 
@@ -4266,7 +4995,17 @@
     }
 
     var missing = timeline.sources.filter(function (source) { return !source.in_field; });
-    var legend = ["night shaded from the real solar altitude"];
+    var present = timeline.sources.filter(function (source) { return source.in_field; });
+    var zone = obsZone();
+    var legend = ["hours are " + (zone ? zone.abbreviation : "local")
+      + "; night shaded from the real solar altitude"];
+    if (present.length) {
+      legend.push("bold marks are transits through this strip — that is where the "
+        + "image changes");
+    } else {
+      legend.push("no catalogue source crosses this strip, so every frame is "
+        + "receiver noise unless your own interference is on");
+    }
     if (missing.length) {
       legend.push(missing.map(function (source) { return source.name; }).join(", ")
         + ": never in this strip");
@@ -4294,14 +5033,21 @@
   var SKY_RADIUS = 150;      // internal units; the SVG scales to its box
   var AIRCRAFT_LABELS = 6;  // callsigns drawn, nearest first; the rest carry a tooltip
 
-  // Zenith at the centre, horizon at the rim, altitude linear in radius --
-  // the ordinary "stereographic-looking" horizon chart, which is really an
-  // equidistant projection. Azimuth runs North through East, matching the
-  // rest of the package.
+  /* Zenith at the centre, horizon at the rim, altitude linear in radius --
+   * the ordinary equidistant horizon chart. Azimuth runs north through
+   * east, matching the rest of the package.
+   *
+   * North is up and **east is left**, which looks wrong for a moment and
+   * is right: this is a chart of the sky above the observer, not a map of
+   * the ground beneath. Lie on your back with your head to the north and
+   * east is on your left. Every planisphere and every all-sky camera
+   * frame is drawn this way, and a chart that put east on the right would
+   * mirror every constellation on it.
+   */
   function skyPoint(altitudeDeg, azimuthDeg) {
     var radius = SKY_RADIUS * clamp((90 - altitudeDeg) / 90, 0, 1);
     var angle = rad(azimuthDeg);
-    return [SKY_RADIUS + radius * Math.sin(angle), SKY_RADIUS - radius * Math.cos(angle)];
+    return [SKY_RADIUS - radius * Math.sin(angle), SKY_RADIUS - radius * Math.cos(angle)];
   }
 
   function drawSkyChart() {
@@ -4396,6 +5142,36 @@
     }
   }
 
+  /* One glyph per layer, drawn by the same classes the chart uses, so the
+   * key cannot drift away from the picture: if a glyph is restyled the
+   * legend restyles with it. Five layers, five marks, and the aircraft
+   * chevron points the way the aircraft is heading. */
+  function renderSkyLegend() {
+    var host = $("sky-legend");
+    if (host.firstChild) { return; }   // static; built once
+    var items = [
+      ["Sun", "circle", { cx: 8, cy: 8, r: 6, "class": "sky-sun" }],
+      ["Moon", "circle", { cx: 8, cy: 8, r: 4.5, "class": "sky-moon" }],
+      ["Catalogue source", "circle", { cx: 8, cy: 8, r: 3, "class": "sky-source" }],
+      ["Satellite", "rect", {
+        x: 5.5, y: 5.5, width: 5, height: 5, "class": "sky-satellite",
+        transform: "rotate(45 8 8)"
+      }],
+      ["Aircraft", "path", {
+        d: "M 0 -5 L 4 4 L 0 1.5 L -4 4 Z", "class": "sky-aircraft",
+        transform: "translate(8,8)"
+      }]
+    ];
+    items.forEach(function (entry) {
+      var item = el("span", "sky-legend-item");
+      var svg = svgNode("svg", { width: 16, height: 16, viewBox: "0 0 16 16" });
+      svg.appendChild(svgNode(entry[1], entry[2]));
+      item.appendChild(svg);
+      item.appendChild(document.createTextNode(entry[0]));
+      host.appendChild(item);
+    });
+  }
+
   function renderSkyLayers() {
     var host = $("sky-layers");
     while (host.firstChild) { host.removeChild(host.firstChild); }
@@ -4429,11 +5205,16 @@
 
   function renderSkyNow() {
     drawSkyChart();
+    renderSkyLegend();
     renderSkyLayers();
     renderSkyTable();
+    renderZoneBadges();
     var sky = state.sky.data;
     if (!sky) { return; }
-    $("sky-updated").textContent = "last updated " + utcClock(sky.utc) + " UTC · LST "
+    var zone = sky.zone;
+    $("sky-updated").textContent = "last updated "
+      + (sky.local || utcClock(sky.utc)) + (zone ? " " + zone.abbreviation : "")
+      + " (" + utcClock(sky.utc) + " UTC) · LST "
       + fractionClock(sky.lst_deg / 360) + " · "
       + (sky.aircraft || []).length + " aircraft, " + (sky.satellites || []).length + " satellites";
   }
@@ -4512,6 +5293,17 @@
     $("movie-play").addEventListener("click", function () { setPlaying(!state.obs.playing); });
     $("movie-back").addEventListener("click", function () { setPlaying(false); stepFrame(-1); });
     $("movie-forward").addEventListener("click", function () { setPlaying(false); stepFrame(1); });
+
+    // Clicking the image plays and pauses it. It is the largest thing on
+    // the tab and the obvious thing to click, so it had better do
+    // something; before this it did nothing at all and a reader clicking
+    // it concluded, reasonably, that the movie was broken.
+    $("movie-canvas").addEventListener("click", function () {
+      if (readyFrames() < 1) { return; }
+      if (readyFrames() < 2) { stepFrame(1); return; }
+      setPlaying(!state.obs.playing);
+      $("movie-canvas").focus();
+    });
 
     $("movie-canvas").addEventListener("keydown", function (event) {
       if (event.key === " " || event.key === "Spacebar") {
@@ -4809,8 +5601,8 @@
 
     // Featuring another antenna invalidates nothing on the server, but it
     // does invalidate the flagger overlay: that was scored on one antenna's
-    // voltages and means nothing on another's. `activeFlag` keys on the
-    // antenna, so the panel puts the control back by itself.
+    // voltages and means nothing on another's. `flagKey` carries the
+    // antenna, so a mask computed for one is never shown on another.
     // The picker is the typed route to the same thing a tile click does.
     $("waterfall-antenna").addEventListener("change", function (event) {
       featureAntenna(Number(event.target.value));
@@ -4821,21 +5613,6 @@
       renderAllAntennasControl();
       renderThumbnails();
       if (!state.allAntennas) { renderWaterfall(); }
-    });
-
-    // The master ground-truth switch. The per-source chips inside "More"
-    // choose *which* layers this paints; with the switch off, none of them
-    // paint at all.
-    $("truth-toggle").addEventListener("click", function (event) {
-      state.truthVisible = !state.truthVisible;
-      setPressed(event.currentTarget, state.truthVisible);
-      renderWaterfall();
-    });
-
-    $("vis-truth-toggle").addEventListener("click", function (event) {
-      state.visTruth = !state.visTruth;
-      setPressed(event.currentTarget, state.visTruth);
-      renderVisibilities();
     });
 
     $("vis-baseline").addEventListener("change", function (event) {
@@ -4849,9 +5626,13 @@
       if ($("vis-more").open) { renderVisSpectrum(); }
     });
 
-    $("flagger-run").addEventListener("click", runFlagger);
-
-    $("image-ab-toggle").addEventListener("click", toggleClean);
+    // Opening the score fold swaps the single wash on the waterfall for
+    // the three-colour breakdown its legend explains, and draws the
+    // flag-fraction canvas, which measures zero while it is closed.
+    $("flagger-controls").addEventListener("toggle", function () {
+      renderWaterfall();
+      renderFlagFraction(activeVoltFlag());
+    });
 
     // Which receptor the waterfall shows is a server-side reduction (see
     // simulate.py's `pol` query param), not a client-side redraw, so
@@ -4906,7 +5687,6 @@
       bindControls();
       renderAllForms();
       renderMaskToggles();
-      renderFlaggerControls();
 
       renderDayControls();
       bindObservatory();

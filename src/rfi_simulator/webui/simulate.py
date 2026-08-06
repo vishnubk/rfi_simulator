@@ -104,6 +104,7 @@ __all__ = [
     "DEFAULT_CENTER_FREQ_HZ",
     "DEFAULT_N_BLOCKS",
     "DEFAULT_N_CHAN",
+    "FLAG_DOMAINS",
     "FLAG_METHODS",
     "FlagRequest",
     "MAX_ANTENNAS",
@@ -1864,6 +1865,7 @@ def defaults_payload() -> dict[str, Any]:
         "flaggers": {
             "methods": FLAG_METHODS,
             "max_methods": MAX_FLAG_METHODS,
+            "domains": FLAG_DOMAINS,
             "defaults": FlagParams().model_dump(),
         },
         "sample_tle": sample_tle_text(),
@@ -2267,6 +2269,17 @@ class _WaterfallReducer:
         self._power_columns: list[np.ndarray] = []
         self._mask_columns: list[np.ndarray] = []
         self._occupied_cells = np.zeros(len(simulator.rfi_sources), dtype=np.int64)
+        # The bandpass: total power per antenna, per receptor, per channel,
+        # summed over every time sample of the run. Unlike the waterfall
+        # this keeps *both* receptors, because comparing them is the whole
+        # point of a bandpass plot; it costs n_ant x n_pol x n_chan floats,
+        # which is a few tens of kilobytes at the largest size this front
+        # end runs and is never pooled in time -- a time-averaged spectrum
+        # is exactly what is wanted.
+        self._bandpass_sum = np.zeros(
+            (simulator.n_antennas, simulator.n_pol, simulator.n_chan), dtype=np.float64
+        )
+        self._bandpass_samples = 0
 
     @property
     def time_samples_per_cell(self) -> int:
@@ -2284,6 +2297,14 @@ class _WaterfallReducer:
         # single-polarization run), so selecting `self._pol` here works
         # identically whether or not the simulator was built with n_pol=2;
         # the waterfall always shows exactly one receptor.
+        # Both receptors, every channel, summed over time: the bandpass.
+        # Taken before the single-receptor slice below so that a dual
+        # polarization run ships XX and YY spectra from one pass.
+        all_pol = block.pol_data
+        all_power = all_pol.real.astype(np.float64) ** 2 + all_pol.imag.astype(np.float64) ** 2
+        self._bandpass_sum += all_power.sum(axis=3)
+        self._bandpass_samples += all_power.shape[3]
+
         data = block.pol_data[:, self._pol]
         power = data.real.astype(np.float64) ** 2 + data.imag.astype(np.float64) ** 2
         power = bin_mean(power, axis=2, n_bins=self.time_bins_per_block)
@@ -2310,6 +2331,12 @@ class _WaterfallReducer:
         column_duration_s = simulator.duration_s / n_columns
         time_s = (np.arange(n_columns) + 0.5) * column_duration_s
 
+        # Mean power per (antenna, receptor, channel), then pooled onto the
+        # display's channel bins so the bandpass shares the waterfall's
+        # frequency axis and the two plots can be read against each other.
+        samples = max(1, self._bandpass_samples)
+        bandpass = bin_mean(self._bandpass_sum / samples, axis=2, n_bins=self.chan_bins)
+
         return {
             "waterfall": waterfall,
             "masks": masks,
@@ -2317,6 +2344,7 @@ class _WaterfallReducer:
             "freq_hz": freq_hz,
             "time_s": time_s,
             "time_samples_per_cell": self.time_samples_per_cell,
+            "bandpass": bandpass,
         }
 
 
@@ -2357,6 +2385,56 @@ def _to_decibels(power: np.ndarray) -> tuple[np.ndarray, float, float, float]:
     return decibels, low, high, peak_db
 
 
+def _bandpass_payload(bandpass: np.ndarray, pol_names: list[str]) -> dict[str, Any]:
+    """Time-averaged spectra, in decibels, ready to plot as lines.
+
+    Parameters
+    ----------
+    bandpass : numpy.ndarray
+        Mean power per ``(antenna, receptor, channel)``, Jy.
+    pol_names : list of str
+        The receptor names the correlator reports, ``["XX"]`` or
+        ``["XX", "YY"]``, so the page can label the traces without
+        guessing from an index.
+
+    Returns
+    -------
+    dict
+        ``antennas``: a ``(n_antenna, n_pol, chan_bins)`` nested list in
+        decibels, sharing the waterfall's frequency axis. ``vmin_db`` and
+        ``vmax_db`` are the true ends of the data with a little headroom,
+        not percentiles: a bandpass is read for its shape, and clipping
+        the very feature -- a narrowband spike -- that the reader is
+        looking for would be the wrong kindness. `DYNAMIC_RANGE_DB` below
+        the peak is still floored so an empty channel cannot reach minus
+        infinity.
+    """
+    peak = float(bandpass.max()) if bandpass.size else 0.0
+    if not np.isfinite(peak) or peak <= 0.0:
+        zeros = np.zeros(bandpass.shape, dtype=np.float64)
+        return {
+            "antennas": [_round_grid(plane, 3) for plane in zeros],
+            "pol_names": list(pol_names),
+            "vmin_db": 0.0,
+            "vmax_db": 1.0,
+            "unit": "dB (mean Jy per channel)",
+        }
+    floor = peak * 10.0 ** (-DYNAMIC_RANGE_DB / 10.0)
+    decibels = 10.0 * np.log10(np.maximum(bandpass, floor))
+    low = float(decibels.min())
+    high = float(decibels.max())
+    if high - low < 1.0:
+        low, high = low - 0.5, high + 0.5
+    pad = 0.05 * (high - low)
+    return {
+        "antennas": [_round_grid(plane, 3) for plane in decibels],
+        "pol_names": list(pol_names),
+        "vmin_db": round(low - pad, 3),
+        "vmax_db": round(high + pad, 3),
+        "unit": "dB (mean Jy per channel)",
+    }
+
+
 def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
     """Run one observation and reduce it to what a browser can draw.
 
@@ -2386,7 +2464,11 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
         ``warnings`` the library raised, and the wall time. The waterfall
         also reports ``time_samples_per_cell``, the number of voltage
         samples pooled into one displayed column, so the page can say how
-        coarse the picture it is drawing really is.
+        coarse the picture it is drawing really is, and ``bandpass``, the
+        time-averaged spectrum of every antenna and *every* receptor (see
+        `_bandpass_payload`) -- both receptors regardless of which one the
+        waterfall is showing, because a bandpass plot exists to compare
+        them.
 
     Raises
     ------
@@ -2424,6 +2506,7 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
     wall_time_s = time.perf_counter() - started
 
     decibels, vmin_db, vmax_db, peak_db = _to_decibels(reduced["waterfall"])
+    bandpass_payload = _bandpass_payload(reduced["bandpass"], list(visibilities.pol_names))
 
     peak_index = int(np.argmax(image))
     peak_row, peak_col = np.unravel_index(peak_index, image.shape)
@@ -2487,6 +2570,7 @@ def run_simulation(request: SimulateRequest, *, pol: int = 0) -> dict[str, Any]:
             "dynamic_range_db": DYNAMIC_RANGE_DB,
             "time_samples_per_cell": int(reduced["time_samples_per_cell"]),
             "unit": "dB (Jy per cell)",
+            "bandpass": bandpass_payload,
         },
         "sources": [
             {
@@ -2588,6 +2672,39 @@ form fields follow."""
 
 FlagMethod = Literal["sk", "mad", "sumthreshold"]
 
+FlagDomain = Literal["voltage", "visibility"]
+"""Where a flagging request is answered.
+
+``voltage`` flags one antenna's own accumulated spectra, before
+correlation; ``visibility`` flags the baseline-averaged amplitude the
+correlator produced, which is where a visibility-domain method such as
+AOFlagger's SumThreshold actually runs on a real telescope. The two see
+different grids and different ground truth (per-sample interference
+masks against the correlator's per-integration `rfi_fraction`), so the
+domain travels in the response and the page prints which one it is."""
+
+FLAG_DOMAINS = [
+    {
+        "value": "voltage",
+        "label": "Voltages",
+        "summary": "One antenna's accumulated spectra, before correlation.",
+        "methods": ["sk", "mad", "sumthreshold"],
+    },
+    {
+        "value": "visibility",
+        "label": "Visibilities",
+        "summary": (
+            "The baseline-averaged amplitude the correlator produced. Spectral "
+            "kurtosis needs pre-detection samples and does not apply here."
+        ),
+        "methods": ["mad", "sumthreshold"],
+    },
+]
+"""list of dict: The two places the page can ask for flags, as
+descriptors the browser builds its controls from -- including which
+methods each domain admits, so a chip can be greyed out with a reason
+instead of a request being refused after the click."""
+
 
 class FlagParams(BaseModel):
     """Tuning of the classical flaggers.
@@ -2642,6 +2759,7 @@ class FlagRequest(BaseModel):
     methods: list[FlagMethod] = Field(min_length=1, max_length=MAX_FLAG_METHODS)
     antenna: int = Field(default=0, ge=0, le=MAX_ANTENNAS - 1)
     pol: Literal[0, 1] = 0
+    domain: FlagDomain = "voltage"
     params: FlagParams = Field(default_factory=FlagParams)
 
     @field_validator("methods")
@@ -2650,6 +2768,26 @@ class FlagRequest(BaseModel):
         if len(set(value)) != len(value):
             raise ValueError(f"name each method once, got {value}")
         return value
+
+    @model_validator(mode="after")
+    def _check_domain(self) -> FlagRequest:
+        """Refuse spectral kurtosis after correlation.
+
+        The estimator is a ratio of the second and fourth moments of the
+        *pre-detection* samples inside one accumulation. Baseline-averaged
+        visibility amplitudes have already had both the polarization and
+        the baseline axes collapsed and the samples integrated, so those
+        moments are gone; running the same formula on them would produce a
+        number, and the number would mean nothing. Say so rather than
+        return it.
+        """
+        if self.domain == "visibility" and "sk" in self.methods:
+            raise ValueError(
+                "spectral kurtosis is a pre-detection test and cannot be run on "
+                "baseline-averaged visibility amplitudes: use it in the voltage "
+                "domain, or pick MAD clipping or SumThreshold here"
+            )
+        return self
 
 
 def _flag_overlay(predicted: np.ndarray, truth: np.ndarray, chan_bins: int) -> dict[str, Any]:
@@ -2684,14 +2822,104 @@ def _flag_overlay(predicted: np.ndarray, truth: np.ndarray, chan_bins: int) -> d
     }
 
 
+def _flag_fraction(mask: np.ndarray, chan_bins: int) -> list[float]:
+    """The fraction of the run each channel spent flagged.
+
+    Parameters
+    ----------
+    mask : numpy.ndarray
+        A boolean mask on the flagger's own grid, ``(n_chan, n_time)``.
+    chan_bins : int
+        Channel bins to pool onto, matching the overlay's.
+
+    Returns
+    -------
+    list of float
+        One number per displayed channel, 0 to 1. Pooling here is a
+        *mean*, not the ANY rule the overlay uses: this is the flag
+        occupancy of a channel and averaging is what it means, whereas
+        the overlay answers "was anything in this cell flagged".
+    """
+    if not mask.size:
+        return []
+    per_channel = mask.astype(np.float64).mean(axis=1)
+    return bin_mean(per_channel, axis=0, n_bins=chan_bins).round(5).tolist()
+
+
+def _visibility_flag_grids(request: FlagRequest) -> dict[str, Any]:
+    """Correlate the run and hand back the grid a visibility flagger sees.
+
+    Parameters
+    ----------
+    request : FlagRequest
+        A validated request whose ``domain`` is ``"visibility"``.
+
+    Returns
+    -------
+    dict
+        ``spectrogram``: ``|V|`` averaged over every cross-correlation
+        baseline, ``(n_chan, n_integrations)`` -- the same quantity the
+        visibility panel draws, at full channel resolution. ``truth``: a
+        boolean mask of the cells any interference source touched, from
+        the correlator's own ``rfi_fraction``. ``freq_hz``, ``time_s``,
+        ``integration_time_s`` and ``n_integrations`` describe the axes.
+
+    Notes
+    -----
+    Ground truth after correlation is a different statement from ground
+    truth before it. Pre-correlation, a cell is contaminated if any
+    voltage sample in it was; post-correlation, the library reports the
+    *fraction* of an integration a source occupied, and a cell counts as
+    contaminated here when that fraction is non-zero. A source that lit
+    one sample in a thousand therefore marks the whole integration --
+    which is the honest reading, because that integration's amplitude
+    really is contaminated, however slightly.
+    """
+    simulator = build_simulator(request.request)
+    pol = request.pol if simulator.n_pol > 1 else 0
+    _, calibration_seq = _feature_seed_sequences(request.request.sim.seed)
+    calibration_errors = (
+        None
+        if request.request.calibration_errors is None
+        else request.request.calibration_errors.build(
+            simulator.n_antennas, np.random.default_rng(calibration_seq)
+        )
+    )
+    visibilities = correlate(simulator.blocks(), calibration_errors=calibration_errors)
+
+    cross = visibilities.cross_mask
+    data = visibilities.pol_data[:, :, pol, :]
+    spectrogram = np.abs(data[:, cross, :]).astype(np.float64).mean(axis=1).T
+
+    fraction = np.asarray(visibilities.rfi_fraction, dtype=np.float64)
+    if fraction.size:
+        truth = (fraction > 0.0).any(axis=1).T
+    else:
+        truth = np.zeros(spectrogram.shape, dtype=bool)
+
+    n_int = int(visibilities.n_int)
+    integration_time_s = float(visibilities.integration_time_s)
+    return {
+        "simulator": simulator,
+        "pol": pol,
+        "spectrogram": spectrogram,
+        "truth": truth,
+        "freq_hz": np.asarray(visibilities.freq_hz, dtype=np.float64),
+        "time_s": (np.arange(n_int) + 0.5) * integration_time_s,
+        "integration_time_s": integration_time_s,
+        "n_integrations": n_int,
+    }
+
+
 def run_flaggers(request: FlagRequest) -> dict[str, Any]:
     """Re-simulate one run and score classical flaggers against its truth.
 
     Parameters
     ----------
     request : FlagRequest
-        A validated request: the observation, the methods, and which
-        antenna and receptor to look at.
+        A validated request: the observation, the methods, which antenna
+        and receptor to look at, and which ``domain`` -- the voltages of
+        one antenna, or the baseline-averaged visibility amplitude.
 
     Returns
     -------
@@ -2721,6 +2949,8 @@ def run_flaggers(request: FlagRequest) -> dict[str, Any]:
     grid with `rfi_simulator.metrics.pool_truth_accumulations`, the
     partition the kurtosis estimator itself uses.
     """
+    if request.domain == "visibility":
+        return _run_visibility_flaggers(request)
     started = time.perf_counter()
     params = request.params
     methods = list(request.methods)
@@ -2788,6 +3018,7 @@ def run_flaggers(request: FlagRequest) -> dict[str, Any]:
                 for name, value in flag_scores(predictions[method], truth).items()
             },
             "overlay": _flag_overlay(predictions[method], truth, chan_bins),
+            "flag_fraction": _flag_fraction(predictions[method], chan_bins),
         }
         for method in methods
     ]
@@ -2801,6 +3032,7 @@ def run_flaggers(request: FlagRequest) -> dict[str, Any]:
     return {
         "methods": results,
         "grid": {
+            "domain": "voltage",
             "m": params.m,
             "n_chan": int(simulator.n_chan),
             "n_accumulations": int(n_accum),
@@ -2810,9 +3042,124 @@ def run_flaggers(request: FlagRequest) -> dict[str, Any]:
             .round(6)
             .tolist(),
             "time_s": ((np.arange(n_accum) + 0.5) * accumulation_s).round(6).tolist(),
+            "truth_fraction": _flag_fraction(truth, chan_bins),
         },
+        "domain": "voltage",
         "antenna": int(request.antenna),
         "pol": int(pol),
+        "params": params.model_dump(),
+        "warnings": messages,
+        "wall_time_s": round(wall_time_s, 3),
+    }
+
+
+def _run_visibility_flaggers(request: FlagRequest) -> dict[str, Any]:
+    """Score the power-based flaggers on the correlated amplitudes.
+
+    Parameters
+    ----------
+    request : FlagRequest
+        A validated request whose ``domain`` is ``"visibility"``. Its
+        ``antenna`` is ignored -- interference reaches every antenna and
+        the grid here is already averaged over every baseline -- and is
+        echoed back so the caller can see that it was not used.
+
+    Returns
+    -------
+    dict
+        The same shape `run_flaggers` returns in the voltage domain, so
+        the page draws it with the same code: ``methods`` with scores, a
+        caught / missed / false-alarm overlay and a per-channel flag
+        fraction, and the ``grid`` those decisions live on.
+
+    Notes
+    -----
+    The grid is coarse in time by construction: there is one column per
+    correlator integration, and a short recording has only a handful.
+    Robust statistics over a handful of samples are weak, and the scores
+    will say so -- which is itself the lesson, since a real
+    visibility-domain flagger runs on hours of integrations, not on
+    milliseconds.
+    """
+    started = time.perf_counter()
+    params = request.params
+    methods = list(request.methods)
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        grids = _visibility_flag_grids(request)
+        spectrogram = grids["spectrogram"]
+        truth = grids["truth"]
+
+        # Both directions, unioned. A per-channel median over time -- the
+        # background the voltage domain uses -- is blind here: a
+        # continuous transmitter is *constant* in a channel across a
+        # recording this short, so it becomes the channel's own median and
+        # deviates from itself by nothing. The spectral direction is what
+        # sees it, and is what an astronomer looking at a snapshot
+        # spectrum uses. Running only one of the two would report a recall
+        # of zero on interference plainly visible in the panel above.
+        time_mask, time_residual = mad_clip_mask(
+            spectrogram, params.n_sigma, return_statistic=True
+        )
+        freq_mask, freq_residual = mad_clip_mask(
+            spectrogram.T, params.n_sigma, return_statistic=True
+        )
+
+        predictions: dict[str, np.ndarray] = {}
+        if "mad" in methods:
+            predictions["mad"] = time_mask | freq_mask.T
+        if "sumthreshold" in methods:
+            predictions["sumthreshold"] = sumthreshold_mask(
+                time_residual, params.chi_1, params.iterations
+            ) | sumthreshold_mask(freq_residual, params.chi_1, params.iterations).T
+    wall_time_s = time.perf_counter() - started
+
+    simulator = grids["simulator"]
+    chan_bins = min(int(simulator.n_chan), FLAG_OVERLAY_MAX_CHAN_BINS)
+    labels = {entry["value"]: entry["label"] for entry in FLAG_METHODS}
+
+    results = [
+        {
+            "method": method,
+            "label": labels[method],
+            "grid": (
+                "baseline-averaged visibility amplitude, one decision per "
+                "integration, background removed along time and frequency"
+            ),
+            "scores": {
+                name: _finite(value)
+                for name, value in flag_scores(predictions[method], truth).items()
+            },
+            "overlay": _flag_overlay(predictions[method], truth, chan_bins),
+            "flag_fraction": _flag_fraction(predictions[method], chan_bins),
+        }
+        for method in methods
+    ]
+
+    messages = []
+    for entry in caught_warnings:
+        text = str(entry.message)
+        if text not in messages:
+            messages.append(text)
+
+    return {
+        "methods": results,
+        "grid": {
+            "domain": "visibility",
+            "m": None,
+            "n_chan": int(simulator.n_chan),
+            "n_accumulations": int(grids["n_integrations"]),
+            "accumulation_s": round(float(grids["integration_time_s"]), 9),
+            "chan_bins": int(chan_bins),
+            "freq_mhz": (bin_mean(grids["freq_hz"], axis=0, n_bins=chan_bins) / 1.0e6)
+            .round(6)
+            .tolist(),
+            "time_s": np.asarray(grids["time_s"]).round(6).tolist(),
+            "truth_fraction": _flag_fraction(truth, chan_bins),
+        },
+        "domain": "visibility",
+        "antenna": int(request.antenna),
+        "pol": int(grids["pol"]),
         "params": params.model_dump(),
         "warnings": messages,
         "wall_time_s": round(wall_time_s, 3),
